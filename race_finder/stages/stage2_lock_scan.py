@@ -31,6 +31,8 @@ from ..parsers.c_parser import (
     find_field_accesses,
     find_lock_events,
     find_lock_wrappers,
+    find_ops_registrations,
+    find_indirect_call_sites,
     lock_state_at,
     collect_call_sites,
     find_alloc_vars,
@@ -124,6 +126,16 @@ def run(cfg, run_dir, stage1_output, verbose=False):
     # Build call graph and annotate HIGH findings
     callee_to_callers = build_callee_to_callers(all_fn_call_data)
     annotate_findings(all_findings, callee_to_callers)
+
+    # Indirect call graph: resolve function-pointer dispatch for functions that
+    # appear unresolvable via direct-call graph ("no_callers_found").  Many
+    # kernel helpers are invoked through ops vtables (server->ops->set_fid()),
+    # which the direct call graph cannot follow.
+    _annotate_indirect_callers(
+        all_findings, c_paths, lock_field_names,
+        extra_lock_funcs, extra_unlock_funcs, verbose,
+    )
+
     cg_impact = call_graph_impact(all_findings)
 
     # Sort: confirmed HIGH first, then suppressed HIGH, medium, low; within each by file+line
@@ -154,6 +166,100 @@ def run(cfg, run_dir, stage1_output, verbose=False):
     _print_summary(all_findings, files_scanned, cg_impact,
                    total_init_suppressed, verbose)
     return output
+
+
+def _annotate_indirect_callers(findings, c_paths, lock_field_names,
+                                extra_lock_funcs, extra_unlock_funcs, verbose):
+    """
+    For HIGH findings whose direct call graph returned 'no_callers_found',
+    attempt to resolve indirect dispatch through ops vtables.
+
+    Strategy:
+      1. Collect the set of unresolved function names.
+      2. Scan all source files for initializer_pair registrations (.field = func).
+      3. For each registered field name, scan for indirect call sites (->field()).
+      4. Annotate the findings with the resolved callers and their lock state.
+         If every indirect caller holds the expected lock, suppress the finding.
+    """
+    no_caller_findings = [
+        f for f in findings
+        if f.get('severity') == 'high'
+        and f.get('call_graph', {}).get('conclusion') == 'no_callers_found'
+        and f.get('expected_lock')
+    ]
+    if not no_caller_findings:
+        return
+
+    target_fns = {f['function'] for f in no_caller_findings}
+    ops_regs = find_ops_registrations(c_paths, target_fns)
+    if not ops_regs:
+        return
+
+    # Build field_name → {func_names} reverse map
+    field_to_funcs = {}
+    for func_name, regs in ops_regs.items():
+        for (_file, field_name) in regs:
+            field_to_funcs.setdefault(field_name, set()).add(func_name)
+
+    all_field_names = set(field_to_funcs)
+    indirect_sites = find_indirect_call_sites(
+        c_paths, all_field_names, extra_lock_funcs, extra_unlock_funcs,
+    )
+
+    if verbose and ops_regs:
+        for fn, regs in ops_regs.items():
+            fields = ', '.join(f'{field} ({p.rsplit("/",1)[-1]})' for p, field in regs)
+            print(f"  [ops] {fn} registered as: {fields}")
+
+    for f in no_caller_findings:
+        fn_name = f['function']
+        if fn_name not in ops_regs:
+            continue
+
+        expected = f['expected_lock']
+        regs = ops_regs[fn_name]
+        reg_field_names = {field for (_, field) in regs}
+
+        # Collect indirect call sites across all registered field names
+        all_sites = []
+        for field_name in reg_field_names:
+            all_sites.extend(indirect_sites.get(field_name, []))
+
+        f['call_graph']['ops_registrations'] = [
+            {'file': p.rsplit('/', 1)[-1], 'field': field}
+            for (p, field) in regs
+        ]
+
+        if not all_sites:
+            f['call_graph']['conclusion'] = 'ops_registered_no_sites_found'
+            continue
+
+        # Lock-state assessment using raw lock argument text.
+        # The expected_lock (e.g. 'lock_sem') won't appear literally in the
+        # caller's code; instead look for any argument text containing it.
+        def _holds_expected(site):
+            return any(expected in arg for arg in site['locks_held'])
+
+        with_lock    = [s for s in all_sites if _holds_expected(s)]
+        without_lock = [s for s in all_sites if not _holds_expected(s)]
+
+        def _site_label(s):
+            return (f"{s['caller_fn']} "
+                    f"({s['file'].rsplit('/',1)[-1]}:{s['line']}) "
+                    f"locks=[{', '.join(s['locks_held'])}]")
+
+        f['call_graph']['indirect_callers'] = [_site_label(s) for s in all_sites[:6]]
+
+        if not without_lock:
+            f['call_graph']['conclusion'] = 'all_indirect_callers_hold_lock'
+            f['revised_severity'] = 'suppressed'
+        elif not with_lock:
+            f['call_graph']['conclusion'] = 'no_indirect_callers_hold_lock'
+        else:
+            f['call_graph']['conclusion'] = (
+                f'{len(without_lock)}_indirect_callers_lack_lock_'
+                f'{len(with_lock)}_hold_it'
+            )
 
 
 def _obj_struct_matches(obj_text, var_types, target_struct):
@@ -388,8 +494,18 @@ def _print_summary(findings, files_scanned, cg_impact, init_suppressed, verbose)
             cg = f.get('call_graph', {})
             if cg:
                 conc = cg.get('conclusion', '')
-                if 'no_callers_found' in conc:
+                if conc == 'no_callers_found':
                     print(f"    call graph: no callers found in analyzed files")
+                elif conc == 'ops_registered_no_sites_found':
+                    regs = cg.get('ops_registrations', [])
+                    reg_str = ', '.join(f"{r['field']} ({r['file']})" for r in regs)
+                    print(f"    call graph: ops-registered ({reg_str}) but no indirect call sites found")
+                elif 'indirect_callers_hold_lock' in conc or 'indirect_callers_lack' in conc or conc == 'no_indirect_callers_hold_lock':
+                    regs = cg.get('ops_registrations', [])
+                    reg_str = ', '.join(f".{r['field']}" for r in regs)
+                    print(f"    call graph: ops dispatch ({reg_str}) — {conc}")
+                    for c in cg.get('indirect_callers', [])[:4]:
+                        print(f"      {c}")
                 elif 'no_callers_hold' in conc:
                     print(f"    call graph: no callers hold {f['expected_lock']}")
                     for c in cg.get('with_lock', [])[:2]:

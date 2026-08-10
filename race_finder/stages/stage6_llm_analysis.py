@@ -238,8 +238,20 @@ def _build_prompt(struct_context, fn_name, short_file, fn_source, findings):
             parts.append(f"     expected lock: {f['expected_lock']}")
         cg = f.get('call_graph', {})
         conc = cg.get('conclusion', '') if cg else ''
-        if 'no_callers_found' in conc:
+        if conc == 'no_callers_found':
             parts.append("     call graph: no callers in analyzed files (likely exported/VFS-called)")
+        elif conc == 'ops_registered_no_sites_found':
+            regs = cg.get('ops_registrations', [])
+            reg_str = ', '.join(f".{r['field']} ({r['file']})" for r in regs)
+            parts.append(f"     call graph: registered in ops struct as {reg_str} "
+                         f"but no indirect call sites found in analyzed files")
+        elif 'indirect_callers' in conc or 'indirect_callers_hold' in conc or conc == 'no_indirect_callers_hold_lock':
+            regs = cg.get('ops_registrations', [])
+            reg_str = ', '.join(f".{r['field']} ({r['file']})" for r in regs)
+            indirect = cg.get('indirect_callers', [])
+            parts.append(f"     call graph: called via ops dispatch ({reg_str}), conclusion={conc}")
+            for site in indirect[:4]:
+                parts.append(f"       {site}")
         elif 'callers_lack' in conc:
             without = cg.get('without_lock', [])[:3]
             with_ = cg.get('with_lock', [])[:3]

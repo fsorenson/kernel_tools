@@ -874,6 +874,135 @@ def find_lock_wrappers(source_paths):
     return acquire, release
 
 
+def find_ops_registrations(source_paths, target_func_names):
+    """
+    Scan struct initializer lists for function-pointer assignments of the form
+    `.field_name = target_function`.
+
+    Returns {func_name: [(file_path, field_name), ...]} covering every ops
+    struct (smb_version_operations, etc.) that registers one of the target
+    functions.
+    """
+    from collections import defaultdict as _dd
+    registrations = _dd(list)
+    for path in source_paths:
+        try:
+            tree, source = parse_file(path)
+        except Exception:
+            continue
+        for node in _walk(tree.root_node):
+            if node.type != 'initializer_pair':
+                continue
+            field_name = None
+            func_name = None
+            for child in node.children:
+                if child.type == 'field_designator':
+                    fid = next(
+                        (c for c in child.children if c.type == 'field_identifier'),
+                        None,
+                    )
+                    if fid:
+                        field_name = node_text(fid, source)
+                elif child.type == 'identifier':
+                    func_name = node_text(child, source)
+            if field_name and func_name and func_name in target_func_names:
+                registrations[func_name].append((str(path), field_name))
+    return dict(registrations)
+
+
+def find_indirect_call_sites(source_paths, field_names,
+                              extra_lock_funcs=None, extra_unlock_funcs=None):
+    """
+    Find indirect call sites of the form ``expr->field_name(...)`` where
+    ``field_name`` is in the given set.  Used to resolve function-pointer
+    dispatch (e.g. ``server->ops->set_fid()``) back to callers.
+
+    Lock state is tracked using *raw argument text* as the key (not struct
+    field names) because the callers are in different translation units and
+    may hold locks on unrelated structs.  The raw text (e.g.
+    ``&cinode->open_file_lock``) gives the LLM enough context to reason.
+
+    Returns {field_name: [{'file', 'caller_fn', 'line', 'locks_held'}, ...]}
+    where ``locks_held`` is a sorted list of raw argument strings.
+    """
+    from collections import defaultdict as _dd
+    eff_lock = LOCK_FUNCS | (extra_lock_funcs or set())
+    eff_unlock = UNLOCK_FUNCS | (extra_unlock_funcs or set())
+    sites = _dd(list)
+
+    for path in source_paths:
+        try:
+            tree, source = parse_file(path)
+        except Exception:
+            continue
+        for fn in find_functions(tree, source):
+            body = fn['body']
+
+            # Track all lock/unlock events by raw first-argument text.
+            raw_events = []
+            for node in _walk(body):
+                if node.type != 'call_expression':
+                    continue
+                fn_id = next((c for c in node.children if c.type == 'identifier'), None)
+                if not fn_id:
+                    continue
+                callee = node_text(fn_id, source)
+                if callee not in eff_lock and callee not in eff_unlock:
+                    continue
+                args = next((c for c in node.children if c.type == 'argument_list'), None)
+                if not args:
+                    continue
+                first = next(
+                    (c for c in args.children if c.type not in ('(', ')', ',')), None
+                )
+                if not first:
+                    continue
+                raw_events.append({
+                    'kind': 'lock' if callee in eff_lock else 'unlock',
+                    'key': node_text(first, source),
+                    'line': node.start_point[0] + 1,
+                })
+            raw_events.sort(key=lambda e: e['line'])
+
+            def _raw_held_at(line):
+                held = {}
+                for ev in raw_events:
+                    if ev['line'] > line:
+                        break
+                    if ev['kind'] == 'lock':
+                        held[ev['key']] = True
+                    else:
+                        held.pop(ev['key'], None)
+                return sorted(held)
+
+            # Find indirect calls: call_expression whose function part is a
+            # field_expression ending in one of our target field names.
+            for node in _walk(body):
+                if node.type != 'call_expression':
+                    continue
+                fn_part = next(
+                    (c for c in node.children if c.type != 'argument_list'), None
+                )
+                if not fn_part or fn_part.type != 'field_expression':
+                    continue
+                fid = next(
+                    (c for c in fn_part.children if c.type == 'field_identifier'), None
+                )
+                if not fid:
+                    continue
+                field_name = node_text(fid, source)
+                if field_name not in field_names:
+                    continue
+                line = node.start_point[0] + 1
+                sites[field_name].append({
+                    'file': str(path),
+                    'caller_fn': fn['name'],
+                    'line': line,
+                    'locks_held': _raw_held_at(line),
+                })
+    return dict(sites)
+
+
 def find_lock_events(body_node, lock_field_names, source,
                      extra_lock_funcs=None, extra_unlock_funcs=None):
     """
