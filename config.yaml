@@ -1,0 +1,37 @@
+# Kernel Race Condition Finder — Configuration
+# All paths may be overridden via command-line arguments.
+
+# Path to the Linux kernel source tree
+kernel_source: /home/src/linux
+
+target:
+  # type: struct | file | directory | function
+#  type: struct
+#  name: cifsInodeInfo
+
+  # Header files to search for struct definition (relative to kernel_source).
+  # If empty, all .h files under source_dirs are searched.
+  headers:
+
+  # C source directories to scan for lock usage (relative to kernel_source)
+  source_dirs:
+    - fs/smb/client/
+    - fs/smb/common/
+
+stages:
+  struct_map: true        # Stage 1: extract struct/lock/field map
+  lock_scan: true         # Stage 2: scan .c files for unprotected accesses
+  toctou: true            # Stage 4: TOCTOU analysis
+  llm_analysis: true     # Stage 4: LLM deep dive — requires --llm flag
+  report: true
+
+
+output:
+  # Directory where run artifacts are written (relative to this config file)
+  dir: runs/
+  # json | yaml
+  format: json
+
+llm:
+  enabled: true
+  model: claude-sonnet-4-6
