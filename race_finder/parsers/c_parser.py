@@ -729,6 +729,43 @@ def _extract_fields_and_regions(body_node, source):
 # Stage 2: lock-usage scanner primitives
 # ---------------------------------------------------------------------------
 
+# VFS inode and address_space lock functions that take an object pointer rather
+# than a pointer to the lock field itself.  The implied lock field is keyed by
+# function name; both single-inode and dual-inode variants are included.
+# These are handled specially in find_lock_events: the first argument is the
+# inode (or mapping), not &inode->i_rwsem, so _extract_lock_field_from_arg
+# cannot derive the field name — it must be looked up from this table.
+_VFS_LOCK_IMPLIED_FIELD = {
+    # inode->i_rwsem (exclusive acquire)
+    'inode_lock':                'i_rwsem',
+    'inode_lock_nested':         'i_rwsem',
+    'inode_lock_shared_nested':  'i_rwsem',
+    'inode_lock_killable':       'i_rwsem',
+    'inode_trylock':             'i_rwsem',
+    'lock_two_nondirectories':   'i_rwsem',
+    # inode->i_rwsem (shared acquire)
+    'inode_lock_shared':         'i_rwsem',
+    'inode_lock_shared_killable':'i_rwsem',
+    'inode_trylock_shared':      'i_rwsem',
+    # address_space->invalidate_lock (exclusive acquire)
+    'filemap_invalidate_lock':       'invalidate_lock',
+    'filemap_invalidate_lock_two':   'invalidate_lock',
+    # address_space->invalidate_lock (shared acquire)
+    'filemap_invalidate_lock_shared':     'invalidate_lock',
+    'filemap_invalidate_trylock_shared':  'invalidate_lock',
+}
+
+_VFS_UNLOCK_IMPLIED_FIELD = {
+    # inode->i_rwsem
+    'inode_unlock':                 'i_rwsem',
+    'inode_unlock_shared':          'i_rwsem',
+    'unlock_two_nondirectories':    'i_rwsem',
+    # address_space->invalidate_lock
+    'filemap_invalidate_unlock':        'invalidate_lock',
+    'filemap_invalidate_unlock_two':    'invalidate_lock',
+    'filemap_invalidate_unlock_shared': 'invalidate_lock',
+}
+
 LOCK_FUNCS = frozenset({
     # spinlock
     'spin_lock', 'spin_lock_bh', 'spin_lock_irq', 'spin_lock_irqsave',
@@ -746,6 +783,8 @@ LOCK_FUNCS = frozenset({
     'down_write', 'down_write_killable', 'down_write_trylock',
     # seqlock
     'write_seqlock', 'write_seqlock_irq', 'write_seqlock_irqsave',
+    # VFS inode / address_space lock wrappers (implied lock field: see _VFS_LOCK_IMPLIED_FIELD)
+    *_VFS_LOCK_IMPLIED_FIELD,
 })
 
 UNLOCK_FUNCS = frozenset({
@@ -761,6 +800,8 @@ UNLOCK_FUNCS = frozenset({
     'up_read', 'up_write',
     # seqlock
     'write_sequnlock', 'write_sequnlock_irq', 'write_sequnlock_irqrestore',
+    # VFS inode / address_space unlock wrappers (implied lock field: see _VFS_UNLOCK_IMPLIED_FIELD)
+    *_VFS_UNLOCK_IMPLIED_FIELD,
 })
 
 # access_type classification based on parent node type
@@ -1316,6 +1357,23 @@ def find_lock_events(body_node, lock_field_names, source,
         first_arg = next((c for c in args.children if c.type not in ('(', ')', ',')), None)
         if not first_arg:
             continue
+
+        # VFS inode / address_space lock wrappers: the first argument is the
+        # containing object (inode *, address_space *), not a pointer to the
+        # lock field.  Look up the implied lock field by function name.
+        if fn_name in _VFS_LOCK_IMPLIED_FIELD or fn_name in _VFS_UNLOCK_IMPLIED_FIELD:
+            implied_map = (_VFS_LOCK_IMPLIED_FIELD if fn_name in eff_lock
+                           else _VFS_UNLOCK_IMPLIED_FIELD)
+            implied = implied_map.get(fn_name)
+            if implied and implied in lock_field_names:
+                events.append({
+                    'kind': 'lock' if fn_name in eff_lock else 'unlock',
+                    'lock_name': implied,
+                    'fn': fn_name,
+                    'line': node.start_point[0] + 1,
+                })
+            continue
+
         lock_name = _extract_lock_field_from_arg(first_arg, source, lock_field_names)
         if lock_name:
             events.append({
