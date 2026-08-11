@@ -112,6 +112,40 @@ def _type_bits(type_str):
     return _TYPE_BITS.get(norm.strip(), 32)
 
 
+def _group_inner_bitfields(inner_fields):
+    """
+    Group (field_name, type_str, bit_width) tuples into co-located bitfield units.
+    Only groups with >=2 members are returned; each group is a list of those tuples.
+    """
+    groups = []
+    current = []
+    bf_cap = 0
+    bf_used = 0
+
+    for field_name, type_str, bit_width in inner_fields:
+        if bit_width is not None and bit_width > 0:
+            cap = _type_bits(type_str)
+            if bf_cap == 0 or cap != bf_cap or bf_used + bit_width > bf_cap:
+                if len(current) >= 2:
+                    groups.append(current)
+                current = [(field_name, type_str, bit_width)]
+                bf_cap = cap
+                bf_used = bit_width
+            else:
+                current.append((field_name, type_str, bit_width))
+                bf_used += bit_width
+        else:
+            if len(current) >= 2:
+                groups.append(current)
+            current = []
+            bf_cap = 0
+            bf_used = 0
+
+    if len(current) >= 2:
+        groups.append(current)
+    return groups
+
+
 def parse_file(path):
     """Return (tree, source_bytes) for a C source file."""
     with open(path, 'rb') as f:
@@ -246,6 +280,92 @@ def _walk(node):
     yield node
     for child in node.children:
         yield from _walk(child)
+
+
+_TYPEDEF_ATTR_KEYWORDS = frozenset({
+    '__packed', '__aligned', '__attribute__', '__nocast', '__bitwise', '__force',
+})
+
+
+def collect_type_definitions(tree, source):
+    """
+    Collect struct/union type definitions from a parsed file.
+
+    Returns {type_name: [(field_name, type_str, bit_width), ...]} covering:
+    - typedef struct { ... } TypeName;
+    - typedef struct { ... } __packed TypeName;   (__packed → ERROR node in tree-sitter)
+    - typedef struct TagName { ... } TypeName;
+    - struct TagName { ... };                      (named struct at file scope)
+    - union TagName { ... };                       (named union at file scope)
+    """
+    types = {}
+
+    def _extract_field_list(fdl_node):
+        result = []
+        for child in fdl_node.children:
+            if child.type != 'field_declaration':
+                continue
+            type_str, field_name, bit_width = _extract_field_decl_info(child, source)
+            if field_name:
+                result.append((field_name, type_str or '', bit_width))
+        return result
+
+    # Pass 1: typedef'd structs/unions.
+    for node in _walk(tree.root_node):
+        if node.type != 'type_definition':
+            continue
+        fdl_node = None
+        for child in node.children:
+            if child.type in ('struct_specifier', 'union_specifier'):
+                fdl_node = next(
+                    (c for c in child.children if c.type == 'field_declaration_list'),
+                    None,
+                )
+                if fdl_node:
+                    break
+        if not fdl_node:
+            continue
+
+        # Alias name: last non-attribute type_identifier child, or identifier inside
+        # an ERROR node (tree-sitter puts __packed-qualified names there).
+        name = None
+        for tid in reversed([c for c in node.children if c.type == 'type_identifier']):
+            txt = node_text(tid, source)
+            if txt not in _TYPEDEF_ATTR_KEYWORDS:
+                name = txt
+                break
+        if name is None:
+            for err in (c for c in node.children if c.type == 'ERROR'):
+                ident = next((c for c in err.children if c.type == 'identifier'), None)
+                if ident:
+                    name = node_text(ident, source)
+                    break
+        if name:
+            types[name] = _extract_field_list(fdl_node)
+
+    # Pass 2: named (tagged) structs/unions defined at file scope without typedef.
+    for node in tree.root_node.children:
+        specs = []
+        if node.type in ('struct_specifier', 'union_specifier'):
+            specs.append(node)
+        elif node.type == 'declaration':
+            specs.extend(
+                c for c in node.children
+                if c.type in ('struct_specifier', 'union_specifier')
+            )
+        for spec in specs:
+            type_id = next(
+                (c for c in spec.children if c.type == 'type_identifier'), None
+            )
+            fdl_node = next(
+                (c for c in spec.children if c.type == 'field_declaration_list'), None
+            )
+            if type_id and fdl_node:
+                name = node_text(type_id, source)
+                if name not in types:
+                    types[name] = _extract_field_list(fdl_node)
+
+    return types
 
 
 def extract_struct_info(header_path, struct_name):
@@ -389,6 +509,54 @@ def extract_struct_info(header_path, struct_name):
             'fields': names,
             'protections': [str(p) for p in sorted(protections, key=str)],
         })
+
+    # Recursive type expansion: non-bitfield fields whose type is a struct/union
+    # defined in this same file and contains its own co-located bitfields.
+    type_defs = collect_type_definitions(tree, source)
+    for f in fields:
+        if f.get('bitfield_unit') is not None:
+            continue
+        type_str = f.get('type', '')
+        inner_name = None
+        if type_str in type_defs:
+            inner_name = type_str
+        else:
+            for kw in ('struct ', 'union '):
+                idx = type_str.find(kw)
+                if idx != -1:
+                    parts = type_str[idx + len(kw):].split()
+                    if parts:
+                        candidate = parts[0].rstrip('*')
+                        if candidate in type_defs:
+                            inner_name = candidate
+                            break
+        if inner_name is None:
+            continue
+
+        inner_groups = _group_inner_bitfields(type_defs[inner_name])
+        if not inner_groups:
+            continue
+
+        outer_prot = f.get('protection')
+        for grp in inner_groups:
+            inner_names = [fn for fn, _, _ in grp]
+            dot_names = [f"{f['name']}.{fn}" for fn in inner_names]
+            if f['name'] not in existing_suspicious:
+                suspicious.append({
+                    'name': f['name'],
+                    'reason': (
+                        f"embedded type '{inner_name}' contains co-located bitfields "
+                        f"({', '.join(inner_names)}); concurrent writes to different "
+                        f"subfields race on the storage word"
+                    ),
+                })
+                existing_suspicious.add(f['name'])
+            bitfield_groups.append({
+                'fields': dot_names,
+                'protections': [outer_prot or 'none'],
+                'embedded_in': f['name'],
+                'inner_type': inner_name,
+            })
 
     return {
         'struct_name': struct_name,

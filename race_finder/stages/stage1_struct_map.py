@@ -116,7 +116,11 @@ def _print_summary(result, verbose):
         print(f"\n  Bitfield co-location groups ({len(bf_groups)} groups with mixed/absent protection):")
         for g in bf_groups:
             prots = g.get('protections', [])
-            print(f"    [{', '.join(g['fields'])}]  protections: {', '.join(prots)}")
+            if g.get('inner_type'):
+                suffix = f"  (embedded {g['inner_type']} in '{g['embedded_in']}')"
+            else:
+                suffix = ''
+            print(f"    [{', '.join(g['fields'])}]{suffix}  protections: {', '.join(prots)}")
 
     if suspicious:
         print(f"\n  SUSPICIOUS ({len(suspicious)} fields with no stated protection):")

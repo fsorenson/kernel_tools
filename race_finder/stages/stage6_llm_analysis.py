@@ -180,7 +180,11 @@ def _build_struct_context(struct_info):
         )
         for g in bf_groups:
             prots = g.get('protections', [])
-            lines.append(f"    [{', '.join(g['fields'])}]  protections: {', '.join(prots)}")
+            if g.get('inner_type'):
+                suffix = f"  (embedded {g['inner_type']} in field '{g['embedded_in']}')"
+            else:
+                suffix = ''
+            lines.append(f"    [{', '.join(g['fields'])}]{suffix}  protections: {', '.join(prots)}")
     return '\n'.join(lines)
 
 
