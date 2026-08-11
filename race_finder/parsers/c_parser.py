@@ -368,7 +368,26 @@ def collect_type_definitions(tree, source):
     return types
 
 
-def extract_struct_info(header_path, struct_name):
+def collect_type_definitions_from_paths(paths):
+    """
+    Collect and merge type definitions from multiple source files.
+    Returns {type_name: [(field_name, type_str, bit_width), ...]} merged across
+    all files.  First definition encountered wins; parse errors are silently
+    skipped.
+    """
+    merged = {}
+    for path in paths:
+        try:
+            tree, source = parse_file(path)
+        except Exception:
+            continue
+        for name, fields in collect_type_definitions(tree, source).items():
+            if name not in merged:
+                merged[name] = fields
+    return merged
+
+
+def extract_struct_info(header_path, struct_name, extra_type_map=None):
     """
     Parse header_path and return a structured dict describing struct_name:
       {
@@ -511,8 +530,10 @@ def extract_struct_info(header_path, struct_name):
         })
 
     # Recursive type expansion: non-bitfield fields whose type is a struct/union
-    # defined in this same file and contains its own co-located bitfields.
-    type_defs = collect_type_definitions(tree, source)
+    # that contains its own co-located bitfields.  Same-file definitions take
+    # precedence over cross-file ones supplied by the caller via extra_type_map.
+    _same_file = collect_type_definitions(tree, source)
+    type_defs = {**(extra_type_map or {}), **_same_file}
     for f in fields:
         if f.get('bitfield_unit') is not None:
             continue

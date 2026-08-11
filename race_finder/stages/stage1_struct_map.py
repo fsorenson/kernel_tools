@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-from ..parsers.c_parser import extract_struct_info
+from ..parsers.c_parser import extract_struct_info, collect_type_definitions_from_paths
 
 
 def run(cfg, run_dir, verbose=False):
@@ -51,6 +51,18 @@ def run(cfg, run_dir, verbose=False):
             c_files.extend(sorted(dir_path.rglob('*.c')))
         headers = [str(p.relative_to(kernel_source)) for p in h_files + c_files]
 
+    # Build a cross-file type definition map from all candidate files before
+    # searching for the struct.  This lets recursive type expansion resolve
+    # typedef'd types that live in sibling headers.
+    candidate_paths = [
+        kernel_source / rel for rel in headers
+        if (kernel_source / rel).exists()
+    ]
+    cross_file_types = collect_type_definitions_from_paths(candidate_paths)
+    if verbose:
+        print(f"  [type map] {len(cross_file_types)} types collected from "
+              f"{len(candidate_paths)} files")
+
     result = None
     searched = []
     for rel_path in headers:
@@ -62,7 +74,7 @@ def run(cfg, run_dir, verbose=False):
         searched.append(str(rel_path))
         if verbose:
             print(f"  [searching] {rel_path}")
-        info = extract_struct_info(src_path, struct_name)
+        info = extract_struct_info(src_path, struct_name, extra_type_map=cross_file_types)
         if info:
             result = info
             if verbose:
