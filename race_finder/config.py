@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
     },
     'stages': {
         'struct_map': True,
+        'async_tag': False,
         'lock_scan': False,
         'toctou': False,
         'llm_analysis': False,
@@ -114,7 +115,7 @@ Examples:
     p.add_argument('--file', metavar='PATH',
                    help='Target single C file (relative to kernel_source)')
     p.add_argument('--stage', metavar='STAGE', action='append', dest='stages',
-                   help='Stage(s) to run: struct_map, lock_scan, toctou, llm_analysis, report, all'
+                   help='Stage(s) to run: struct_map, async_tag, lock_scan, toctou, llm_analysis, report, all'
                         ' — comma-separated or repeated (e.g. --stage struct_map,lock_scan)')
     p.add_argument('--llm', action='store_true',
                    help='Enable LLM deep analysis stage')

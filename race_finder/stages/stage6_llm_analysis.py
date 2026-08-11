@@ -240,9 +240,21 @@ def _build_prompt(struct_context, fn_name, short_file, fn_source, findings):
         ]
         if f.get('expected_lock'):
             parts.append(f"     expected lock: {f['expected_lock']}")
+        ctx = f.get('async_context')
+        if ctx:
+            regs = ', '.join(
+                f"{r['via']} ({r['file']}:{r['line']})"
+                for r in ctx.get('registrations', [])[:3]
+            )
+            parts.append(
+                f"     async context: [{ctx['async_kind']}] {ctx['context_note']}"
+                + (f" — registered via {regs}" if regs else "")
+            )
         cg = f.get('call_graph', {})
         conc = cg.get('conclusion', '') if cg else ''
-        if conc == 'no_callers_found':
+        if conc == 'async_handler':
+            parts.append("     call graph: async handler — no direct callers expected")
+        elif conc == 'no_callers_found':
             parts.append("     call graph: no callers in analyzed files (likely exported/VFS-called)")
         elif conc == 'ops_registered_no_sites_found':
             regs = cg.get('ops_registrations', [])

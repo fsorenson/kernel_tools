@@ -1063,6 +1063,103 @@ def find_lock_wrappers(source_paths):
     return acquire, release
 
 
+# Mapping: registration macro/function → ([arg_indices_holding_fn_ptr], async_kind, context_note)
+# arg_indices are 0-based positions in the argument list.
+_ASYNC_REGISTRATIONS = {
+    'INIT_WORK':             ([1], 'workqueue',    'workqueue handler'),
+    'INIT_DELAYED_WORK':     ([1], 'workqueue',    'workqueue delayed handler'),
+    'INIT_DEFERRABLE_WORK':  ([1], 'workqueue',    'workqueue deferrable handler'),
+    'INIT_WORK_ONSTACK':     ([1], 'workqueue',    'workqueue handler (on-stack)'),
+    'call_rcu':              ([1], 'rcu_callback', 'RCU callback; cannot sleep or block'),
+    'call_rcu_hurry':        ([1], 'rcu_callback', 'RCU callback (hurry variant)'),
+    'timer_setup':           ([1], 'timer',        'timer callback; softirq context'),
+    'timer_setup_on_stack':  ([1], 'timer',        'timer callback (on-stack); softirq context'),
+    'setup_timer':           ([1], 'timer',        'timer callback (legacy); softirq context'),
+    'request_irq':           ([1], 'irq_handler',  'hard IRQ handler'),
+    'request_threaded_irq':  ([1, 2], 'irq_handler', 'threaded IRQ handler'),
+    'devm_request_irq':      ([2], 'irq_handler',  'device-managed IRQ handler'),
+    'tasklet_setup':         ([1], 'tasklet',      'tasklet handler; softirq context'),
+    'tasklet_init':          ([1], 'tasklet',      'tasklet handler (legacy); softirq context'),
+    'kthread_run':           ([0], 'kthread',      'kernel thread'),
+    'kthread_create':        ([0], 'kthread',      'kernel thread'),
+    'kthread_run_on_cpu':    ([0], 'kthread',      'kernel thread (pinned to CPU)'),
+    'kthread_create_on_node':([0], 'kthread',      'kernel thread (NUMA-local)'),
+    'netif_napi_add':        ([2], 'napi_poll',    'NAPI poll handler; softirq context'),
+    'netif_napi_add_weight': ([2], 'napi_poll',    'NAPI poll handler (weighted)'),
+}
+
+
+def _extract_fn_ptr_name(node, source):
+    """
+    Extract a plain function-name identifier from a function-pointer argument.
+    Handles: bare identifier, cast_expression wrapping an identifier.
+    Returns the name string, or None if it can't be extracted.
+    """
+    if node.type == 'identifier':
+        return node_text(node, source)
+    if node.type == 'cast_expression':
+        for child in node.children:
+            result = _extract_fn_ptr_name(child, source)
+            if result:
+                return result
+    return None
+
+
+def find_async_registrations(source_paths):
+    """
+    Scan source files for registrations of functions as async callbacks.
+
+    Detects INIT_WORK, INIT_DELAYED_WORK, call_rcu, timer_setup, kthread_create,
+    request_irq, tasklet_setup, and related patterns.
+
+    Returns {func_name: {'async_kind': str, 'context_note': str,
+                         'registrations': [{'file': str, 'line': int, 'via': str}]}}
+    """
+    result = {}
+    for path in source_paths:
+        try:
+            tree, source = parse_file(path)
+        except Exception:
+            continue
+        for node in _walk(tree.root_node):
+            if node.type != 'call_expression':
+                continue
+            fn_id = next((c for c in node.children if c.type == 'identifier'), None)
+            if not fn_id:
+                continue
+            reg_name = node_text(fn_id, source)
+            reg_info = _ASYNC_REGISTRATIONS.get(reg_name)
+            if not reg_info:
+                continue
+            arg_indices, async_kind, context_note = reg_info
+
+            arg_list = next(
+                (c for c in node.children if c.type == 'argument_list'), None
+            )
+            if not arg_list:
+                continue
+            args = [c for c in arg_list.children if c.type not in ('(', ')', ',')]
+
+            for idx in arg_indices:
+                if idx >= len(args):
+                    continue
+                fn_name = _extract_fn_ptr_name(args[idx], source)
+                if not fn_name or fn_name in ('NULL', '0'):
+                    continue
+                entry = result.setdefault(fn_name, {
+                    'async_kind': async_kind,
+                    'context_note': context_note,
+                    'registrations': [],
+                })
+                entry['registrations'].append({
+                    'file': str(path),
+                    'line': node.start_point[0] + 1,
+                    'via': reg_name,
+                })
+
+    return result
+
+
 def find_ops_registrations(source_paths, target_func_names):
     """
     Scan struct initializer lists for function-pointer assignments of the form

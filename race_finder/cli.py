@@ -5,10 +5,13 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import build_arg_parser, load_config
-from .stages import stage1_struct_map, stage2_lock_scan, stage4_toctou, stage6_llm_analysis, stage_report
+from .stages import (
+    stage1_struct_map, stage2_lock_scan, stage3_async_tagger,
+    stage4_toctou, stage6_llm_analysis, stage_report,
+)
 
 
-_ALL_STAGES = ['struct_map', 'lock_scan', 'toctou', 'llm_analysis', 'report']
+_ALL_STAGES = ['struct_map', 'lock_scan', 'async_tag', 'toctou', 'llm_analysis', 'report']
 
 
 def _resolve_stages(raw):
@@ -69,9 +72,14 @@ def main():
         print("--- Stage 1: Structural Map ---")
         stage_results['struct_map'] = stage1_struct_map.run(cfg, run_dir, verbose=args.verbose)
 
+    if should_run('async_tag'):
+        print("\n--- Stage 3: Async/Callback Tagger ---")
+        stage_results['async_tag'] = stage3_async_tagger.run(cfg, run_dir, verbose=args.verbose)
+
     if should_run('lock_scan'):
         print("\n--- Stage 2: Lock Usage Scan ---")
         s1 = stage_results.get('struct_map')
+        s3 = stage_results.get('async_tag')
         if not s1:
             # Load from a prior run if stage 1 wasn't run this invocation
             import json, glob as _glob
@@ -79,10 +87,18 @@ def main():
             if prior:
                 with open(prior[-1]) as _f:
                     s1 = json.load(_f)
+        if not s3:
+            import json, glob as _glob
+            prior = sorted(_glob.glob(str(run_dir.parent / f'*_{target_name}' / 'stage3_async_tags.json')))
+            if prior:
+                with open(prior[-1]) as _f:
+                    s3 = json.load(_f)
         if not s1:
             print("  [skip] stage 1 output not available — run --stage struct_map first")
         else:
-            stage_results['lock_scan'] = stage2_lock_scan.run(cfg, run_dir, s1, verbose=args.verbose)
+            stage_results['lock_scan'] = stage2_lock_scan.run(
+                cfg, run_dir, s1, stage3_output=s3, verbose=args.verbose
+            )
 
     if should_run('toctou'):
         print("\n--- Stage 4: TOCTOU Analysis ---")

@@ -45,7 +45,7 @@ from ..analysis.call_graph import (
 )
 
 
-def run(cfg, run_dir, stage1_output, verbose=False):
+def run(cfg, run_dir, stage1_output, stage3_output=None, verbose=False):
     struct_info = stage1_output['result']
     struct_name = struct_info['struct_name']
 
@@ -135,6 +135,16 @@ def run(cfg, run_dir, stage1_output, verbose=False):
         all_findings, c_paths, lock_field_names,
         extra_lock_funcs, extra_unlock_funcs, verbose,
     )
+
+    # Async context tagging: annotate findings in workqueue handlers, RCU
+    # callbacks, timer callbacks, IRQ handlers, and kernel threads.
+    async_fns = (stage3_output or {}).get('async_functions', {})
+    if async_fns:
+        _annotate_async_context(all_findings, async_fns)
+        async_tagged = sum(1 for f in all_findings if f.get('async_context'))
+        if async_tagged:
+            async_fns_tagged = len({f['function'] for f in all_findings if f.get('async_context')})
+            print(f"  Async context tagged: {async_tagged} findings in {async_fns_tagged} functions")
 
     cg_impact = call_graph_impact(all_findings)
 
@@ -260,6 +270,33 @@ def _annotate_indirect_callers(findings, c_paths, lock_field_names,
                 f'{len(without_lock)}_indirect_callers_lack_lock_'
                 f'{len(with_lock)}_hold_it'
             )
+
+
+def _annotate_async_context(findings, async_fns):
+    """
+    For each finding whose function is a known async callback, attach an
+    'async_context' key with the kind and context note.
+
+    Additionally, for HIGH findings that were tagged 'no_callers_found' but are
+    actually async handlers: update the call_graph conclusion to 'async_handler'
+    so Stage 2/6 reasoning knows this isn't a VFS-exported helper.
+    """
+    for f in findings:
+        info = async_fns.get(f['function'])
+        if not info:
+            continue
+        f['async_context'] = {
+            'async_kind': info['async_kind'],
+            'context_note': info['context_note'],
+            'registrations': [
+                {'file': r['file'].rsplit('/', 1)[-1], 'line': r['line'], 'via': r['via']}
+                for r in info['registrations']
+            ],
+        }
+        # Upgrade the call_graph conclusion for previously-unresolved HIGH findings.
+        cg = f.get('call_graph', {})
+        if cg.get('conclusion') == 'no_callers_found':
+            cg['conclusion'] = 'async_handler'
 
 
 def _obj_struct_matches(obj_text, var_types, target_struct):
@@ -491,10 +528,21 @@ def _print_summary(findings, files_scanned, cg_impact, init_suppressed, verbose)
             if f.get('expected_lock'):
                 print(f"    expected: {f['expected_lock']}  held: {f['locks_held'] or 'none'}")
             print(f"    snippet: {f['snippet']}")
+            ctx = f.get('async_context')
+            if ctx:
+                regs = ', '.join(
+                    f"{r['via']} ({r['file']}:{r['line']})"
+                    for r in ctx.get('registrations', [])[:3]
+                )
+                print(f"    async context: [{ctx['async_kind']}] {ctx['context_note']}")
+                if regs:
+                    print(f"      registered via: {regs}")
             cg = f.get('call_graph', {})
             if cg:
                 conc = cg.get('conclusion', '')
-                if conc == 'no_callers_found':
+                if conc == 'async_handler':
+                    print(f"    call graph: async handler (no direct callers expected)")
+                elif conc == 'no_callers_found':
                     print(f"    call graph: no callers found in analyzed files")
                 elif conc == 'ops_registered_no_sites_found':
                     regs = cg.get('ops_registrations', [])

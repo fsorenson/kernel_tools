@@ -8,7 +8,7 @@ Prioritized. Check marks indicate completed features.
 
 - [x] Stage 1: Structure/lock mapper — extract structs, embedded locks, state fields, and lock-protection annotations from kernel headers
 - [x] Stage 2: Lock-usage scanner — detect field accesses in .c files without an enclosing lock acquire, flag unprotected reads/writes to state/refcount fields
-- [ ] Stage 3: Async/callback path tagger — identify workqueue handlers (INIT_WORK, queue_work), RCU callbacks (call_rcu), timer handlers, completion callbacks, and other async contexts where normal locking assumptions break
+- [x] Stage 3: Async/callback path tagger — identify workqueue handlers (INIT_WORK, queue_work), RCU callbacks (call_rcu), timer handlers, completion callbacks, and other async contexts where normal locking assumptions break
 
 ## P1 — Analysis Depth
 
@@ -28,7 +28,7 @@ Prioritized. Check marks indicate completed features.
 ## P2.5 — VFS-Layer Struct Support
 
 - [ ] VFS inode lock family — add `inode_lock`, `inode_unlock`, `inode_lock_shared`, `inode_unlock_shared`, `inode_trylock`, `lock_two_inodes`, `filemap_invalidate_lock` (and shared/unlock variants) to LOCK_FUNCS/UNLOCK_FUNCS so that `i_rwsem`-protected field accesses are correctly tracked
-- [ ] Type-aware field matching — track the declared type of the object variable (e.g., distinguish `inode->i_flags` from another struct's `i_flags`) to reduce false positives when targeting structs with generic field names (`i_size`, `i_flags`, `i_count`, `i_ino`)
+- [x] Type-aware field matching — track the declared type of the object variable (e.g., distinguish `inode->i_flags` from another struct's `i_flags`) to reduce false positives when targeting structs with generic field names (`i_size`, `i_flags`, `i_count`, `i_ino`)
 - [ ] Kernel-wide header search — allow `headers:` to reference files outside `source_dirs` (e.g., `include/linux/fs.h` for `struct inode`, `include/linux/dcache.h` for `struct dentry`) so VFS-layer structs can be targeted without hardcoding paths
 
 ## P3 — Scale & Integration
