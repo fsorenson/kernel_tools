@@ -79,11 +79,23 @@ def _build_context(run_dir, s1, s2):
         for i, s1f in enumerate(s1_findings, 1):
             llm = lkp.get(i, {})
             xfn = s1f.get('propagation') == 'cross_function'
+        overflow = s1f.get('overflow', False)
+        if overflow:
+            cat_label = (f"Cat {s1f['category']} — integer overflow: "
+                         f"{s1f.get('overflow_lhs','')} "
+                         f"{s1f.get('overflow_op','*')} "
+                         f"{s1f.get('overflow_rhs','')}")
+        else:
+            cat_label = _CAT_LABEL.get(s1f['category'], s1f['category'])
         rows.append({
                 'idx':             i,
                 'propagation':     s1f.get('propagation', 'intra'),
+                'overflow':        overflow,
+                'overflow_op':     s1f.get('overflow_op', ''),
+                'overflow_lhs':    s1f.get('overflow_lhs', ''),
+                'overflow_rhs':    s1f.get('overflow_rhs', ''),
                 'category':        s1f['category'],
-                'cat_label':       _CAT_LABEL.get(s1f['category'], s1f['category']),
+                'cat_label':       cat_label,
                 'taint_source_fn': s1f['taint_source_fn'],
                 'taint_line':      s1f['taint_line'],
                 'taint_snippet':   s1f['taint_snippet'],
@@ -240,14 +252,19 @@ def _md_finding(buf, r, has_llm):
             verdict = " — *unanalyzed*"
 
     xfn = r.get('propagation') == 'cross_function'
+    ovf = r.get('overflow', False)
     xfn_tag = f" — cross-function via `{r['callee_fn']}()`" if xfn else ''
-    W(f"#### Finding #{r['idx']} — Category {r['category']}{xfn_tag}{verdict}\n")
+    ovf_tag = ' — **INTEGER OVERFLOW**' if ovf else ''
+    W(f"#### Finding #{r['idx']} — Category {r['category']}{xfn_tag}{ovf_tag}{verdict}\n")
     W(f"| Field | Value |")
     W(f"|---|---|")
     W(f"| Category | {r['cat_label']} |")
     W(f"| Taint source | `{r['taint_source_fn']}()` line {r['taint_line']} |")
     W(f"| Taint snippet | `{r['taint_snippet']}` |")
     W(f"| Tainted var | `{r['tainted_var']}` |")
+    if ovf:
+        W(f"| Overflow expr | `{r['overflow_lhs']} {r['overflow_op']} {r['overflow_rhs']}` |")
+        W(f"| Safe fix | `kmalloc_array()` or `check_mul_overflow()` |")
     if xfn:
         W(f"| Call site | line {r['call_site_line']} — passes `{r['tainted_var']}` to `{r['callee_fn']}()` |")
         W(f"| Call snippet | `{r['call_site_snippet']}` |")
@@ -467,10 +484,12 @@ def _html_finding(lines, r, has_llm):
 
     verdict_sep = ' &mdash; ' if verdict else ''
     xfn = r.get('propagation') == 'cross_function'
+    ovf = r.get('overflow', False)
     xfn_str = (f' &mdash; cross-function via <code>{_e(r["callee_fn"])}()</code>'
                if xfn else '')
+    ovf_str = ' &mdash; <b style="color:var(--oob_write)">INTEGER OVERFLOW</b>' if ovf else ''
     W(f'<h4 class="{hcls}">Finding #{r["idx"]} &mdash; Category {_e(r["category"])}'
-      f'{xfn_str}{verdict_sep}{verdict}</h4>')
+      f'{xfn_str}{ovf_str}{verdict_sep}{verdict}</h4>')
 
     W('<table>')
     W(f'<tr><th>Category</th><td>{_e(r["cat_label"])}</td></tr>')
@@ -478,6 +497,11 @@ def _html_finding(lines, r, has_llm):
       f'<code>{_e(r["taint_source_fn"])}()</code> line {r["taint_line"]}</td></tr>')
     W(f'<tr><th>Taint snippet</th><td><code>{_e(r["taint_snippet"])}</code></td></tr>')
     W(f'<tr><th>Tainted var</th><td><code>{_e(r["tainted_var"])}</code></td></tr>')
+    if ovf:
+        W(f'<tr><th>Overflow expr</th><td><code>{_e(r["overflow_lhs"])} '
+          f'{_e(r["overflow_op"])} {_e(r["overflow_rhs"])}</code></td></tr>')
+        W(f'<tr><th>Safe fix</th><td><code>kmalloc_array()</code> or '
+          f'<code>check_mul_overflow()</code></td></tr>')
     if xfn:
         W(f'<tr><th>Call site</th><td>line {r["call_site_line"]} &mdash; '
           f'passes <code>{_e(r["tainted_var"])}</code> to '

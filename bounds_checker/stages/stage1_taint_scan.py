@@ -79,15 +79,17 @@ def run(cfg, run_dir, verbose=False):
 
 
 def _print_summary(findings_intra, findings_cross, by_category, c_paths):
-    total = len(findings_intra) + len(findings_cross)
-    guarded = sum(1 for f in findings_intra + findings_cross if f['possibly_guarded'])
-    unguarded = total - guarded
+    all_findings = findings_intra + findings_cross
+    total    = len(all_findings)
+    guarded  = sum(1 for f in all_findings if f['possibly_guarded'])
+    overflow = sum(1 for f in all_findings if f.get('overflow'))
 
     print(f"\n{'─'*60}")
     print(f"  Taint scan: {total} finding(s) in {len(c_paths)} file(s)")
     print(f"  Intra-procedural: {len(findings_intra)}   "
-          f"Cross-function: {len(findings_cross)}")
-    print(f"  Unguarded: {unguarded}   Possibly guarded: {guarded}")
+          f"Cross-function: {len(findings_cross)}   "
+          f"Integer-overflow: {overflow}")
+    print(f"  Unguarded: {total - guarded}   Possibly guarded: {guarded}")
     print()
 
     for cat in sorted(by_category):
@@ -96,12 +98,14 @@ def _print_summary(findings_intra, findings_cross, by_category, c_paths):
             'B': 'Cat B — server value → size/alloc argument',
             'C': 'Cat C — server value → array subscript',
         }.get(cat, f'Cat {cat}')
-        entries = by_category[cat]
+        entries   = by_category[cat]
         intra_n   = sum(1 for f in entries if f.get('propagation') == 'intra')
         cross_n   = sum(1 for f in entries if f.get('propagation') == 'cross_function')
+        ovf_n     = sum(1 for f in entries if f.get('overflow'))
         guarded_n = sum(1 for f in entries if f['possibly_guarded'])
+        ovf_str   = f', overflow={ovf_n}' if ovf_n else ''
         print(f"  [{cat}] {label}: {len(entries)} finding(s)"
-              f"  (intra={intra_n}, xfn={cross_n}, {guarded_n} possibly guarded)")
+              f"  (intra={intra_n}, xfn={cross_n}{ovf_str}, {guarded_n} possibly guarded)")
         for f in entries[:8]:
             guard_tag  = ' [guarded?]' if f['possibly_guarded'] else ''
             xfn_tag    = f' → {f["callee_fn"]}()' if f.get('propagation') == 'cross_function' else ''

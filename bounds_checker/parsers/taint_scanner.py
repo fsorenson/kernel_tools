@@ -97,6 +97,19 @@ DANGEROUS_SINKS = {
 # For Category C: these operators produce a subscript expression
 _SUBSCRIPT_NODE = 'subscript_expression'
 
+# Overflow-safe size helpers: if any of these wrap the size argument (or an
+# operand within it), the arithmetic is already overflow-checked — don't flag.
+_SAFE_SIZE_HELPERS = frozenset({
+    'array_size',           # array_size(n, size) → SIZE_MAX on overflow
+    'array3_size',          # array3_size(a, b, c)
+    'size_mul',             # 5.8+: size_mul(a, b)
+    'size_add',             # 5.8+: size_add(a, b)
+    'struct_size',          # struct_size(p, member, n) for trailing-array allocs
+    'check_mul_overflow',   # explicit check; caller handles the error path
+    'check_add_overflow',
+    'saturate_add',
+})
+
 
 # ---------------------------------------------------------------------------
 # Expression taint analysis helpers
@@ -158,6 +171,86 @@ def _arg_nodes(call_node):
     if not arg_list:
         return []
     return [c for c in arg_list.children if c.type not in ('(', ')', ',')]
+
+
+def _find_overflow_in_size_arg(arg_node, source, tainted):
+    """
+    Detect integer overflow risk in a size/length argument.
+
+    Checks whether the argument is a top-level binary * or + expression
+    where at least one operand carries taint — without a safe overflow
+    wrapper (_SAFE_SIZE_HELPERS) guarding the expression.
+
+    Only examines the outermost binary expression (unwrapping one layer of
+    parens/casts) to avoid multiple findings for chains like a * b * c.
+
+    Returns a list with at most one dict:
+        {'op', 'lhs_text', 'rhs_text', 'taint_source', 'tainted_var',
+         'taint_line', 'taint_kind'}
+    or [] if no overflow risk is found.
+    """
+    def _is_safe_call(node):
+        if node.type != 'call_expression':
+            return False
+        fn_id = next((c for c in node.children if c.type == 'identifier'), None)
+        return fn_id is not None and node_text(fn_id, source) in _SAFE_SIZE_HELPERS
+
+    # If the whole arg is a safe helper, bail immediately.
+    if _is_safe_call(arg_node):
+        return []
+
+    # Unwrap one layer of parentheses or cast to find the binary expression.
+    target = arg_node
+    if arg_node.type in ('parenthesized_expression', 'cast_expression'):
+        for child in arg_node.children:
+            if child.type == 'binary_expression':
+                target = child
+                break
+
+    if target.type != 'binary_expression':
+        return []
+
+    op_types = {c.type for c in target.children}
+    if '*' not in op_types and '+' not in op_types:
+        return []
+    op = '*' if '*' in op_types else '+'
+
+    lhs = target.children[0]
+    rhs = target.children[-1]
+
+    # If either operand is itself a safe helper, the expression is protected.
+    if _is_safe_call(lhs) or _is_safe_call(rhs):
+        return []
+
+    # Find taint in either operand.
+    taint_src = tainted_var = taint_line_v = None
+    taint_kind = 'value'
+    for side in (lhs, rhs):
+        src = _node_has_taint_source_call(side, source)
+        if src:
+            taint_src, tainted_var = src, node_text(side, source)[:60]
+            taint_line_v = target.start_point[0] + 1
+            break
+        ref = _node_references_tainted_var(side, source, tainted)
+        if ref:
+            taint_src = tainted[ref]['source_fn']
+            tainted_var = ref
+            taint_line_v = tainted[ref]['line']
+            taint_kind = tainted[ref]['kind']
+            break
+
+    if not taint_src:
+        return []
+
+    return [{
+        'op':          op,
+        'lhs_text':    node_text(lhs, source)[:60],
+        'rhs_text':    node_text(rhs, source)[:60],
+        'taint_source': taint_src,
+        'tainted_var': tainted_var,
+        'taint_line':  taint_line_v,
+        'taint_kind':  taint_kind,
+    }]
 
 
 def _collect_tainted_args(args, source, tainted, call_line):
@@ -346,6 +439,48 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         ),
                     })
 
+            # Integer overflow check: tainted value in multiplicative/additive
+            # size expression (e.g., kmalloc(count * sizeof(foo))).
+            # Emits a separate 'size_mul_overflow' finding; the dedup pass at
+            # the end of _scan_body suppresses the redundant plain Cat B for
+            # the same (sink_fn, sink_line, arg_idx).
+            for idx in sink_info.get('size_args', []):
+                if idx >= len(args):
+                    continue
+                for hit in _find_overflow_in_size_arg(args[idx], source, tainted):
+                    guarded = _find_guards_between(
+                        fn_body, {hit['tainted_var']},
+                        hit['taint_line'], sink_line, source,
+                    )
+                    op_word = 'multiplication' if hit['op'] == '*' else 'addition'
+                    findings.append({
+                        'function':        fn_name,
+                        'file':            str(filepath),
+                        'category':        'B',
+                        'severity':        'high',
+                        'overflow':        True,
+                        'overflow_op':     hit['op'],
+                        'overflow_lhs':    hit['lhs_text'],
+                        'overflow_rhs':    hit['rhs_text'],
+                        'taint_source_fn': hit['taint_source'],
+                        'tainted_var':     hit['tainted_var'],
+                        'taint_line':      hit['taint_line'],
+                        'taint_snippet':   get_source_line(source, hit['taint_line']),
+                        'sink_fn':         sink_fn,
+                        'sink_line':       sink_line,
+                        'sink_snippet':    sink_snippet,
+                        'sink_arg_index':  idx,
+                        'sink_arg_role':   'size_mul_overflow',
+                        'possibly_guarded': guarded,
+                        'reason': (
+                            f"integer overflow risk: {hit['lhs_text']} {hit['op']} "
+                            f"{hit['rhs_text']} passed as size to {sink_fn}(); "
+                            f"tainted {hit['tainted_var']} (from {hit['taint_source']}()) "
+                            f"could cause {op_word} to wrap, producing an undersized "
+                            f"allocation — use kmalloc_array() or check_mul_overflow()"
+                        ),
+                    })
+
             # Check pointer arguments (Category A)
             for idx in sink_info.get('ptr_args', []):
                 if idx >= len(args):
@@ -436,11 +571,24 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 ),
             })
 
-    # Deduplicate: same (category, tainted_var, sink_fn, sink_line)
+    # Deduplicate and resolve conflicts between overflow and plain Cat B.
+    # When an overflow finding and a plain Cat B cover the same
+    # (function, sink_fn, sink_line, arg_idx), suppress the plain Cat B —
+    # the overflow finding is more specific and has the right fix suggestion.
+    overflow_locs = {
+        (f['function'], f['sink_fn'], f['sink_line'], f['sink_arg_index'])
+        for f in findings if f.get('overflow')
+    }
+
     seen = set()
     unique = []
     for f in findings:
-        key = (f['category'], f['tainted_var'], f['sink_fn'], f['sink_line'])
+        loc = (f['function'], f['sink_fn'], f['sink_line'], f['sink_arg_index'])
+        if (f['category'] == 'B' and not f.get('overflow') and
+                f['sink_arg_role'] in ('size', 'count') and loc in overflow_locs):
+            continue   # superseded by the more specific overflow finding
+        key = (f['category'], f.get('sink_arg_role', ''), f['tainted_var'],
+               f['sink_fn'], f['sink_line'])
         if key not in seen:
             seen.add(key)
             unique.append(f)

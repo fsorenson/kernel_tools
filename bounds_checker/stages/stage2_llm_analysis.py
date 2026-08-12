@@ -32,9 +32,10 @@ if _VERTEX_REGION == 'global':
     _VERTEX_REGION = 'us-east5'
 
 _CATEGORY_LABELS = {
-    'A': 'server-supplied value → pointer arithmetic → memory operation',
-    'B': 'server-supplied value → size/length/allocation argument',
-    'C': 'server-supplied value → array subscript',
+    'A':        'server-supplied value → pointer arithmetic → memory operation',
+    'B':        'server-supplied value → size/length/allocation argument',
+    'B_OVF':    'integer overflow: server-supplied value in multiplicative/additive size expression',
+    'C':        'server-supplied value → array subscript',
 }
 
 _IMPACT_CHOICES = (
@@ -313,13 +314,22 @@ def _format_findings(findings):
     lines = []
     for i, f in enumerate(findings, 1):
         cat = f['category']
-        cat_label = _CATEGORY_LABELS.get(cat, cat)
+        overflow = f.get('overflow', False)
+        cat_key = f'{cat}_OVF' if overflow else cat
+        cat_label = _CATEGORY_LABELS.get(cat_key, _CATEGORY_LABELS.get(cat, cat))
         guard_tag = 'yes (check heuristic — may not be sufficient)' if f['possibly_guarded'] else 'no'
         xfn = f.get('propagation') == 'cross_function'
 
         entry = (
             f"#{i}  Category {cat}: {cat_label}"
         )
+        if overflow:
+            entry += (
+                f"\n    Overflow expression: {f['overflow_lhs']} "
+                f"{f['overflow_op']} {f['overflow_rhs']}"
+                f"\n    Safe fix: use kmalloc_array() or check_mul_overflow() "
+                f"instead of raw {'multiplication' if f['overflow_op'] == '*' else 'addition'}"
+            )
         if xfn:
             entry += f"  [CROSS-FUNCTION via {f['callee_fn']}()]"
         entry += (

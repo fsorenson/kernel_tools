@@ -58,9 +58,12 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       `propagation: 'cross_function'` distinguishes these from intra-procedural
       findings in the JSON, report, and LLM prompt.
 
-- [ ] Integer overflow detection — flag `a * b` or `a + b` passed directly to
-      `kmalloc`/`memcpy`/etc. without `check_mul_overflow`, `size_add`,
-      `size_mul`, or `kmalloc_array`; separate from Category B basic size check
+- [x] Integer overflow detection — flag `a * b` or `a + b` in size/length
+      arguments to allocators and memory ops where at least one operand is
+      tainted; suppresses the plain Cat B for the same location in favor of
+      the more specific `sink_arg_role: 'size_mul_overflow'` finding;
+      safe wrappers (`array_size`, `size_mul`, `kmalloc_array`, etc.) are
+      recognized and excluded
 
 - [ ] Guard detection improvement — current MVP uses a line-number heuristic
       (if any `if` referencing the tainted var appears between source and sink,
