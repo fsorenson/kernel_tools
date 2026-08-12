@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from bounds_checker.config import build_arg_parser, load_config
-from bounds_checker.stages import stage1_taint_scan
+from bounds_checker.stages import stage1_taint_scan, stage2_llm_analysis
 
 
 def main():
@@ -50,9 +50,19 @@ def main():
     else:
         s1 = None
 
-    # Stage 2: LLM analysis (placeholder)
+    # Stage 2: LLM analysis
     if args.llm:
-        print("\n--- Stage 2: LLM Analysis --- (not yet implemented)")
+        print("\n--- Stage 2: LLM Analysis ---")
+        if s1:
+            cfg['llm']['enabled'] = True
+            stage2_llm_analysis.run(
+                cfg, run_dir, s1,
+                verbose=args.verbose,
+                debug=args.debug,
+                thinking_budget=args.thinking,
+            )
+        else:
+            print("  Skipped — no Stage 1 findings.")
 
     print(f"\nDone. Artifacts in: {run_dir}")
     return 0

@@ -26,7 +26,7 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       - [x] **Category C**: server-supplied value → array subscript without bounds check
             (e.g., `arr[le16_to_cpu(hdr->Index)]` without `if (idx >= ARRAY_SIZE(arr))`)
 
-- [ ] Stage 2: LLM deep analysis — feed taint findings to Claude API for
+- [x] Stage 2: LLM deep analysis — feed taint findings to Claude API for
       false-positive filtering, severity assessment, and fix suggestions;
       analogous to race finder Stage 6
 

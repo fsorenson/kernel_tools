@@ -54,6 +54,8 @@ def load_config(config_path=None, cli_args=None):
             cfg['output']['dir'] = cli_args.output_dir
         if getattr(cli_args, 'categories', None):
             cfg['categories'] = cli_args.categories
+        if getattr(cli_args, 'model', None):
+            cfg['llm']['model'] = cli_args.model
 
     cfg['kernel_source'] = Path(cfg['kernel_source']).expanduser().resolve()
     if not cfg['kernel_source'].exists():
@@ -87,6 +89,12 @@ Examples:
     p.add_argument('--output-dir', metavar='DIR',
                    help='Output directory for run artifacts')
     p.add_argument('--llm', action='store_true',
-                   help='Enable LLM deep analysis stage (not yet implemented)')
+                   help='Enable Stage 2 LLM deep analysis (requires API credentials)')
+    p.add_argument('--model', metavar='MODEL',
+                   help='Claude model for LLM analysis (overrides config)')
+    p.add_argument('--thinking', metavar='TOKENS', type=int, default=0,
+                   help='Extended thinking budget in tokens (0=disabled; min 1024)')
+    p.add_argument('--debug', action='store_true',
+                   help='Write full LLM prompts and responses to stage2_llm_analysis.debug')
     p.add_argument('--verbose', '-v', action='store_true')
     return p
