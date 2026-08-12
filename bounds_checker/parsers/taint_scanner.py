@@ -285,24 +285,88 @@ def _collect_tainted_args(args, source, tainted, call_line):
 # Guard / check detection
 # ---------------------------------------------------------------------------
 
+_GUARD_CMP_OPS   = frozenset({'<', '<=', '>', '>=', '==', '!='})
+_GUARD_TERM_STMTS = frozenset({
+    'return_statement', 'goto_statement', 'break_statement', 'continue_statement',
+})
+_GUARD_TERM_CALLS = frozenset({
+    'BUG', 'BUG_ON', 'BUG_ON_NULL', 'panic',
+    'WARN', 'WARN_ON', 'WARN_ON_ONCE',
+})
+
+
 def _find_guards_between(fn_body, var_names, line_lo, line_hi, source):
     """
-    Return True if any if_statement between line_lo and line_hi has a
-    condition that references any variable in var_names.
-    This is a line-number heuristic — does not account for control flow.
+    Return True if a plausible bounds check on a variable in var_names appears
+    between line_lo and line_hi.
+
+    Two requirements beyond the original line-range check:
+
+    1. Condition must contain a relational comparison (< <= > >= == !=) with
+       at least one operand that references a variable in var_names.  This
+       eliminates bare zero-tests (if (X)) and conditions that reference the
+       variable in a non-comparison context.
+
+    2. The check must actually gate the dangerous use, via either:
+       a. Early-exit pattern: consequence or alternative contains a terminal
+          statement (return/goto/break/continue/BUG/panic), OR
+       b. Guarded-use pattern: the sink line (line_hi) falls textually inside
+          the consequence or alternative, meaning the dangerous call only
+          executes when the check passes.
     """
+    if not var_names:
+        return False
+
+    def _cond_has_relational_var(cond_node):
+        for n in _walk(cond_node):
+            if n.type != 'binary_expression':
+                continue
+            if not any(c.type in _GUARD_CMP_OPS for c in n.children):
+                continue
+            for ident in _walk(n):
+                if ident.type == 'identifier' and node_text(ident, source) in var_names:
+                    return True
+        return False
+
+    def _has_terminal(subtree):
+        for n in _walk(subtree):
+            if n.type in _GUARD_TERM_STMTS:
+                return True
+            if n.type == 'call_expression':
+                fn_id = next((c for c in n.children if c.type == 'identifier'), None)
+                if fn_id and node_text(fn_id, source) in _GUARD_TERM_CALLS:
+                    return True
+        return False
+
     for node in _walk(fn_body):
         if node.type != 'if_statement':
             continue
         stmt_line = node.start_point[0] + 1
         if stmt_line <= line_lo or stmt_line >= line_hi:
             continue
+
         cond = node.child_by_field_name('condition')
-        if cond is None:
+        if cond is None or not _cond_has_relational_var(cond):
             continue
-        for n in _walk(cond):
-            if n.type == 'identifier' and node_text(n, source) in var_names:
+
+        consequence = node.child_by_field_name('consequence')
+        alternative = node.child_by_field_name('alternative')
+
+        # Early-exit pattern
+        if consequence and _has_terminal(consequence):
+            return True
+        if alternative and _has_terminal(alternative):
+            return True
+
+        # Guarded-use pattern: dangerous call is inside this branch
+        for branch in (consequence, alternative):
+            if branch is None:
+                continue
+            b_lo = branch.start_point[0] + 1
+            b_hi = branch.end_point[0] + 1
+            if b_lo <= line_hi <= b_hi:
                 return True
+
     return False
 
 

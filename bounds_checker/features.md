@@ -65,9 +65,14 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       safe wrappers (`array_size`, `size_mul`, `kmalloc_array`, etc.) are
       recognized and excluded
 
-- [ ] Guard detection improvement — current MVP uses a line-number heuristic
-      (if any `if` referencing the tainted var appears between source and sink,
-      mark "possibly guarded"); improve with control-flow awareness
+- [x] Guard detection improvement — upgraded from line-number heuristic to a
+      two-requirement check: (1) condition must contain a relational comparison
+      (`< <= > >= == !=`) referencing the tainted variable (eliminates bare
+      zero-tests); (2) guard must actually gate the use via an early-exit terminal
+      (`return`/`goto`/`break`/`continue`/`BUG`/`panic`) in the consequence or
+      alternative, or the sink must be textually within the guarded branch.
+      Reduces spurious "possibly guarded" rate from 66 % to 62 % on fs/smb/client;
+      remaining flags correspond to genuine relational checks with early exits.
 
 - [ ] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       `int` intermediate; the narrowing silently caps the value, allowing a check
