@@ -40,6 +40,8 @@ def write_reports(run_dir, stage1_output, stage2_output, formats=('md', 'html'))
 
     for p in written:
         print(f"  Report: {p}")
+
+    write_summary(run_dir, stage1_output, stage2_output, formats)
     return written
 
 
@@ -571,3 +573,375 @@ def _html_finding(lines, r, has_llm):
                 W(f'<div class="cve"><b>CVE pattern:</b> {_e(r["cve_pattern"])}</div>')
         elif real is False and r['notes']:
             W(f'<div class="note fp-dim"><i>Dismissed:</i> {_e(r["notes"])}</div>')
+
+
+# ---------------------------------------------------------------------------
+# Priority summary (cross-file ranked list)
+# ---------------------------------------------------------------------------
+
+# Scoring weights — tune here without touching the renderers.
+_IMPACT_SCORE = {
+    'oob_write': 100, 'stack_overflow': 90, 'oob_read': 80,
+    'integer_overflow': 60, 'undersized_alloc': 60, 'info_disclosure': 40,
+}
+_CAT_BASE = {'A': 50, 'E': 50, 'C': 40, 'B': 40, 'F': 30, 'H': 20}
+
+_TIERS = [
+    (250, 'Critical'),   # LLM-confirmed real bug
+    (100, 'High'),       # unanalyzed, unguarded, dangerous category
+    (60,  'Medium'),     # unanalyzed/guarded or lower-category
+    (0,   'Low'),        # likely false positive, low-risk
+]
+
+_SUMMARY_TOP_N = 30     # rows shown in the "top findings" MD table
+
+
+def _score_finding(s1f, llm):
+    score = _CAT_BASE.get(s1f['category'], 10)
+    real  = llm.get('real_bug')
+    if real is True:
+        score += 200 + _IMPACT_SCORE.get(llm.get('impact', ''), 0)
+    elif real is None:
+        score += 50    # unanalyzed — assume it could be real
+    if not s1f['possibly_guarded']:
+        score += 20
+    if s1f.get('overflow'):
+        score += 30
+    return score
+
+
+def _tier_label(score):
+    for threshold, label in _TIERS:
+        if score >= threshold:
+            return label
+    return 'Low'
+
+
+def _sink_label(s1f):
+    role = s1f.get('sink_arg_role', '')
+    if role == 'narrowed_value':
+        return 'truncation'
+    if role == 'loop_bound':
+        return 'loop bound'
+    if role == 'subscript':
+        xfn = s1f.get('propagation') == 'cross_function'
+        return 'subscript (callee)' if xfn else 'subscript'
+    if role == 'tainted_ptr_deref':
+        return f"{s1f['tainted_var']}->{s1f.get('field_name', '?')}"
+    if s1f.get('overflow'):
+        return (f"{s1f.get('overflow_lhs','')} "
+                f"{s1f.get('overflow_op','*')} "
+                f"{s1f.get('overflow_rhs','')}")
+    xfn = s1f.get('propagation') == 'cross_function'
+    callee = s1f.get('callee_fn', '')
+    if xfn and callee:
+        return f"{s1f['sink_fn']}() in {callee}()"
+    return f"{s1f['sink_fn']}()"
+
+
+def _llm_verdict(llm, has_llm):
+    if not has_llm:
+        return '—'
+    real = llm.get('real_bug')
+    if real is True:
+        impact = llm.get('impact', '')
+        return f"BUG:{impact}" if impact and impact != 'none' else 'BUG'
+    if real is False:
+        return 'FP'
+    return '?'
+
+
+def _build_scored_rows(stage1_output, stage2_output):
+    """Return sorted list of (score, s1f, llm, short_file)."""
+    s2_by_fn = {(a['function'], a['file']): a
+                for a in stage2_output.get('analyses', [])}
+
+    s1_groups = defaultdict(list)
+    for f in stage1_output.get('findings', []):
+        s1_groups[(f['function'], f['file'])].append(f)
+
+    rows = []
+    for (fn_name, filepath), s1_findings in s1_groups.items():
+        short_file = Path(filepath).name
+        analysis = (s2_by_fn.get((fn_name, short_file))
+                    or s2_by_fn.get((fn_name, filepath), {}))
+        lkp = {f['finding_index']: f for f in analysis.get('findings', [])}
+        for i, s1f in enumerate(s1_findings, 1):
+            llm = lkp.get(i, {})
+            score = _score_finding(s1f, llm)
+            rows.append((score, s1f, llm, short_file))
+
+    rows.sort(key=lambda x: (-x[0], x[1]['function'], x[1]['sink_line']))
+    return rows
+
+
+def write_summary(run_dir, stage1_output, stage2_output, formats=('md', 'html')):
+    """Write cross-file priority summary (summary.md / summary.html)."""
+    run_dir  = Path(run_dir)
+    has_llm  = bool(stage2_output.get('analyses'))
+    rows     = _build_scored_rows(stage1_output, stage2_output)
+    now_str  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    run_name = run_dir.name
+    source_dirs = stage1_output.get('source_dirs', [])
+
+    written = []
+    if 'md' in formats:
+        path = run_dir / 'summary.md'
+        path.write_text(
+            _render_summary_md(rows, has_llm, run_name, now_str, source_dirs),
+            encoding='utf-8',
+        )
+        written.append(path)
+    if 'html' in formats:
+        path = run_dir / 'summary.html'
+        path.write_text(
+            _render_summary_html(rows, has_llm, run_name, now_str, source_dirs),
+            encoding='utf-8',
+        )
+        written.append(path)
+
+    for p in written:
+        print(f"  Summary: {p}")
+    return written
+
+
+# -- Stat helpers ------------------------------------------------------------
+
+def _cat_counts(rows):
+    counts = {}
+    for _, s1f, _, _ in rows:
+        counts[s1f['category']] = counts.get(s1f['category'], 0) + 1
+    return counts
+
+
+def _tier_counts(rows, has_llm):
+    counts = {}
+    for score, s1f, llm, _ in rows:
+        t = _tier_label(score)
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def _file_counts(rows):
+    counts = {}
+    for _, s1f, _, short_file in rows:
+        counts[short_file] = counts.get(short_file, 0) + 1
+    return dict(sorted(counts.items(), key=lambda x: -x[1]))
+
+
+# -- Markdown renderer -------------------------------------------------------
+
+def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs):
+    buf = []
+    W = buf.append
+
+    W(f"# Priority Summary — {run_name}\n")
+    W(f"**Date:** {now_str}  ")
+    W(f"**Source:** {', '.join(source_dirs)}  ")
+    W(f"**Total findings:** {len(rows)}\n")
+
+    # Tier breakdown
+    tier_cts = _tier_counts(rows, has_llm)
+    tier_parts = '  |  '.join(
+        f"**{t}:** {tier_cts.get(t, 0)}"
+        for t, _ in [('Critical', None), ('High', None),
+                     ('Medium', None), ('Low', None)]
+        if tier_cts.get(t, 0)
+    )
+    W(f"**Tier breakdown:** {tier_parts}\n")
+
+    cat_cts = _cat_counts(rows)
+    cat_parts = '  '.join(
+        f"Cat {c}: {n}" for c, n in sorted(cat_cts.items())
+    )
+    W(f"**By category:** {cat_parts}\n")
+
+    if has_llm:
+        real_n  = sum(1 for _, _, llm, _ in rows if llm.get('real_bug') is True)
+        fp_n    = sum(1 for _, _, llm, _ in rows if llm.get('real_bug') is False)
+        unk_n   = sum(1 for _, _, llm, _ in rows if llm.get('real_bug') is None)
+        W(f"**LLM:** {real_n} real bug(s)  |  {fp_n} FP  |  {unk_n} unanalyzed\n")
+
+    W("\n---\n")
+
+    # Top-N table (always show; truncate with note if more)
+    top = rows[:_SUMMARY_TOP_N]
+    W(f"## Top {min(len(rows), _SUMMARY_TOP_N)} Findings by Priority\n")
+    llm_hdr = ' LLM |' if has_llm else ''
+    W(f"| # | Tier | Cat | Function | File | Variable | Sink | Guard |{llm_hdr}")
+    W(f"|---|---|---|---|---|---|---|---|{'---|' if has_llm else ''}")
+    for rank, (score, s1f, llm, short_file) in enumerate(top, 1):
+        tier  = _tier_label(score)
+        guard = 'yes?' if s1f['possibly_guarded'] else 'no'
+        sink  = _sink_label(s1f)
+        vrdt  = _llm_verdict(llm, has_llm)
+        llm_col = f' {vrdt} |' if has_llm else ''
+        W(f"| {rank} | {tier} | {s1f['category']} | `{s1f['function']}` "
+          f"| {short_file} | `{s1f['tainted_var']}` "
+          f"| {sink} | {guard} |{llm_col}")
+
+    if len(rows) > _SUMMARY_TOP_N:
+        W(f"\n*{len(rows) - _SUMMARY_TOP_N} lower-priority findings not shown — "
+          f"see report.md for full details.*\n")
+
+    W("")
+
+    # Per-tier sections (all findings, grouped)
+    W("---\n")
+    W("## All Findings by Tier\n")
+    current_tier = None
+    for rank, (score, s1f, llm, short_file) in enumerate(rows, 1):
+        tier = _tier_label(score)
+        if tier != current_tier:
+            W(f"### {tier}\n")
+            W(f"| # | Score | Cat | Function | File | Variable | Sink | Guard |"
+              f"{' LLM |' if has_llm else ''}")
+            W(f"|---|---|---|---|---|---|---|---|{'---|' if has_llm else ''}")
+            current_tier = tier
+        guard = 'yes?' if s1f['possibly_guarded'] else 'no'
+        sink  = _sink_label(s1f)
+        vrdt  = _llm_verdict(llm, has_llm)
+        llm_col = f' {vrdt} |' if has_llm else ''
+        W(f"| {rank} | {score} | {s1f['category']} | `{s1f['function']}` "
+          f"| {short_file} | `{s1f['tainted_var']}` "
+          f"| {sink} | {guard} |{llm_col}")
+    W("")
+
+    # Files with most findings
+    W("---\n")
+    W("## Findings by File\n")
+    W("| File | Findings |")
+    W("|---|---|")
+    for fname, n in _file_counts(rows).items():
+        W(f"| {fname} | {n} |")
+    W("")
+
+    return '\n'.join(buf)
+
+
+# -- HTML summary renderer ---------------------------------------------------
+
+_SUMMARY_CSS = """\
+:root {
+  --bg: #f8f8f8; --fg: #222; --border: #ccc;
+  --hdr-bg: #2a3d5a; --hdr-fg: #fff; --code-bg: #eee;
+  --critical: #8b0000; --high: #c00; --medium: #b06000; --low: #555;
+  --fp: #2a7a2a; --bug: #c00; --unknown: #888;
+}
+* { box-sizing: border-box; }
+body { font-family: 'Liberation Mono','Courier New',monospace; font-size:12px;
+       background:var(--bg); color:var(--fg); margin:0; padding:0; }
+h1 { background:var(--hdr-bg); color:var(--hdr-fg); margin:0;
+     padding:14px 20px; font-size:16px; }
+.meta { background:#e8edf3; padding:8px 20px; border-bottom:1px solid var(--border);
+        line-height:1.8; }
+.meta span { margin-right:20px; }
+.meta .key { color:#555; font-weight:bold; }
+main { padding:14px 20px; }
+h2 { font-size:14px; border-bottom:2px solid var(--hdr-bg);
+     padding-bottom:3px; margin-top:22px; }
+table { border-collapse:collapse; width:100%; margin:6px 0; }
+td,th { border:1px solid var(--border); padding:3px 6px; vertical-align:top; }
+th { background:#dde; text-align:left; white-space:nowrap; }
+tr:hover { background:#fffbe6; }
+code { background:var(--code-bg); padding:1px 3px; border-radius:2px; }
+.tier-Critical { color:var(--critical); font-weight:bold; }
+.tier-High     { color:var(--high);     font-weight:bold; }
+.tier-Medium   { color:var(--medium);   font-weight:bold; }
+.tier-Low      { color:var(--low); }
+.verdict-bug   { color:var(--bug);  font-weight:bold; }
+.verdict-fp    { color:var(--fp);   font-style:italic; }
+.verdict-unk   { color:var(--unknown); }
+.guard-yes     { color:#888; }
+.guard-no      { color:var(--high); font-weight:bold; }
+.score-bar     { display:inline-block; background:#b06000;
+                 height:8px; vertical-align:middle; border-radius:2px; }
+"""
+
+
+def _summary_row_html(W, rank, score, s1f, llm, short_file, has_llm, max_score):
+    tier   = _tier_label(score)
+    guard  = s1f['possibly_guarded']
+    sink   = _e(_sink_label(s1f))
+    vrdt   = _llm_verdict(llm, has_llm)
+
+    vcls = ('verdict-bug' if vrdt.startswith('BUG')
+            else 'verdict-fp' if vrdt == 'FP'
+            else 'verdict-unk')
+    gcls = 'guard-yes' if guard else 'guard-no'
+    bar_w = max(2, int(80 * score / max(max_score, 1)))
+
+    llm_col = (f'<td class="{vcls}">{_e(vrdt)}</td>' if has_llm else '')
+    W(f'<tr>'
+      f'<td>{rank}</td>'
+      f'<td><span class="tier-{tier}">{tier}</span></td>'
+      f'<td>'
+      f'<span class="score-bar" style="width:{bar_w}px" title="{score}"></span>'
+      f' {score}</td>'
+      f'<td>{_e(s1f["category"])}</td>'
+      f'<td><code>{_e(s1f["function"])}</code></td>'
+      f'<td>{_e(short_file)}</td>'
+      f'<td><code>{_e(s1f["tainted_var"])}</code></td>'
+      f'<td>{sink}</td>'
+      f'<td class="{gcls}">{"yes?" if guard else "no"}</td>'
+      f'{llm_col}'
+      f'</tr>')
+
+
+def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs):
+    lines = []
+    W = lines.append
+
+    W('<!DOCTYPE html>')
+    W('<html lang="en"><head><meta charset="utf-8">')
+    W(f'<title>Priority Summary — {_e(run_name)}</title>')
+    W(f'<style>{_SUMMARY_CSS}</style></head><body>')
+    W(f'<h1>Priority Summary &mdash; {_e(run_name)}</h1>')
+
+    # Meta bar
+    tier_cts = _tier_counts(rows, has_llm)
+    cat_cts  = _cat_counts(rows)
+    W('<div class="meta">')
+    W(f'<span><span class="key">Date:</span> {_e(now_str)}</span>')
+    W(f'<span><span class="key">Source:</span> {_e(", ".join(source_dirs))}</span>')
+    W(f'<span><span class="key">Total:</span> {len(rows)} findings</span>')
+    for tier, _ in [('Critical', None), ('High', None), ('Medium', None), ('Low', None)]:
+        n = tier_cts.get(tier, 0)
+        if n:
+            cls = f'tier-{tier}'
+            W(f'<span><span class="key">{tier}:</span> '
+              f'<span class="{cls}">{n}</span></span>')
+    cat_str = ' &nbsp; '.join(f"Cat {c}: {n}" for c, n in sorted(cat_cts.items()))
+    W(f'<span><span class="key">By category:</span> {cat_str}</span>')
+    if has_llm:
+        real_n = sum(1 for _, _, llm, _ in rows if llm.get('real_bug') is True)
+        fp_n   = sum(1 for _, _, llm, _ in rows if llm.get('real_bug') is False)
+        unk_n  = sum(1 for _, _, llm, _ in rows if llm.get('real_bug') is None)
+        W(f'<span><span class="key">LLM:</span> '
+          f'<span class="verdict-bug">{real_n} real</span> &nbsp;|&nbsp; '
+          f'{fp_n} FP &nbsp;|&nbsp; {unk_n} unanalyzed</span>')
+    W('</div><main>')
+
+    # Full ranked table
+    W('<h2>All Findings — Ranked by Priority</h2>')
+    llm_th = '<th>LLM</th>' if has_llm else ''
+    W('<table>')
+    W(f'<tr><th>#</th><th>Tier</th><th>Score</th><th>Cat</th>'
+      f'<th>Function</th><th>File</th><th>Variable</th>'
+      f'<th>Sink</th><th>Guard</th>{llm_th}</tr>')
+
+    max_score = rows[0][0] if rows else 1
+    for rank, (score, s1f, llm, short_file) in enumerate(rows, 1):
+        _summary_row_html(W, rank, score, s1f, llm, short_file, has_llm, max_score)
+
+    W('</table>')
+
+    # Files with most findings
+    W('<h2>Findings by File</h2>')
+    W('<table><tr><th>File</th><th>Findings</th></tr>')
+    for fname, n in _file_counts(rows).items():
+        W(f'<tr><td>{_e(fname)}</td><td>{n}</td></tr>')
+    W('</table>')
+
+    W('</main></body></html>')
+    return '\n'.join(lines)

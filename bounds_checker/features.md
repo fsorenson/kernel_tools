@@ -110,8 +110,14 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
 - [ ] Integration with race finder run dirs — optionally consume race finder
       Stage 1 struct map to annotate which tainted fields belong to which struct
 
-- [ ] Multi-struct / cross-file summary — aggregate findings across a full
-      subsystem directory into a ranked list by severity
+- [x] Multi-struct / cross-file summary — `write_summary()` aggregates all
+      findings across the full subsystem into `summary.md` + `summary.html`,
+      ranked by a composite score (category base + LLM impact bonus + guard
+      bonus + overflow bonus).  Tier labels: Critical (LLM real bug, score ≥ 250),
+      High (≥ 100), Medium (≥ 60), Low.  Auto-generated after every Stage 1 and
+      Stage 2 run alongside `report.md`.  HTML version shows a score bar and
+      color-coded tier/verdict columns.  A "Findings by File" table at the bottom
+      identifies which source files have the highest finding density.
 
 - [ ] Reproducer designer integration — pipe high-confidence bounds findings
       into `tools/reproducer_designer.py` for test case generation
