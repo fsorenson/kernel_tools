@@ -78,14 +78,21 @@ def _build_context(run_dir, s1, s2):
         rows = []
         for i, s1f in enumerate(s1_findings, 1):
             llm = lkp.get(i, {})
-            rows.append({
+            xfn = s1f.get('propagation') == 'cross_function'
+        rows.append({
                 'idx':             i,
+                'propagation':     s1f.get('propagation', 'intra'),
                 'category':        s1f['category'],
                 'cat_label':       _CAT_LABEL.get(s1f['category'], s1f['category']),
                 'taint_source_fn': s1f['taint_source_fn'],
                 'taint_line':      s1f['taint_line'],
                 'taint_snippet':   s1f['taint_snippet'],
                 'tainted_var':     s1f['tainted_var'],
+                # cross-function extras
+                'callee_fn':       s1f.get('callee_fn', ''),
+                'callee_file':     s1f.get('callee_file', ''),
+                'call_site_line':  s1f.get('call_site_line', ''),
+                'call_site_snippet': s1f.get('call_site_snippet', ''),
                 'sink_fn':         s1f['sink_fn'],
                 'sink_line':       s1f['sink_line'],
                 'sink_snippet':    s1f['sink_snippet'],
@@ -232,14 +239,21 @@ def _md_finding(buf, r, has_llm):
         else:
             verdict = " — *unanalyzed*"
 
-    W(f"#### Finding #{r['idx']} — Category {r['category']}{verdict}\n")
+    xfn = r.get('propagation') == 'cross_function'
+    xfn_tag = f" — cross-function via `{r['callee_fn']}()`" if xfn else ''
+    W(f"#### Finding #{r['idx']} — Category {r['category']}{xfn_tag}{verdict}\n")
     W(f"| Field | Value |")
     W(f"|---|---|")
     W(f"| Category | {r['cat_label']} |")
     W(f"| Taint source | `{r['taint_source_fn']}()` line {r['taint_line']} |")
     W(f"| Taint snippet | `{r['taint_snippet']}` |")
     W(f"| Tainted var | `{r['tainted_var']}` |")
-    W(f"| Sink | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={r['sink_arg_role']}) |")
+    if xfn:
+        W(f"| Call site | line {r['call_site_line']} — passes `{r['tainted_var']}` to `{r['callee_fn']}()` |")
+        W(f"| Call snippet | `{r['call_site_snippet']}` |")
+        W(f"| Sink (in callee) | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={r['sink_arg_role']}) |")
+    else:
+        W(f"| Sink | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={r['sink_arg_role']}) |")
     W(f"| Sink snippet | `{r['sink_snippet']}` |")
     W(f"| Possibly guarded | {'yes (heuristic)' if r['possibly_guarded'] else 'no'} |")
 
@@ -452,8 +466,11 @@ def _html_finding(lines, r, has_llm):
         verdict = ''
 
     verdict_sep = ' &mdash; ' if verdict else ''
+    xfn = r.get('propagation') == 'cross_function'
+    xfn_str = (f' &mdash; cross-function via <code>{_e(r["callee_fn"])}()</code>'
+               if xfn else '')
     W(f'<h4 class="{hcls}">Finding #{r["idx"]} &mdash; Category {_e(r["category"])}'
-      f'{verdict_sep}{verdict}</h4>')
+      f'{xfn_str}{verdict_sep}{verdict}</h4>')
 
     W('<table>')
     W(f'<tr><th>Category</th><td>{_e(r["cat_label"])}</td></tr>')
@@ -461,9 +478,18 @@ def _html_finding(lines, r, has_llm):
       f'<code>{_e(r["taint_source_fn"])}()</code> line {r["taint_line"]}</td></tr>')
     W(f'<tr><th>Taint snippet</th><td><code>{_e(r["taint_snippet"])}</code></td></tr>')
     W(f'<tr><th>Tainted var</th><td><code>{_e(r["tainted_var"])}</code></td></tr>')
-    W(f'<tr><th>Sink</th><td>'
-      f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
-      f'(arg {r["sink_arg_index"]}, role={_e(r["sink_arg_role"])})</td></tr>')
+    if xfn:
+        W(f'<tr><th>Call site</th><td>line {r["call_site_line"]} &mdash; '
+          f'passes <code>{_e(r["tainted_var"])}</code> to '
+          f'<code>{_e(r["callee_fn"])}()</code></td></tr>')
+        W(f'<tr><th>Call snippet</th><td><code>{_e(r["call_site_snippet"])}</code></td></tr>')
+        W(f'<tr><th>Sink (in callee)</th><td>'
+          f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
+          f'(arg {r["sink_arg_index"]}, role={_e(r["sink_arg_role"])})</td></tr>')
+    else:
+        W(f'<tr><th>Sink</th><td>'
+          f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
+          f'(arg {r["sink_arg_index"]}, role={_e(r["sink_arg_role"])})</td></tr>')
     W(f'<tr><th>Sink snippet</th><td><code>{_e(r["sink_snippet"])}</code></td></tr>')
     guarded = 'yes (heuristic)' if r['possibly_guarded'] else 'no'
     W(f'<tr><th>Possibly guarded</th><td>{guarded}</td></tr>')

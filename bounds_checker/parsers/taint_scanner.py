@@ -160,6 +160,34 @@ def _arg_nodes(call_node):
     return [c for c in arg_list.children if c.type not in ('(', ')', ',')]
 
 
+def _collect_tainted_args(args, source, tainted, call_line):
+    """
+    Return {arg_idx: taint_info} for arguments that carry taint.
+    taint_info: {'var', 'source_fn', 'line', 'kind'}
+    """
+    result = {}
+    for i, arg in enumerate(args):
+        src = _node_has_taint_source_call(arg, source)
+        if src:
+            result[i] = {
+                'var': node_text(arg, source)[:60],
+                'source_fn': src,
+                'line': call_line,
+                'kind': 'value',
+            }
+        else:
+            ref = _node_references_tainted_var(arg, source, tainted)
+            if ref:
+                info = tainted[ref]
+                result[i] = {
+                    'var': ref,
+                    'source_fn': info['source_fn'],
+                    'line': info['line'],
+                    'kind': info['kind'],
+                }
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Guard / check detection
 # ---------------------------------------------------------------------------
@@ -186,40 +214,27 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source):
 
 
 # ---------------------------------------------------------------------------
-# Main per-function taint scan
+# Core taint walk (shared by intra and cross-function modes)
 # ---------------------------------------------------------------------------
 
-def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
+def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
     """
-    Scan one function body for taint flows from TAINT_SOURCES to DANGEROUS_SINKS.
+    Core taint walk for one function body.
 
-    Returns a list of finding dicts, one per (taint_source, sink) pair:
-      {
-        'function':        str,
-        'file':            str,
-        'category':        'A'|'B'|'C',
-        'severity':        'high'|'medium',
-        'taint_source_fn': str,      # e.g. 'get_unaligned_le16'
-        'tainted_var':     str,      # variable name that carries the taint
-        'taint_line':      int,
-        'taint_snippet':   str,
-        'sink_fn':         str,      # e.g. 'memcpy'
-        'sink_line':       int,
-        'sink_snippet':    str,
-        'sink_arg_index':  int,      # which argument is tainted
-        'sink_arg_role':   str,      # 'size', 'pointer', 'subscript', 'count'
-        'possibly_guarded': bool,
-        'reason':          str,
-      }
+    initial_taint: optional {var_name: {'source_fn', 'line', 'kind'}} to pre-seed
+        the taint state.  Used by cross-function Phase 1 (parameter simulation):
+        treat a specific parameter as if it were tainted on entry.
+
+    Returns:
+        findings  — list of finding dicts (same schema as scan_function)
+        call_events — list of {callee, line, call_snippet, tainted_args}
+            for every call_expression that received at least one tainted argument.
+            Used by cross-function Phase 2 to identify dangerous call sites.
     """
+    tainted = dict(initial_taint) if initial_taint else {}
     findings = []
+    call_events = []
 
-    # tainted: {var_name: {'source_fn': str, 'line': int, 'kind': 'value'|'pointer'}}
-    # 'value'   — holds a numeric server-supplied value (Category B/C risk)
-    # 'pointer' — holds a pointer derived from server-supplied arithmetic (Category A risk)
-    tainted = {}
-
-    # Walk the function body in source order, updating taint state and checking sinks
     for node in _walk(fn_body):
 
         # ── Taint source: direct assignment or init with taint source in RHS ──
@@ -234,9 +249,6 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
 
             src_fn = _node_has_taint_source_call(rhs, source)
             if src_fn:
-                # Determine kind: if the RHS also has binary arithmetic mixing a
-                # pointer with the tainted value, it's a pointer taint.
-                # Otherwise it's a value taint.
                 rhs_text = node_text(rhs, source)
                 kind = 'pointer' if '+' in rhs_text or '-' in rhs_text else 'value'
                 tainted[lhs_var] = {
@@ -246,11 +258,9 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
                 }
                 continue
 
-            # Propagation: RHS references an already-tainted variable
             ref = _node_references_tainted_var(rhs, source, tainted)
             if ref:
                 ref_kind = tainted[ref]['kind']
-                # Propagated through arithmetic → pointer taint; direct copy → same kind
                 rhs_text = node_text(rhs, source)
                 kind = 'pointer' if ('+' in rhs_text or '-' in rhs_text or
                                      ref_kind == 'pointer') else 'value'
@@ -260,35 +270,49 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
                     'kind': kind,
                 }
 
-        # ── Sink: dangerous function call ──
+        # ── Sink / call site ──
         elif node.type == 'call_expression':
             fn_id = next((c for c in node.children if c.type == 'identifier'), None)
             if not fn_id:
                 continue
-            sink_fn = node_text(fn_id, source)
-            sink_info = DANGEROUS_SINKS.get(sink_fn)
+            callee = node_text(fn_id, source)
+            args = _arg_nodes(node)
+            call_line = node.start_point[0] + 1
+
+            # Emit call event for any call with tainted arguments; used by
+            # cross-function Phase 2 to match against param_sink_map.
+            t_args = _collect_tainted_args(args, source, tainted, call_line)
+            if t_args:
+                call_events.append({
+                    'callee': callee,
+                    'line': call_line,
+                    'call_snippet': get_source_line(source, call_line),
+                    'tainted_args': t_args,
+                })
+
+            sink_info = DANGEROUS_SINKS.get(callee)
             if not sink_info:
                 continue
 
-            args = _arg_nodes(node)
-            sink_line = node.start_point[0] + 1
+            sink_fn = callee
+            sink_line = call_line
             sink_snippet = get_source_line(source, sink_line)
 
-            # Check size arguments (Categories B and overflow)
+            # Check size arguments (Category B)
             for idx in sink_info.get('size_args', []):
                 if idx >= len(args):
                     continue
                 arg = args[idx]
-                role = 'count' if sink_info.get('is_counted') and idx == sink_info['size_args'][0] else 'size'
+                role = ('count' if sink_info.get('is_counted') and
+                        idx == sink_info['size_args'][0] else 'size')
 
-                # Direct taint source in argument expression
                 src_fn = _node_has_taint_source_call(arg, source)
                 tainted_var = None
                 taint_line = sink_line
 
                 if src_fn:
                     tainted_var = node_text(arg, source)[:40]
-                    taint_line = sink_line  # same line
+                    taint_line = sink_line
                 else:
                     ref = _node_references_tainted_var(arg, source, tainted)
                     if ref:
@@ -421,7 +445,38 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
             seen.add(key)
             unique.append(f)
 
-    return unique
+    return unique, call_events
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
+    """
+    Scan one function body for taint flows from TAINT_SOURCES to DANGEROUS_SINKS.
+
+    Returns a list of finding dicts, one per (taint_source, sink) pair:
+      {
+        'function':        str,
+        'file':            str,
+        'category':        'A'|'B'|'C',
+        'severity':        'high'|'medium',
+        'taint_source_fn': str,      # e.g. 'get_unaligned_le16'
+        'tainted_var':     str,      # variable name that carries the taint
+        'taint_line':      int,
+        'taint_snippet':   str,
+        'sink_fn':         str,      # e.g. 'memcpy'
+        'sink_line':       int,
+        'sink_snippet':    str,
+        'sink_arg_index':  int,      # which argument is tainted
+        'sink_arg_role':   str,      # 'size', 'pointer', 'subscript', 'count'
+        'possibly_guarded': bool,
+        'reason':          str,
+      }
+    """
+    findings, _ = _scan_body(fn_name, fn_body, source, filepath)
+    return findings
 
 
 def scan_files(source_paths, verbose=False):
@@ -441,8 +496,8 @@ def scan_files(source_paths, verbose=False):
                 print(f"  [skip {path}: {e}]")
             continue
         for fn in find_functions(tree, source):
-            findings = scan_function(
-                fn['name'], fn['node'], fn['body'], source, path
+            findings, _ = _scan_body(
+                fn['name'], fn['body'], source, path
             )
             all_findings.extend(findings)
 

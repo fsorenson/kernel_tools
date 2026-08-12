@@ -52,9 +52,11 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
 
 ## P2 — Depth and Quality
 
-- [ ] Cross-function taint propagation — one-hop: when a function receives a
-      tainted value as a parameter and passes it to a sink, trace back to callers
-      to identify the origin; analogous to race finder Stage 5
+- [x] Cross-function taint propagation — one-hop: Phase 1 builds a
+      param_sink_map (which parameters of which functions reach a dangerous sink);
+      Phase 2 scans call sites for tainted args matching param_sink_map entries.
+      `propagation: 'cross_function'` distinguishes these from intra-procedural
+      findings in the JSON, report, and LLM prompt.
 
 - [ ] Integer overflow detection — flag `a * b` or `a + b` passed directly to
       `kmalloc`/`memcpy`/etc. without `check_mul_overflow`, `size_add`,

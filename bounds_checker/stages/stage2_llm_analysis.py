@@ -194,11 +194,16 @@ def _extract_fn_source(filepath, fn_name, findings):
                 f"{s+i:5}: {line}" for i, line in enumerate(src_lines[s-1:e])
             )
 
-        # Large function: signature block + windows around taint/sink lines
+        # Large function: signature block + windows around taint/sink lines.
+        # For cross-function findings the sink is in the callee; window around
+        # the call_site_line in the caller instead.
         finding_lines = set()
         for f in findings:
             finding_lines.add(f['taint_line'])
-            finding_lines.add(f['sink_line'])
+            if f.get('propagation') == 'cross_function':
+                finding_lines.add(f.get('call_site_line', f['sink_line']))
+            else:
+                finding_lines.add(f['sink_line'])
 
         include = set(range(s, min(s + 12, e + 1)))
         for fl in finding_lines:
@@ -310,17 +315,42 @@ def _format_findings(findings):
         cat = f['category']
         cat_label = _CATEGORY_LABELS.get(cat, cat)
         guard_tag = 'yes (check heuristic — may not be sufficient)' if f['possibly_guarded'] else 'no'
-        lines.append(
-            f"#{i}  Category {cat}: {cat_label}\n"
-            f"    Taint source: {f['taint_source_fn']}()  line {f['taint_line']}\n"
+        xfn = f.get('propagation') == 'cross_function'
+
+        entry = (
+            f"#{i}  Category {cat}: {cat_label}"
+        )
+        if xfn:
+            entry += f"  [CROSS-FUNCTION via {f['callee_fn']}()]"
+        entry += (
+            f"\n    Taint source: {f['taint_source_fn']}()  line {f['taint_line']}\n"
             f"    Taint snippet:  {f['taint_snippet']}\n"
             f"    Tainted variable: {f['tainted_var']}\n"
-            f"    Sink: {f['sink_fn']}()  line {f['sink_line']}  "
-            f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
-            f"    Sink snippet:   {f['sink_snippet']}\n"
+        )
+        if xfn:
+            entry += (
+                f"    Call site: line {f['call_site_line']}  "
+                f"passes {f['tainted_var']} to {f['callee_fn']}()\n"
+                f"    Call snippet:   {f['call_site_snippet']}\n"
+                f"    Sink (in {f['callee_fn']}()): "
+                f"{f['sink_fn']}()  line {f['sink_line']}  "
+                f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
+                f"    Sink snippet:   {f['sink_snippet']}\n"
+                f"    Note: the sink is in the callee, but the fix may belong "
+                f"in THIS function (validate before calling {f['callee_fn']}()) "
+                f"or in {f['callee_fn']}() itself (validate its parameter).\n"
+            )
+        else:
+            entry += (
+                f"    Sink: {f['sink_fn']}()  line {f['sink_line']}  "
+                f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
+                f"    Sink snippet:   {f['sink_snippet']}\n"
+            )
+        entry += (
             f"    Possibly guarded: {guard_tag}\n"
             f"    Scanner reason: {f['reason']}"
         )
+        lines.append(entry)
     return '\n\n'.join(lines)
 
 
