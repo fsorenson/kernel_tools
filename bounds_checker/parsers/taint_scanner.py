@@ -582,6 +582,71 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     ),
                 })
 
+        # ── Category F: loop with server-supplied iteration bound ──
+        elif node.type in ('for_statement', 'while_statement', 'do_statement'):
+            cond = node.child_by_field_name('condition')
+            if cond is None:
+                continue
+
+            loop_line = node.start_point[0] + 1
+            src_fn = ref = None
+            taint_line = loop_line
+
+            # Walk condition for a relational comparison (< <= > >=) that
+            # involves a tainted variable.  Equality checks (== !=) are state
+            # tests, not iteration bounds — skip them.
+            for n in _walk(cond):
+                if n.type != 'binary_expression':
+                    continue
+                if not any(c.type in ('<', '<=', '>', '>=') for c in n.children):
+                    continue
+                ref = _node_references_tainted_var(n, source, tainted)
+                if ref:
+                    src_fn = tainted[ref]['source_fn']
+                    taint_line = tainted[ref]['line']
+                    break
+                src_fn = _node_has_taint_source_call(n, source)
+                if src_fn:
+                    break
+
+            if src_fn is None:
+                continue
+
+            tainted_var_name = ref or '(inline)'
+            loop_type = {
+                'for_statement':   'for_loop',
+                'while_statement': 'while_loop',
+                'do_statement':    'do_loop',
+            }[node.type]
+
+            sink_line = loop_line
+            sink_snippet = get_source_line(source, sink_line)
+            guarded = _find_guards_between(
+                fn_body, {ref} if ref else set(),
+                taint_line, sink_line, source,
+            )
+            findings.append({
+                'function':        fn_name,
+                'file':            str(filepath),
+                'category':        'F',
+                'severity':        'medium',
+                'taint_source_fn': src_fn,
+                'tainted_var':     tainted_var_name,
+                'taint_line':      taint_line,
+                'taint_snippet':   get_source_line(source, taint_line),
+                'sink_fn':         loop_type,
+                'sink_line':       sink_line,
+                'sink_snippet':    sink_snippet,
+                'sink_arg_index':  0,
+                'sink_arg_role':   'loop_bound',
+                'possibly_guarded': guarded,
+                'reason': (
+                    f"server-supplied value {tainted_var_name!r} "
+                    f"(from {src_fn}()) controls loop iteration count "
+                    f"without validation against buffer size"
+                ),
+            })
+
         # ── Category C: array subscript with tainted index ──
         elif node.type == _SUBSCRIPT_NODE:
             # subscript_expression: [array, '[', index, ']']

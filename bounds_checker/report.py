@@ -51,6 +51,7 @@ _CAT_LABEL = {
     'A': 'Cat A — server offset → pointer → memory op',
     'B': 'Cat B — server value → size/alloc argument',
     'C': 'Cat C — server value → array subscript',
+    'F': 'Cat F — server value → loop iteration count',
 }
 _ASSESSMENT_LABEL = {
     'real_bug': 'BUG', 'false_positive': 'FP',
@@ -268,9 +269,15 @@ def _md_finding(buf, r, has_llm):
     if xfn:
         W(f"| Call site | line {r['call_site_line']} — passes `{r['tainted_var']}` to `{r['callee_fn']}()` |")
         W(f"| Call snippet | `{r['call_site_snippet']}` |")
-        W(f"| Sink (in callee) | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={r['sink_arg_role']}) |")
+    role = r['sink_arg_role']
+    if role == 'loop_bound':
+        W(f"| Loop | `{r['sink_fn']}` line {r['sink_line']} |")
+    elif role == 'subscript':
+        W(f"| {'Subscript (in callee)' if xfn else 'Subscript'} | `{r['sink_fn']}` line {r['sink_line']} |")
+    elif xfn:
+        W(f"| Sink (in callee) | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={role}) |")
     else:
-        W(f"| Sink | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={r['sink_arg_role']}) |")
+        W(f"| Sink | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={role}) |")
     W(f"| Sink snippet | `{r['sink_snippet']}` |")
     W(f"| Possibly guarded | {'yes (heuristic)' if r['possibly_guarded'] else 'no'} |")
 
@@ -507,13 +514,22 @@ def _html_finding(lines, r, has_llm):
           f'passes <code>{_e(r["tainted_var"])}</code> to '
           f'<code>{_e(r["callee_fn"])}()</code></td></tr>')
         W(f'<tr><th>Call snippet</th><td><code>{_e(r["call_site_snippet"])}</code></td></tr>')
+    role = r['sink_arg_role']
+    if role == 'loop_bound':
+        W(f'<tr><th>Loop</th><td>'
+          f'<code>{_e(r["sink_fn"])}</code> line {r["sink_line"]}</td></tr>')
+    elif role == 'subscript':
+        lbl = 'Subscript (in callee)' if xfn else 'Subscript'
+        W(f'<tr><th>{lbl}</th><td>'
+          f'<code>{_e(r["sink_fn"])}</code> line {r["sink_line"]}</td></tr>')
+    elif xfn:
         W(f'<tr><th>Sink (in callee)</th><td>'
           f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
-          f'(arg {r["sink_arg_index"]}, role={_e(r["sink_arg_role"])})</td></tr>')
+          f'(arg {r["sink_arg_index"]}, role={_e(role)})</td></tr>')
     else:
         W(f'<tr><th>Sink</th><td>'
           f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
-          f'(arg {r["sink_arg_index"]}, role={_e(r["sink_arg_role"])})</td></tr>')
+          f'(arg {r["sink_arg_index"]}, role={_e(role)})</td></tr>')
     W(f'<tr><th>Sink snippet</th><td><code>{_e(r["sink_snippet"])}</code></td></tr>')
     guarded = 'yes (heuristic)' if r['possibly_guarded'] else 'no'
     W(f'<tr><th>Possibly guarded</th><td>{guarded}</td></tr>')

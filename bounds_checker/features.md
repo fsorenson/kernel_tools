@@ -40,9 +40,12 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       `pkt->nested.field` where `nested` is located at a server-supplied offset
       without first verifying `offset + sizeof(nested) <= pkt_end`
 
-- [ ] **Category F**: variable-length protocol array iterated without count validation —
+- [x] **Category F**: variable-length protocol array iterated without count validation —
       `for (i = 0; i < server_count; i++) use(&arr[i])` without checking
-      `server_count * sizeof(entry) <= remaining_bytes`
+      `server_count * sizeof(entry) <= remaining_bytes`; detected via for/while/do
+      loop conditions that carry a tainted relational bound; cross-function propagation
+      extends this to callee loops whose count parameter traces back to a taint source
+      in the caller
 
 - [ ] **Category G1**: `copy_from_user` / `copy_to_user` return value unchecked —
       partial copy treated as success

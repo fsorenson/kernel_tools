@@ -23,7 +23,7 @@ DEFAULT_CONFIG = {
     'target': {
         'source_dirs': [],
     },
-    'categories': ['A', 'B', 'C'],   # which categories to scan
+    'categories': ['A', 'B', 'C', 'F'],   # which categories to scan
     'output': {
         'dir': 'bc_runs/',
     },

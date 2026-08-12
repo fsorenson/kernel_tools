@@ -32,10 +32,11 @@ if _VERTEX_REGION == 'global':
     _VERTEX_REGION = 'us-east5'
 
 _CATEGORY_LABELS = {
-    'A':        'server-supplied value → pointer arithmetic → memory operation',
-    'B':        'server-supplied value → size/length/allocation argument',
-    'B_OVF':    'integer overflow: server-supplied value in multiplicative/additive size expression',
-    'C':        'server-supplied value → array subscript',
+    'A':     'server-supplied value → pointer arithmetic → memory operation',
+    'B':     'server-supplied value → size/length/allocation argument',
+    'B_OVF': 'integer overflow: server-supplied value in multiplicative/additive size expression',
+    'C':     'server-supplied value → array subscript',
+    'F':     'server-supplied value controls loop iteration count without buffer bounds validation',
 }
 
 _IMPACT_CHOICES = (
@@ -349,6 +350,14 @@ def _format_findings(findings):
                 f"    Note: the sink is in the callee, but the fix may belong "
                 f"in THIS function (validate before calling {f['callee_fn']}()) "
                 f"or in {f['callee_fn']}() itself (validate its parameter).\n"
+            )
+        elif f.get('sink_arg_role') == 'loop_bound':
+            entry += (
+                f"    Loop: {f['sink_fn']}  line {f['sink_line']}\n"
+                f"    Loop snippet:   {f['sink_snippet']}\n"
+                f"    Note: check whether total bytes iterated "
+                f"({f['tainted_var']} * sizeof(element)) is validated "
+                f"against the packet/buffer length before the loop.\n"
             )
         else:
             entry += (

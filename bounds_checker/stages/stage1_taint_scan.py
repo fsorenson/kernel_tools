@@ -97,6 +97,7 @@ def _print_summary(findings_intra, findings_cross, by_category, c_paths):
             'A': 'Cat A — server offset → pointer → memory op',
             'B': 'Cat B — server value → size/alloc argument',
             'C': 'Cat C — server value → array subscript',
+            'F': 'Cat F — server value → loop iteration count',
         }.get(cat, f'Cat {cat}')
         entries   = by_category[cat]
         intra_n   = sum(1 for f in entries if f.get('propagation') == 'intra')

@@ -51,8 +51,10 @@ def main():
 
     # Stage 1: taint scan (Categories A, B, C)
     cats = set(cfg['categories'])
-    if cats & {'A', 'B', 'C'}:
-        print(f"\n--- Stage 1: Taint Scanner (Cat {', '.join(sorted(cats & {'A','B','C'}))}) ---")
+    _TAINT_CATS = {'A', 'B', 'C', 'F'}
+    if cats & _TAINT_CATS:
+        active = ', '.join(sorted(cats & _TAINT_CATS))
+        print(f"\n--- Stage 1: Taint Scanner (Cat {active}) ---")
         s1 = stage1_taint_scan.run(cfg, run_dir, verbose=args.verbose)
     else:
         s1 = None
