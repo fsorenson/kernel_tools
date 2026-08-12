@@ -7,6 +7,17 @@ from pathlib import Path
 import yaml
 
 
+# Known Claude models, most-capable-first.  IDs are the Anthropic/Vertex model strings.
+KNOWN_MODELS = [
+    ('claude-opus-5',               'Claude Opus 5      — highest capability, slowest, most expensive'),
+    ('claude-sonnet-5',             'Claude Sonnet 5    — strong capability, balanced speed/cost'),
+    ('claude-sonnet-4-6',           'Claude Sonnet 4.6  — default; good balance of quality and throughput'),
+    ('claude-haiku-4-5-20251001',   'Claude Haiku 4.5   — fastest, lowest cost; lighter analysis'),
+]
+
+_DEFAULT_MODEL = 'claude-sonnet-4-6'
+
+
 DEFAULT_CONFIG = {
     'kernel_source': '/home/src/linux',
     'target': {
@@ -18,7 +29,7 @@ DEFAULT_CONFIG = {
     },
     'llm': {
         'enabled': False,
-        'model': 'claude-sonnet-4-6',
+        'model': _DEFAULT_MODEL,
     },
 }
 
@@ -91,7 +102,10 @@ Examples:
     p.add_argument('--llm', action='store_true',
                    help='Enable Stage 2 LLM deep analysis (requires API credentials)')
     p.add_argument('--model', metavar='MODEL',
-                   help='Claude model for LLM analysis (overrides config)')
+                   help='Claude model for LLM analysis (overrides config); '
+                        'use --list-models to see known models')
+    p.add_argument('--list-models', action='store_true',
+                   help='List known Claude model IDs and exit')
     p.add_argument('--thinking', metavar='TOKENS', type=int, default=0,
                    help='Extended thinking budget in tokens (0=disabled; min 1024)')
     p.add_argument('--debug', action='store_true',

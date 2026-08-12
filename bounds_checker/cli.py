@@ -5,13 +5,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from bounds_checker.config import build_arg_parser, load_config
+from bounds_checker.config import build_arg_parser, load_config, KNOWN_MODELS
 from bounds_checker.stages import stage1_taint_scan, stage2_llm_analysis
 
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    if args.list_models:
+        print("Known Claude model IDs (pass to --model or set llm.model in config):\n")
+        for model_id, desc in KNOWN_MODELS:
+            print(f"  {model_id:<36}  {desc}")
+        print()
+        sys.exit(0)
 
     cfg = load_config(args.config, args)
 
