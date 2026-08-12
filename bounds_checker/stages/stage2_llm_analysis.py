@@ -37,6 +37,7 @@ _CATEGORY_LABELS = {
     'B_OVF': 'integer overflow: server-supplied value in multiplicative/additive size expression',
     'C':     'server-supplied value → array subscript',
     'F':     'server-supplied value controls loop iteration count without buffer bounds validation',
+    'H':     'server-supplied wide value silently truncated to narrower integer type',
 }
 
 _IMPACT_CHOICES = (
@@ -350,6 +351,15 @@ def _format_findings(findings):
                 f"    Note: the sink is in the callee, but the fix may belong "
                 f"in THIS function (validate before calling {f['callee_fn']}()) "
                 f"or in {f['callee_fn']}() itself (validate its parameter).\n"
+            )
+        elif f.get('sink_arg_role') == 'narrowed_value':
+            entry += (
+                f"    Truncation: {f.get('src_width','?')}-bit source → "
+                f"{f.get('dest_width','?')}-bit {f.get('dest_type','')}  "
+                f"line {f['sink_line']}\n"
+                f"    Note: flag as false positive if the RHS expression uses "
+                f"masking (& 0xFF, & 0xFFFF) or right-shift that limits the "
+                f"value to the destination width before assignment.\n"
             )
         elif f.get('sink_arg_role') == 'loop_bound':
             entry += (

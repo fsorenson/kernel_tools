@@ -52,6 +52,7 @@ _CAT_LABEL = {
     'B': 'Cat B — server value → size/alloc argument',
     'C': 'Cat C — server value → array subscript',
     'F': 'Cat F — server value → loop iteration count',
+    'H': 'Cat H — server value → narrow integer type (silent truncation)',
 }
 _ASSESSMENT_LABEL = {
     'real_bug': 'BUG', 'false_positive': 'FP',
@@ -111,6 +112,9 @@ def _build_context(run_dir, s1, s2):
                 'sink_snippet':    s1f['sink_snippet'],
                 'sink_arg_index':  s1f['sink_arg_index'],
                 'sink_arg_role':   s1f['sink_arg_role'],
+                'src_width':       s1f.get('src_width'),
+                'dest_width':      s1f.get('dest_width'),
+                'dest_type':       s1f.get('dest_type', ''),
                 'possibly_guarded': s1f['possibly_guarded'],
                 'reason':          s1f['reason'],
                 # LLM fields (may be missing if no LLM run)
@@ -270,7 +274,10 @@ def _md_finding(buf, r, has_llm):
         W(f"| Call site | line {r['call_site_line']} — passes `{r['tainted_var']}` to `{r['callee_fn']}()` |")
         W(f"| Call snippet | `{r['call_site_snippet']}` |")
     role = r['sink_arg_role']
-    if role == 'loop_bound':
+    if role == 'narrowed_value':
+        W(f"| Truncation | line {r['sink_line']}: "
+          f"{r.get('src_width','?')}-bit → {r.get('dest_width','?')}-bit `{r.get('dest_type','')}` |")
+    elif role == 'loop_bound':
         W(f"| Loop | `{r['sink_fn']}` line {r['sink_line']} |")
     elif role == 'subscript':
         W(f"| {'Subscript (in callee)' if xfn else 'Subscript'} | `{r['sink_fn']}` line {r['sink_line']} |")
@@ -515,7 +522,11 @@ def _html_finding(lines, r, has_llm):
           f'<code>{_e(r["callee_fn"])}()</code></td></tr>')
         W(f'<tr><th>Call snippet</th><td><code>{_e(r["call_site_snippet"])}</code></td></tr>')
     role = r['sink_arg_role']
-    if role == 'loop_bound':
+    if role == 'narrowed_value':
+        W(f'<tr><th>Truncation</th><td>line {r["sink_line"]}: '
+          f'{r.get("src_width","?")} → {r.get("dest_width","?")}-bit '
+          f'<code>{_e(r.get("dest_type",""))}</code></td></tr>')
+    elif role == 'loop_bound':
         W(f'<tr><th>Loop</th><td>'
           f'<code>{_e(r["sink_fn"])}</code> line {r["sink_line"]}</td></tr>')
     elif role == 'subscript':

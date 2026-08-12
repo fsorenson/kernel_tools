@@ -9,6 +9,8 @@ Categories detected:
   A — tainted value → pointer arithmetic → used as ptr argument to memory op
   B — tainted value → size argument to memory op or allocator
   C — tainted value → array subscript
+  F — tainted value → loop iteration count
+  H — tainted wide value stored in a narrower integer type (silent truncation)
 
 Each finding includes the taint source location, the sink location, and a
 "possibly_guarded" flag indicating whether a conditional on the tainted variable
@@ -42,6 +44,20 @@ TAINT_SOURCES = frozenset({
     # ntohs / ntohl (network byte order, used in some subsystems)
     'ntohs', 'ntohl', 'ntohe',
 })
+
+# Maps each taint source to its natural return-value bit width.
+# Used by Category H to detect when a wide server-supplied value is stored
+# in a narrower integer type (silent truncation).
+TAINT_SOURCE_WIDTHS = {
+    'get_unaligned_le8':  8,  'get_unaligned_be8':  8,
+    'get_unaligned_le16': 16, 'get_unaligned_be16': 16,
+    'get_unaligned_le32': 32, 'get_unaligned_be32': 32,
+    'get_unaligned_le64': 64, 'get_unaligned_be64': 64,
+    'le16_to_cpu': 16, 'be16_to_cpu': 16, 'le16_to_cpus': 16,
+    'le32_to_cpu': 32, 'be32_to_cpu': 32, 'le32_to_cpus': 32,
+    'le64_to_cpu': 64, 'be64_to_cpu': 64, 'le64_to_cpus': 64,
+    'ntohs': 16, 'ntohl': 32, 'ntohe': 32,
+}
 
 # ---------------------------------------------------------------------------
 # Dangerous sinks: functions where a tainted argument is a bug
@@ -96,6 +112,81 @@ DANGEROUS_SINKS = {
 
 # For Category C: these operators produce a subscript expression
 _SUBSCRIPT_NODE = 'subscript_expression'
+
+# ---------------------------------------------------------------------------
+# Category H: type-width narrowing tables
+# ---------------------------------------------------------------------------
+
+# Maps C integer type names → bit width.  Only covers types that actually
+# appear in kernel protocol parsing code; excludes pointer types.
+_TYPE_WIDTHS = {
+    # Kernel u/s typedefs
+    'u8': 8,  '__u8': 8,  's8': 8,  '__s8': 8,
+    'u16': 16, '__u16': 16, 's16': 16, '__s16': 16,
+    'u32': 32, '__u32': 32, 's32': 32, '__s32': 32,
+    'u64': 64, '__u64': 64, 's64': 64, '__s64': 64,
+    # Endian-annotated types (same underlying width)
+    '__le16': 16, '__be16': 16,
+    '__le32': 32, '__be32': 32,
+    '__le64': 64, '__be64': 64,
+    # POSIX fixed-width
+    'uint8_t': 8,  'int8_t': 8,
+    'uint16_t': 16, 'int16_t': 16,
+    'uint32_t': 32, 'int32_t': 32,
+    'uint64_t': 64, 'int64_t': 64,
+    # C primitives (kernel assumes LP64)
+    'char': 8,  'unsigned char': 8,
+    'short': 16, 'unsigned short': 16,
+    'int': 32,  'unsigned int': 32, 'unsigned': 32,
+    'long': 64, 'unsigned long': 64,
+}
+
+
+def _get_type_width(type_text):
+    """Return bit width of a C integer type string, or None if unknown/pointer."""
+    return _TYPE_WIDTHS.get(type_text.strip())
+
+
+def _build_local_widths(fn_body, source):
+    """
+    Return {var_name: bit_width} for integer variables declared in fn_body.
+    Skips pointer declarators; only covers scalar integer locals.
+
+    Variables declared multiple times with conflicting widths (e.g. same name
+    in if/else branches with different types) are excluded — we can't safely
+    determine the intended width without scope tracking.
+    """
+    widths = {}
+    conflicts = set()
+    for n in _walk(fn_body):
+        if n.type != 'declaration':
+            continue
+        type_node = n.child_by_field_name('type')
+        if type_node is None:
+            continue
+        width = _get_type_width(node_text(type_node, source))
+        if width is None:
+            continue
+        for child in n.children:
+            if child.type == 'init_declarator':
+                decl = child.children[0] if child.children else None
+                if decl and decl.type == 'identifier':
+                    name = node_text(decl, source)
+                    if name in widths and widths[name] != width:
+                        conflicts.add(name)
+                    elif name not in conflicts:
+                        widths[name] = width
+            elif child.type == 'identifier':
+                name = node_text(child, source)
+                if name in widths and widths[name] != width:
+                    conflicts.add(name)
+                elif name not in conflicts:
+                    widths[name] = width
+            # pointer_declarator → skip (not an integer scalar)
+    for name in conflicts:
+        widths.pop(name, None)
+    return widths
+
 
 # Overflow-safe size helpers: if any of these wrap the size argument (or an
 # operand within it), the arithmetic is already overflow-checked — don't flag.
@@ -392,7 +483,74 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
     findings = []
     call_events = []
 
+    # Pre-build integer width map for Cat H narrowing detection.
+    var_widths = _build_local_widths(fn_body, source)
+
     for node in _walk(fn_body):
+
+        # ── Category H: type-width narrowing in declarations ──
+        # Handled here (on declaration, not init_declarator) so we have the
+        # declared type of the LHS without needing a parent-node lookup.
+        if node.type == 'declaration':
+            type_node = node.child_by_field_name('type')
+            if type_node is None:
+                continue
+            dest_type = node_text(type_node, source)
+            dest_width = _get_type_width(dest_type)
+            if dest_width is None:
+                continue
+            for child in node.children:
+                if child.type != 'init_declarator' or len(child.children) < 3:
+                    continue
+                decl_node = child.children[0]
+                if decl_node.type != 'identifier':
+                    continue   # pointer declarator — skip
+                dest_var = node_text(decl_node, source)
+                rhs = child.children[2]
+                line = child.start_point[0] + 1
+
+                src_fn_h = _node_has_taint_source_call(rhs, source)
+                src_width_h = TAINT_SOURCE_WIDTHS.get(src_fn_h) if src_fn_h else None
+                ref_h = None
+                if src_fn_h is None:
+                    ref_h = _node_references_tainted_var(rhs, source, tainted)
+                    if ref_h:
+                        src_fn_h = tainted[ref_h]['source_fn']
+                        src_width_h = tainted[ref_h].get('width')
+
+                if src_fn_h and src_width_h and src_width_h > dest_width:
+                    guard_vars = {ref_h} if ref_h else set()
+                    taint_ln = tainted[ref_h]['line'] if ref_h else line
+                    guarded_h = _find_guards_between(
+                        fn_body, guard_vars, taint_ln, line, source,
+                    ) if guard_vars and taint_ln < line else False
+                    snippet = get_source_line(source, line)
+                    findings.append({
+                        'function':        fn_name,
+                        'file':            str(filepath),
+                        'category':        'H',
+                        'severity':        'medium',
+                        'taint_source_fn': src_fn_h,
+                        'tainted_var':     dest_var,
+                        'taint_line':      line,
+                        'taint_snippet':   snippet,
+                        'sink_fn':         'narrowing_assignment',
+                        'sink_line':       line,
+                        'sink_snippet':    snippet,
+                        'sink_arg_index':  0,
+                        'sink_arg_role':   'narrowed_value',
+                        'src_width':       src_width_h,
+                        'dest_width':      dest_width,
+                        'dest_type':       dest_type,
+                        'possibly_guarded': guarded_h,
+                        'reason': (
+                            f"{src_width_h}-bit value from {src_fn_h}() silently "
+                            f"truncated to {dest_width}-bit {dest_type} in {dest_var!r}; "
+                            f"a later bounds check on {dest_var!r} may pass even when "
+                            f"the original value would not"
+                        ),
+                    })
+            continue   # skip the rest of the loop body for declaration nodes
 
         # ── Taint source: direct assignment or init with taint source in RHS ──
         if node.type in ('assignment_expression', 'init_declarator'):
@@ -412,7 +570,41 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     'source_fn': src_fn,
                     'line': node.start_point[0] + 1,
                     'kind': kind,
+                    'width': TAINT_SOURCE_WIDTHS.get(src_fn),
                 }
+                # Cat H: assignment_expression narrowing (not init_declarator —
+                # that case is handled in the declaration branch above).
+                if (node.type == 'assignment_expression' and lhs_var in var_widths):
+                    dest_width_h = var_widths[lhs_var]
+                    src_width_h = TAINT_SOURCE_WIDTHS.get(src_fn)
+                    if src_width_h and src_width_h > dest_width_h:
+                        line_h = node.start_point[0] + 1
+                        snippet_h = get_source_line(source, line_h)
+                        findings.append({
+                            'function':        fn_name,
+                            'file':            str(filepath),
+                            'category':        'H',
+                            'severity':        'medium',
+                            'taint_source_fn': src_fn,
+                            'tainted_var':     lhs_var,
+                            'taint_line':      line_h,
+                            'taint_snippet':   snippet_h,
+                            'sink_fn':         'narrowing_assignment',
+                            'sink_line':       line_h,
+                            'sink_snippet':    snippet_h,
+                            'sink_arg_index':  0,
+                            'sink_arg_role':   'narrowed_value',
+                            'src_width':       src_width_h,
+                            'dest_width':      dest_width_h,
+                            'dest_type':       f'u{dest_width_h}',
+                            'possibly_guarded': False,
+                            'reason': (
+                                f"{src_width_h}-bit value from {src_fn}() silently "
+                                f"truncated to {dest_width_h}-bit {lhs_var!r}; "
+                                f"a later bounds check on {lhs_var!r} may pass even "
+                                f"when the original value would not"
+                            ),
+                        })
                 continue
 
             ref = _node_references_tainted_var(rhs, source, tainted)
@@ -425,7 +617,46 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     'source_fn': tainted[ref]['source_fn'],
                     'line': tainted[ref]['line'],   # keep the original source line
                     'kind': kind,
+                    'width': tainted[ref].get('width'),  # propagate source width
                 }
+                # Cat H: narrowing via tainted variable (assignment_expression only)
+                if (node.type == 'assignment_expression' and lhs_var in var_widths):
+                    dest_width_h = var_widths[lhs_var]
+                    src_width_h = tainted[ref].get('width')
+                    if src_width_h and src_width_h > dest_width_h:
+                        line_h = node.start_point[0] + 1
+                        src_fn_h = tainted[ref]['source_fn']
+                        snippet_h = get_source_line(source, line_h)
+                        taint_ln_h = tainted[ref]['line']
+                        guarded_h = _find_guards_between(
+                            fn_body, {ref}, taint_ln_h, line_h, source,
+                        ) if taint_ln_h < line_h else False
+                        findings.append({
+                            'function':        fn_name,
+                            'file':            str(filepath),
+                            'category':        'H',
+                            'severity':        'medium',
+                            'taint_source_fn': src_fn_h,
+                            'tainted_var':     lhs_var,
+                            'taint_line':      line_h,
+                            'taint_snippet':   snippet_h,
+                            'sink_fn':         'narrowing_assignment',
+                            'sink_line':       line_h,
+                            'sink_snippet':    snippet_h,
+                            'sink_arg_index':  0,
+                            'sink_arg_role':   'narrowed_value',
+                            'src_width':       src_width_h,
+                            'dest_width':      dest_width_h,
+                            'dest_type':       f'u{dest_width_h}',
+                            'possibly_guarded': guarded_h,
+                            'reason': (
+                                f"{src_width_h}-bit value (via {ref!r}, from "
+                                f"{src_fn_h}()) silently truncated to "
+                                f"{dest_width_h}-bit {lhs_var!r}; a later bounds "
+                                f"check on {lhs_var!r} may pass even when the "
+                                f"original value would not"
+                            ),
+                        })
 
         # ── Sink / call site ──
         elif node.type == 'call_expression':

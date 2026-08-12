@@ -51,7 +51,7 @@ def main():
 
     # Stage 1: taint scan (Categories A, B, C)
     cats = set(cfg['categories'])
-    _TAINT_CATS = {'A', 'B', 'C', 'F'}
+    _TAINT_CATS = {'A', 'B', 'C', 'F', 'H'}
     if cats & _TAINT_CATS:
         active = ', '.join(sorted(cats & _TAINT_CATS))
         print(f"\n--- Stage 1: Taint Scanner (Cat {active}) ---")

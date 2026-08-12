@@ -77,9 +77,14 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       Reduces spurious "possibly guarded" rate from 66 % to 62 % on fs/smb/client;
       remaining flags correspond to genuine relational checks with early exits.
 
-- [ ] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
-      `int` intermediate; the narrowing silently caps the value, allowing a check
-      on the narrowed copy to pass for values that wouldn't pass on the original
+- [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
+      narrower intermediate; the narrowing silently caps the value, allowing a later
+      bounds check on the narrowed copy to pass for values that would fail on the
+      full-width original.  Detects both declaration and assignment forms; variables
+      declared with different widths in different branches (if/else scope shadowing)
+      are excluded to avoid false positives.  Common false positives: intentional
+      shift-then-mask truncation (e.g. `u8 x = (u32_val >> 24) & 0xFF`) where the
+      mask makes the narrowing safe — these require LLM assessment.
 
 - [ ] Configurable taint sources and sinks — allow per-project YAML extension of
       the default `TAINT_SOURCES` and `DANGEROUS_SINKS` sets for non-CIFS subsystems
