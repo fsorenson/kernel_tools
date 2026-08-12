@@ -129,6 +129,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
 
             try:
                 result = _call_llm(client, model, prompt, verbose,
+                                   n_findings=len(fn_findings),
                                    thinking_budget=thinking_budget,
                                    debug_fh=debug_fh,
                                    fn_label=f"{fn_name}() [{short_file}]")
@@ -407,11 +408,18 @@ def _build_prompt(fn_name, short_file, fn_source, findings):
 # ---------------------------------------------------------------------------
 
 def _call_llm(client, model, prompt, verbose,
-              thinking_budget=0, debug_fh=None, fn_label=''):
-    _JSON_TOKENS = 3072
+              n_findings=1, thinking_budget=0, debug_fh=None, fn_label=''):
+    # Scale output budget with findings count; cap at the model's hard limit.
+    # Base: 1024 tokens for outer JSON + overall_notes.
+    # Per finding: ~512 tokens for 10 fields (some with multi-sentence strings).
+    _BASE  = 1024
+    _PER   = 512
+    _MIN   = 3072
+    _MAX   = 8192
+    json_tokens = min(_MAX, max(_MIN, _BASE + n_findings * _PER))
     kwargs = dict(
         model=model,
-        max_tokens=_JSON_TOKENS + thinking_budget if thinking_budget else _JSON_TOKENS,
+        max_tokens=json_tokens + thinking_budget if thinking_budget else json_tokens,
         system=_SYSTEM,
         messages=[{'role': 'user', 'content': prompt}],
     )
@@ -438,6 +446,12 @@ def _call_llm(client, model, prompt, verbose,
         _write_debug(debug_fh, f'RESPONSE — {fn_label}', response_text,
                      footer=(f"stop={msg.stop_reason}  "
                              f"in={usage.input_tokens}  out={usage.output_tokens}"))
+
+    if msg.stop_reason == 'max_tokens':
+        raise ValueError(
+            f"output truncated at {json_tokens} tokens ({len(response_text)} chars) — "
+            f"response cut mid-JSON; consider using --thinking or reducing findings per function"
+        )
 
     if verbose:
         print(f"[{len(response_text)} chars]", end=' ')
