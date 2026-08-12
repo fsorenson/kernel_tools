@@ -1,0 +1,62 @@
+"""Bounds checker command-line entry point."""
+
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from bounds_checker.config import build_arg_parser, load_config
+from bounds_checker.stages import stage1_taint_scan
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    cfg = load_config(args.config, args)
+
+    if not cfg['target']['source_dirs']:
+        print("Error: specify --source-dir DIR (e.g. --source-dir fs/smb/client)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Create run directory
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    subsystem = cfg['target']['source_dirs'][0].replace('/', '_')
+    run_dir = Path(cfg['output']['dir']) / f"{ts}_{subsystem}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save config snapshot
+    snapshot = {
+        'kernel_source': str(cfg['kernel_source']),
+        'target': cfg['target'],
+        'categories': cfg['categories'],
+    }
+    (run_dir / 'config_snapshot.json').write_text(json.dumps(snapshot, indent=2))
+
+    print(f"\n{'='*60}")
+    print(f"  Kernel Bounds / Data Validation Checker")
+    print(f"{'='*60}")
+    print(f"Run directory: {run_dir}")
+    print(f"Kernel source: {cfg['kernel_source']}")
+    print(f"Source dirs:   {', '.join(cfg['target']['source_dirs'])}")
+    print(f"Categories:    {', '.join(cfg['categories'])}")
+
+    # Stage 1: taint scan (Categories A, B, C)
+    cats = set(cfg['categories'])
+    if cats & {'A', 'B', 'C'}:
+        print(f"\n--- Stage 1: Taint Scanner (Cat {', '.join(sorted(cats & {'A','B','C'}))}) ---")
+        s1 = stage1_taint_scan.run(cfg, run_dir, verbose=args.verbose)
+    else:
+        s1 = None
+
+    # Stage 2: LLM analysis (placeholder)
+    if args.llm:
+        print("\n--- Stage 2: LLM Analysis --- (not yet implemented)")
+
+    print(f"\nDone. Artifacts in: {run_dir}")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
