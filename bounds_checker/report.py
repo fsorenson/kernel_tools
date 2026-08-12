@@ -79,15 +79,15 @@ def _build_context(run_dir, s1, s2):
         for i, s1f in enumerate(s1_findings, 1):
             llm = lkp.get(i, {})
             xfn = s1f.get('propagation') == 'cross_function'
-        overflow = s1f.get('overflow', False)
-        if overflow:
-            cat_label = (f"Cat {s1f['category']} — integer overflow: "
-                         f"{s1f.get('overflow_lhs','')} "
-                         f"{s1f.get('overflow_op','*')} "
-                         f"{s1f.get('overflow_rhs','')}")
-        else:
-            cat_label = _CAT_LABEL.get(s1f['category'], s1f['category'])
-        rows.append({
+            overflow = s1f.get('overflow', False)
+            if overflow:
+                cat_label = (f"Cat {s1f['category']} — integer overflow: "
+                             f"{s1f.get('overflow_lhs','')} "
+                             f"{s1f.get('overflow_op','*')} "
+                             f"{s1f.get('overflow_rhs','')}")
+            else:
+                cat_label = _CAT_LABEL.get(s1f['category'], s1f['category'])
+            rows.append({
                 'idx':             i,
                 'propagation':     s1f.get('propagation', 'intra'),
                 'overflow':        overflow,
