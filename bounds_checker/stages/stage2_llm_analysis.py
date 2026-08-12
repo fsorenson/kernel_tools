@@ -36,6 +36,7 @@ _CATEGORY_LABELS = {
     'B':     'server-supplied value → size/length/allocation argument',
     'B_OVF': 'integer overflow: server-supplied value in multiplicative/additive size expression',
     'C':     'server-supplied value → array subscript',
+    'E':     'tainted pointer dereference: struct field access via pointer derived from server offset',
     'F':     'server-supplied value controls loop iteration count without buffer bounds validation',
     'H':     'server-supplied wide value silently truncated to narrower integer type',
 }
@@ -351,6 +352,15 @@ def _format_findings(findings):
                 f"    Note: the sink is in the callee, but the fix may belong "
                 f"in THIS function (validate before calling {f['callee_fn']}()) "
                 f"or in {f['callee_fn']}() itself (validate its parameter).\n"
+            )
+        elif f.get('sink_arg_role') == 'tainted_ptr_deref':
+            entry += (
+                f"    Pointer deref: {f['tainted_var']}->{f.get('field_name','?')}  "
+                f"line {f['sink_line']}\n"
+                f"    Deref snippet:  {f['sink_snippet']}\n"
+                f"    Note: verify that offset + sizeof(*{f['tainted_var']}) <= packet_end "
+                f"before the struct pointer is created.  False positive if the pointer "
+                f"was validated (e.g. smb2_validate_iov, pdu_length checks) before use.\n"
             )
         elif f.get('sink_arg_role') == 'narrowed_value':
             entry += (

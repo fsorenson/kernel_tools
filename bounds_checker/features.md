@@ -36,9 +36,13 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       `strlen()` / `strlcpy()` on a server-supplied buffer with no guarantee
       a null byte exists within bounds; guard pattern is `strnlen(buf, max)`
 
-- [ ] **Category E**: nested struct field access beyond packet bounds — accessing
-      `pkt->nested.field` where `nested` is located at a server-supplied offset
-      without first verifying `offset + sizeof(nested) <= pkt_end`
+- [x] **Category E**: tainted pointer dereference — accessing `ptr->field` where
+      `ptr` is derived from server-supplied offset arithmetic (i.e. `kind='pointer'`
+      in the taint tracker) without first verifying `offset + sizeof(*ptr) <= pkt_end`;
+      detected via `field_expression` nodes with `->` operator where the base argument
+      traces to a tainted pointer variable.  Known limitation: inline cast expressions
+      like `((struct Foo *)(base + le32_to_cpu(off)))->field` (no named intermediate
+      pointer variable) are not yet flagged — a follow-up.
 
 - [x] **Category F**: variable-length protocol array iterated without count validation —
       `for (i = 0; i < server_count; i++) use(&arr[i])` without checking
@@ -54,6 +58,13 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       after use rather than before
 
 ## P2 — Depth and Quality
+
+- [x] Pointer kind tracking fix — `kind='pointer'` was incorrectly assigned to any
+      taint assignment whose RHS text contained `-`, because `->` member access
+      contains the `-` character.  Replaced the string-search heuristic
+      (`'-' in rhs_text`) with an AST walk that checks for a `binary_expression`
+      node whose operator child has type `'+'` or `'-'`.  Eliminated 8 Cat A and
+      34 Cat E false positives in fs/smb/client.
 
 - [x] Cross-function taint propagation — one-hop: Phase 1 builds a
       param_sink_map (which parameters of which functions reach a dangerous sink);

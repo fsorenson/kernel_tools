@@ -51,6 +51,7 @@ _CAT_LABEL = {
     'A': 'Cat A — server offset → pointer → memory op',
     'B': 'Cat B — server value → size/alloc argument',
     'C': 'Cat C — server value → array subscript',
+    'E': 'Cat E — tainted pointer dereference (->field access beyond packet bounds)',
     'F': 'Cat F — server value → loop iteration count',
     'H': 'Cat H — server value → narrow integer type (silent truncation)',
 }
@@ -115,6 +116,7 @@ def _build_context(run_dir, s1, s2):
                 'src_width':       s1f.get('src_width'),
                 'dest_width':      s1f.get('dest_width'),
                 'dest_type':       s1f.get('dest_type', ''),
+                'field_name':      s1f.get('field_name', ''),
                 'possibly_guarded': s1f['possibly_guarded'],
                 'reason':          s1f['reason'],
                 # LLM fields (may be missing if no LLM run)
@@ -281,6 +283,8 @@ def _md_finding(buf, r, has_llm):
         W(f"| Loop | `{r['sink_fn']}` line {r['sink_line']} |")
     elif role == 'subscript':
         W(f"| {'Subscript (in callee)' if xfn else 'Subscript'} | `{r['sink_fn']}` line {r['sink_line']} |")
+    elif role == 'tainted_ptr_deref':
+        W(f"| Pointer deref | `{r['tainted_var']}->{r.get('field_name','?')}` line {r['sink_line']} |")
     elif xfn:
         W(f"| Sink (in callee) | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={role}) |")
     else:
@@ -533,6 +537,10 @@ def _html_finding(lines, r, has_llm):
         lbl = 'Subscript (in callee)' if xfn else 'Subscript'
         W(f'<tr><th>{lbl}</th><td>'
           f'<code>{_e(r["sink_fn"])}</code> line {r["sink_line"]}</td></tr>')
+    elif role == 'tainted_ptr_deref':
+        W(f'<tr><th>Pointer deref</th><td>'
+          f'<code>{_e(r["tainted_var"])}->{_e(r.get("field_name","?"))}</code> '
+          f'line {r["sink_line"]}</td></tr>')
     elif xfn:
         W(f'<tr><th>Sink (in callee)</th><td>'
           f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '

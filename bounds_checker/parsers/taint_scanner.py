@@ -229,6 +229,20 @@ def _node_references_tainted_var(node, source, tainted):
     return None
 
 
+def _rhs_has_additive_arith(rhs_node):
+    """
+    Return True if rhs_node contains additive arithmetic (+ or - as a binary
+    operator).  Uses the AST to avoid false positives from '->' member access,
+    '--' decrement, unary '-', and similar constructs that contain the '-'
+    character but are not pointer arithmetic.
+    """
+    for n in _walk(rhs_node):
+        if n.type == 'binary_expression':
+            if any(c.type in ('+', '-') for c in n.children):
+                return True
+    return False
+
+
 def _extract_lhs_var(assign_node, source):
     """
     Extract the variable name from the left-hand side of an assignment or
@@ -564,8 +578,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
 
             src_fn = _node_has_taint_source_call(rhs, source)
             if src_fn:
-                rhs_text = node_text(rhs, source)
-                kind = 'pointer' if '+' in rhs_text or '-' in rhs_text else 'value'
+                kind = 'pointer' if _rhs_has_additive_arith(rhs) else 'value'
                 tainted[lhs_var] = {
                     'source_fn': src_fn,
                     'line': node.start_point[0] + 1,
@@ -610,9 +623,9 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             ref = _node_references_tainted_var(rhs, source, tainted)
             if ref:
                 ref_kind = tainted[ref]['kind']
-                rhs_text = node_text(rhs, source)
-                kind = 'pointer' if ('+' in rhs_text or '-' in rhs_text or
-                                     ref_kind == 'pointer') else 'value'
+                kind = 'pointer' if (
+                    _rhs_has_additive_arith(rhs) or ref_kind == 'pointer'
+                ) else 'value'
                 tainted[lhs_var] = {
                     'source_fn': tainted[ref]['source_fn'],
                     'line': tainted[ref]['line'],   # keep the original source line
@@ -875,6 +888,62 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     f"server-supplied value {tainted_var_name!r} "
                     f"(from {src_fn}()) controls loop iteration count "
                     f"without validation against buffer size"
+                ),
+            })
+
+        # ── Category E: dereference of pointer derived from server offset ──
+        #
+        # Pattern: offset = le32_to_cpu(hdr->Off); ptr = base + offset; ptr->field
+        # The ptr variable is tracked as kind='pointer'.  Accessing struct fields
+        # through it without first verifying offset + sizeof(*ptr) <= pkt_end is
+        # an OOB read.
+        #
+        # Only flags named pointer variables (kind='pointer' in tainted), not
+        # inline cast expressions — those are a known gap for a future follow-up.
+        elif node.type == 'field_expression':
+            if not any(c.type == '->' for c in node.children):
+                continue   # .field on a value type — safe
+
+            arg = node.child_by_field_name('argument')
+            if arg is None:
+                continue
+
+            ref = _node_references_tainted_var(arg, source, tainted)
+            if not ref or tainted[ref]['kind'] != 'pointer':
+                continue
+
+            info = tainted[ref]
+            taint_line = info['line']
+            sink_line = node.start_point[0] + 1
+            if taint_line >= sink_line:
+                continue
+
+            fld_node = node.child_by_field_name('field')
+            field_name = node_text(fld_node, source) if fld_node else '?'
+            sink_snippet = get_source_line(source, sink_line)
+            guarded = _find_guards_between(
+                fn_body, {ref}, taint_line, sink_line, source,
+            )
+            findings.append({
+                'function':        fn_name,
+                'file':            str(filepath),
+                'category':        'E',
+                'severity':        'high',
+                'taint_source_fn': info['source_fn'],
+                'tainted_var':     ref,
+                'taint_line':      taint_line,
+                'taint_snippet':   get_source_line(source, taint_line),
+                'sink_fn':         'ptr_deref',
+                'sink_line':       sink_line,
+                'sink_snippet':    sink_snippet,
+                'sink_arg_index':  0,
+                'sink_arg_role':   'tainted_ptr_deref',
+                'field_name':      field_name,
+                'possibly_guarded': guarded,
+                'reason': (
+                    f"pointer {ref!r} derived from {info['source_fn']}() offset "
+                    f"arithmetic used without verifying offset + sizeof(*{ref}) "
+                    f"<= packet_end; {ref}->{field_name} may read beyond packet bounds"
                 ),
             })
 
