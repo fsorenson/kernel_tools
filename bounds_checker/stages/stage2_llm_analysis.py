@@ -22,6 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from kernel_analysis.parsers.c_parser import parse_file, find_functions
+from bounds_checker.report import write_reports
 
 
 _MAX_FN_LINES = 150
@@ -164,6 +165,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     print(f"\nStage 2 output: {out_path}")
 
     _print_summary(all_analyses, verbose)
+    write_reports(run_dir, stage1_output, output)
     return output
 
 

@@ -74,8 +74,9 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
 
 ## P3 — Output and Integration
 
-- [ ] Markdown / HTML report formatter — per-file findings with source snippets,
-      taint flow explanation, suggested fix; analogous to race finder report stage
+- [x] Markdown / HTML report formatter — per-file findings with source snippets,
+      taint flow explanation, suggested fix; written after Stage 1 (static only)
+      and overwritten after Stage 2 (with LLM assessment, impact badges, fix text)
 
 - [ ] Integration with race finder run dirs — optionally consume race finder
       Stage 1 struct map to annotate which tainted fields belong to which struct

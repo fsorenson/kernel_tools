@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from bounds_checker.parsers.taint_scanner import scan_files, TAINT_SOURCES, DANGEROUS_SINKS
+from bounds_checker.report import write_reports
 
 
 def run(cfg, run_dir, verbose=False):
@@ -54,6 +55,8 @@ def run(cfg, run_dir, verbose=False):
     out_path = Path(run_dir) / 'stage1_taint_scan.json'
     out_path.write_text(json.dumps(output, indent=2))
     print(f"\nStage 1 output: {out_path}")
+    # Write static-analysis-only report (will be superseded if Stage 2 runs)
+    write_reports(run_dir, output, {'analyses': [], 'model': '—', 'functions_analyzed': 0})
     return output
 
 
