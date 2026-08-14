@@ -434,54 +434,72 @@ def _call_llm(client, model, prompt, verbose,
         model=model,
         max_tokens=json_tokens + thinking_budget if thinking_budget else json_tokens,
         system=_SYSTEM,
-        messages=[{'role': 'user', 'content': prompt}],
     )
     if thinking_budget:
         kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': thinking_budget}
 
-    if debug_fh:
-        _write_debug(debug_fh, f'PROMPT — {fn_label}', prompt)
+    _RETRY_NOTE = (
+        "IMPORTANT: your previous response was not valid JSON.  "
+        "Output ONLY the JSON object — nothing before the opening brace, "
+        "nothing after the closing brace, no markdown fences, no prose.\n\n"
+    )
 
-    msg = client.messages.create(**kwargs)
+    last_exc = None
+    for attempt in range(2):
+        msg_prompt = (_RETRY_NOTE + prompt) if attempt else prompt
+        kwargs['messages'] = [{'role': 'user', 'content': msg_prompt}]
 
-    thinking_text = ''
-    response_text = ''
-    for block in msg.content:
-        if block.type == 'thinking':
-            thinking_text = block.thinking
-        elif block.type == 'text':
-            response_text = block.text.strip()
+        if debug_fh:
+            label = f'PROMPT (retry)' if attempt else 'PROMPT'
+            _write_debug(debug_fh, f'{label} — {fn_label}', msg_prompt)
 
-    if debug_fh:
-        if thinking_text:
-            _write_debug(debug_fh, f'THINKING — {fn_label}', thinking_text)
-        usage = msg.usage
-        _write_debug(debug_fh, f'RESPONSE — {fn_label}', response_text,
-                     footer=(f"stop={msg.stop_reason}  "
-                             f"in={usage.input_tokens}  out={usage.output_tokens}"))
+        msg = client.messages.create(**kwargs)
 
-    if msg.stop_reason == 'max_tokens':
-        raise ValueError(
-            f"output truncated at {json_tokens} tokens ({len(response_text)} chars) — "
-            f"response cut mid-JSON; consider using --thinking or reducing findings per function"
-        )
+        thinking_text = ''
+        response_text = ''
+        for block in msg.content:
+            if block.type == 'thinking':
+                thinking_text = block.thinking
+            elif block.type == 'text':
+                response_text = block.text.strip()
 
-    if verbose:
-        print(f"[{len(response_text)} chars]", end=' ')
+        if debug_fh:
+            if thinking_text:
+                _write_debug(debug_fh, f'THINKING — {fn_label}', thinking_text)
+            usage = msg.usage
+            _write_debug(debug_fh, f'RESPONSE — {fn_label}', response_text,
+                         footer=(f"stop={msg.stop_reason}  "
+                                 f"in={usage.input_tokens}  out={usage.output_tokens}"))
 
-    # Strip accidental fences, then use raw_decode to find the first valid JSON object
-    text = re.sub(r'^```(?:json)?\s*', '', response_text, flags=re.MULTILINE)
-    text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE).strip()
+        if msg.stop_reason == 'max_tokens':
+            raise ValueError(
+                f"output truncated at {json_tokens} tokens ({len(response_text)} chars) — "
+                f"response cut mid-JSON; consider using --thinking or reducing findings per function"
+            )
 
-    start = text.find('{')
-    if start == -1:
-        raise ValueError(f"No JSON object in response: {text[:200]!r}")
-    decoder = json.JSONDecoder()
-    try:
-        obj, _ = decoder.raw_decode(text, start)
-        return obj
-    except json.JSONDecodeError as e:
-        raise ValueError(f"JSON parse error: {e}\n{text[start:start+300]}")
+        if verbose:
+            suffix = ' (retry)' if attempt else ''
+            print(f"[{len(response_text)} chars{suffix}]", end=' ')
+
+        # Strip accidental fences, then use raw_decode to find the first valid JSON object
+        text = re.sub(r'^```(?:json)?\s*', '', response_text, flags=re.MULTILINE)
+        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE).strip()
+
+        start = text.find('{')
+        if start == -1:
+            last_exc = ValueError(f"No JSON object in response: {text[:200]!r}")
+            continue
+        decoder = json.JSONDecoder()
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+            return obj
+        except json.JSONDecodeError as e:
+            last_exc = ValueError(f"JSON parse error: {e}\n{text[start:start+300]}")
+            if debug_fh:
+                debug_fh.write(f"\n[JSON parse failed on attempt {attempt}, "
+                               f"{'retrying' if attempt == 0 else 'giving up'}]: {e}\n")
+
+    raise last_exc
 
 
 def _write_debug(fh, title, body, footer=None):
