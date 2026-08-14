@@ -18,7 +18,10 @@ import os
 import re
 import sys
 import textwrap
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 
 from kernel_analysis.parsers.c_parser import parse_file, find_functions
@@ -83,7 +86,7 @@ _CONFIDENCE_ORDER = {'high': 2, 'medium': 1, 'low': 0}
 
 
 def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
-                verbose, thinking_budget, debug_fh):
+                verbose, thinking_budget, debug_fh, debug_lock=None):
     """
     Run LLM analysis for all findings in one function, splitting into batches
     of _BATCH_SIZE when needed.  Batch finding_index values are remapped to
@@ -95,7 +98,8 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
                          n_findings=len(fn_findings),
                          thinking_budget=thinking_budget,
                          debug_fh=debug_fh,
-                         fn_label=f"{fn_name}() [{short_file}]")
+                         fn_label=f"{fn_name}() [{short_file}]",
+                         debug_lock=debug_lock)
 
     total     = len(fn_findings)
     n_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
@@ -116,7 +120,8 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
                            n_findings=len(batch),
                            thinking_budget=thinking_budget,
                            debug_fh=debug_fh,
-                           fn_label=label)
+                           fn_label=label,
+                           debug_lock=debug_lock)
 
         # Remap batch-local 1-based finding_index to function-global 1-based
         for fr in result.get('findings', []):
@@ -141,7 +146,7 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
 # Stage entry point
 # ---------------------------------------------------------------------------
 
-def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget=0):
+def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget=0, n_workers=1):
     """
     Analyze Stage 1 taint findings with the LLM.
 
@@ -175,9 +180,10 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     for f in findings:
         fn_groups[(f['function'], f['file'])].append(f)
 
+    workers_str = f', {n_workers} workers' if n_workers > 1 else ''
     suffix = (f', extended thinking ({thinking_budget} tokens)' if thinking_budget
               else ', debug' if debug else '')
-    print(f"Stage 2 (LLM): analyzing {len(fn_groups)} function(s) with {model}{suffix}")
+    print(f"Stage 2 (LLM): analyzing {len(fn_groups)} function(s) with {model}{suffix}{workers_str}")
 
     run_dir = Path(run_dir)
     debug_path = run_dir / 'stage2_llm_analysis.debug'
@@ -185,46 +191,73 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     if debug_fh:
         print(f"  debug log: {debug_path}")
 
+    # One lock protects all debug file writes; uncontested when n_workers == 1.
+    debug_lock = threading.Lock() if debug_fh else None
+
     all_analyses = []
+    total_fns = len(fn_groups)
+    done_count = 0
+
+    def _work(fn_name, filepath, fn_findings):
+        short_file = Path(filepath).name
+        fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
+        if fn_source is None:
+            return fn_name, short_file, fn_findings, None, None
+        try:
+            result = _analyze_fn(
+                client, model, fn_name, short_file, fn_source, fn_findings,
+                verbose, thinking_budget, debug_fh, debug_lock,
+            )
+            return fn_name, short_file, fn_findings, result, None
+        except Exception as exc:
+            if verbose:
+                import traceback; traceback.print_exc()
+            if debug_fh:
+                with (debug_lock or nullcontext()):
+                    debug_fh.write(f"\n[ERROR] {fn_name}(): {exc}\n")
+                    debug_fh.flush()
+            return fn_name, short_file, fn_findings, None, exc
 
     try:
-        for (fn_name, filepath), fn_findings in sorted(fn_groups.items()):
-            short_file = Path(filepath).name
-            n = len(fn_findings)
-            n_batches = (n + _BATCH_SIZE - 1) // _BATCH_SIZE
-            batch_tag = f' [{n_batches} batches]' if n_batches > 1 else ''
-            print(f"  {fn_name}() [{short_file}]{batch_tag} ...", end=' ', flush=True)
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_work, fn_name, filepath, fn_findings): (fn_name, filepath)
+                for (fn_name, filepath), fn_findings in sorted(fn_groups.items())
+            }
+            for future in as_completed(futures):
+                done_count += 1
+                progress = f"[{done_count}/{total_fns}]"
+                try:
+                    fn_name, short_file, fn_findings, result, exc = future.result()
+                except Exception as e:
+                    key = futures[future]
+                    print(f"  {progress} {key[0]}() [unexpected error: {e}]")
+                    continue
 
-            fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
-            if fn_source is None:
-                print("[source not found]")
-                continue
+                n = len(fn_findings)
+                n_batches = (n + _BATCH_SIZE - 1) // _BATCH_SIZE
+                batch_tag = f' [{n_batches} batches]' if n_batches > 1 else ''
 
-            try:
-                result = _analyze_fn(
-                    client, model, fn_name, short_file, fn_source, fn_findings,
-                    verbose, thinking_budget, debug_fh,
-                )
-                result['function'] = fn_name
-                result['file'] = short_file
-                all_analyses.append(result)
-                assessment = result.get('assessment', '?')
-                conf = result.get('confidence', '?')
-                real_n = sum(1 for f in result.get('findings', []) if f.get('real_bug'))
-                print(f"[{assessment}, {conf}, {real_n}/{n} real]")
-            except Exception as exc:
-                print(f"[error: {exc}]")
-                if verbose:
-                    import traceback; traceback.print_exc()
-                if debug_fh:
-                    debug_fh.write(f"\n[ERROR] {fn_name}(): {exc}\n")
-                all_analyses.append({
-                    'function': fn_name,
-                    'file': short_file,
-                    'assessment': 'error',
-                    'error': str(exc),
-                    'findings': [],
-                })
+                if result is None and exc is None:
+                    print(f"  {progress} {fn_name}() [{short_file}] [source not found]")
+                elif exc is not None:
+                    print(f"  {progress} {fn_name}() [{short_file}]{batch_tag} [error: {exc}]")
+                    all_analyses.append({
+                        'function': fn_name,
+                        'file': short_file,
+                        'assessment': 'error',
+                        'error': str(exc),
+                        'findings': [],
+                    })
+                else:
+                    result['function'] = fn_name
+                    result['file'] = short_file
+                    all_analyses.append(result)
+                    assessment = result.get('assessment', '?')
+                    conf = result.get('confidence', '?')
+                    real_n = sum(1 for f in result.get('findings', []) if f.get('real_bug'))
+                    print(f"  {progress} {fn_name}() [{short_file}]{batch_tag} "
+                          f"[{assessment}, {conf}, {real_n}/{n} real]")
     finally:
         if debug_fh:
             debug_fh.close()
@@ -523,7 +556,7 @@ def _build_prompt(fn_name, short_file, fn_source, findings):
 # ---------------------------------------------------------------------------
 
 def _call_llm(client, model, prompt, verbose,
-              n_findings=1, thinking_budget=0, debug_fh=None, fn_label=''):
+              n_findings=1, thinking_budget=0, debug_fh=None, fn_label='', debug_lock=None):
     # Scale output budget with findings count; cap at the model's hard limit.
     # Base: 1024 tokens for outer JSON + overall_notes.
     # Per finding: ~512 tokens for 10 fields (some with multi-sentence strings).
@@ -546,14 +579,25 @@ def _call_llm(client, model, prompt, verbose,
         "nothing after the closing brace, no markdown fences, no prose.\n\n"
     )
 
+    _ctx = debug_lock if debug_lock is not None else nullcontext()
+
+    def _dbg(title, body, footer=None):
+        if debug_fh:
+            with _ctx:
+                _write_debug(debug_fh, title, body, footer)
+
+    def _dbg_raw(text):
+        if debug_fh:
+            with _ctx:
+                debug_fh.write(text)
+                debug_fh.flush()
+
     last_exc = None
     for attempt in range(2):
         msg_prompt = (_RETRY_NOTE + prompt) if attempt else prompt
         kwargs['messages'] = [{'role': 'user', 'content': msg_prompt}]
 
-        if debug_fh:
-            label = f'PROMPT (retry)' if attempt else 'PROMPT'
-            _write_debug(debug_fh, f'{label} — {fn_label}', msg_prompt)
+        _dbg(f"{'PROMPT (retry)' if attempt else 'PROMPT'} — {fn_label}", msg_prompt)
 
         msg = client.messages.create(**kwargs)
 
@@ -565,13 +609,12 @@ def _call_llm(client, model, prompt, verbose,
             elif block.type == 'text':
                 response_text = block.text.strip()
 
-        if debug_fh:
-            if thinking_text:
-                _write_debug(debug_fh, f'THINKING — {fn_label}', thinking_text)
-            usage = msg.usage
-            _write_debug(debug_fh, f'RESPONSE — {fn_label}', response_text,
-                         footer=(f"stop={msg.stop_reason}  "
-                                 f"in={usage.input_tokens}  out={usage.output_tokens}"))
+        if thinking_text:
+            _dbg(f'THINKING — {fn_label}', thinking_text)
+        usage = msg.usage
+        _dbg(f'RESPONSE — {fn_label}', response_text,
+             footer=(f"stop={msg.stop_reason}  "
+                     f"in={usage.input_tokens}  out={usage.output_tokens}"))
 
         if msg.stop_reason == 'max_tokens':
             raise ValueError(
@@ -597,9 +640,8 @@ def _call_llm(client, model, prompt, verbose,
             return obj
         except json.JSONDecodeError as e:
             last_exc = ValueError(f"JSON parse error: {e}\n{text[start:start+300]}")
-            if debug_fh:
-                debug_fh.write(f"\n[JSON parse failed on attempt {attempt}, "
-                               f"{'retrying' if attempt == 0 else 'giving up'}]: {e}\n")
+            _dbg_raw(f"\n[JSON parse failed on attempt {attempt}, "
+                     f"{'retrying' if attempt == 0 else 'giving up'}]: {e}\n")
 
     raise last_exc
 

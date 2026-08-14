@@ -69,6 +69,7 @@ def main():
                 verbose=args.verbose,
                 debug=args.debug,
                 thinking_budget=args.thinking,
+                n_workers=cfg['llm'].get('workers', 4),
             )
         else:
             print("  Skipped — no Stage 1 findings.")

@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
     'llm': {
         'enabled': False,
         'model': _DEFAULT_MODEL,
+        'workers': 4,
     },
 }
 
@@ -67,6 +68,8 @@ def load_config(config_path=None, cli_args=None):
             cfg['categories'] = cli_args.categories
         if getattr(cli_args, 'model', None):
             cfg['llm']['model'] = cli_args.model
+        if getattr(cli_args, 'llm_workers', None) is not None:
+            cfg['llm']['workers'] = cli_args.llm_workers
 
     cfg['kernel_source'] = Path(cfg['kernel_source']).expanduser().resolve()
     if not cfg['kernel_source'].exists():
@@ -108,6 +111,8 @@ Examples:
                    help='List known Claude model IDs and exit')
     p.add_argument('--thinking', metavar='TOKENS', type=int, default=0,
                    help='Extended thinking budget in tokens (0=disabled; min 1024)')
+    p.add_argument('--llm-workers', metavar='N', type=int, default=None,
+                   help='Number of parallel LLM API calls (default: 4; use 1 for serial)')
     p.add_argument('--debug', action='store_true',
                    help='Write full LLM prompts and responses to stage2_llm_analysis.debug')
     p.add_argument('--verbose', '-v', action='store_true')

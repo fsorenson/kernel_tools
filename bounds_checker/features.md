@@ -121,6 +121,23 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       shift-then-mask truncation (e.g. `u8 x = (u32_val >> 24) & 0xFF`) where the
       mask makes the narrowing safe — these require LLM assessment.
 
+- [x] Parallel LLM calls — `ThreadPoolExecutor` with configurable worker count
+      (`llm.workers` in YAML, `--llm-workers N` on CLI, default 4); each worker
+      independently calls `_analyze_fn()` for one function; all debug file writes
+      protected by a `threading.Lock`; `done_count` and `all_analyses` updated
+      in the main thread via `as_completed()`; Anthropic SDK (`httpx.Client`) is
+      thread-safe with connection pooling.  Output format: `[N/total] fn() [file]
+      [K batches] [assessment, conf, N/M real]`.  Serial fallback: `--llm-workers 1`.
+      Typical speedup: 4–6× on Vertex; throughput limited by API rate limits.
+
+- [ ] Category filter for LLM — `--llm-categories A B C` to skip LLM analysis for
+      noisy categories (e.g., H, G2) without re-running Stage 1; reduces call
+      count when a full re-analysis is not warranted
+
+- [ ] Merge/combine runs — `bc merge bc_runs/dir1 bc_runs/dir2 ...` to aggregate
+      multiple run directories into a unified `summary.md` + `summary.html`; useful
+      when scanning drivers/* in per-subdirectory batches and combining results
+
 - [ ] Configurable taint sources and sinks — allow per-project YAML extension of
       the default `TAINT_SOURCES` and `DANGEROUS_SINKS` sets for non-CIFS subsystems
       (e.g., NFS uses `be32_to_cpu`, block drivers have their own idioms)
