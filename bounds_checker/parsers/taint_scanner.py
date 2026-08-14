@@ -201,6 +201,25 @@ _SAFE_SIZE_HELPERS = frozenset({
     'saturate_add',
 })
 
+# ---------------------------------------------------------------------------
+# Category D: unterminated string (strlen / strlcpy on server-supplied buffer)
+# ---------------------------------------------------------------------------
+#
+# Maps function name → index of the argument that must be null-terminated.
+# These functions assume null termination without enforcing a length bound on
+# the source buffer.  strlcpy is included because it limits the *destination*
+# copy length but still internally calls strlen on the source.
+_STRING_UNSAFE_SINKS = {
+    'strlen':  0,
+    'strlcpy': 1,   # strlcpy(dst, src, n)   — still strlen's src
+    'strcat':  1,   # strcat(dst, src)
+    'strdup':  0,
+    'kstrdup': 0,
+}
+
+# Calls that establish a safe bounded-length search — constitute a guard for Cat D.
+_STRING_SAFE_CALLS = frozenset({'strnlen', 'memchr', 'memchr_inv'})
+
 
 # ---------------------------------------------------------------------------
 # Expression taint analysis helpers
@@ -475,6 +494,34 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source):
     return False
 
 
+def _find_string_guard(fn_body, var_name, line_lo, line_hi, source):
+    """
+    Return True if a safe bounded-length call (strnlen, memchr, memchr_inv)
+    on var_name appears between line_lo and line_hi.
+
+    These are the only constructs that establish a null-termination guarantee
+    without unbounded scanning; a strnlen() result stored and compared is
+    sufficient even if not paired with a return.
+    """
+    for node in _walk(fn_body):
+        if node.type != 'call_expression':
+            continue
+        call_line = node.start_point[0] + 1
+        if call_line <= line_lo or call_line >= line_hi:
+            continue
+        fn_id = next((c for c in node.children if c.type == 'identifier'), None)
+        if fn_id is None or node_text(fn_id, source) not in _STRING_SAFE_CALLS:
+            continue
+        args = _arg_nodes(node)
+        if not args:
+            continue
+        # var_name must appear in the first argument (possibly through a cast)
+        for n in _walk(args[0]):
+            if n.type == 'identifier' and node_text(n, source) == var_name:
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Core taint walk (shared by intra and cross-function modes)
 # ---------------------------------------------------------------------------
@@ -690,6 +737,47 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     'call_snippet': get_source_line(source, call_line),
                     'tainted_args': t_args,
                 })
+
+            # ── Category D: strlen / strlcpy on server-supplied buffer ──
+            #
+            # Must run BEFORE the `if not sink_info` guard so functions that
+            # are not in DANGEROUS_SINKS (strlen, strcat, strdup, kstrdup) are
+            # still checked.  strlcpy IS in DANGEROUS_SINKS (size arg), but
+            # we additionally flag its source arg here.
+            d_arg_idx = _STRING_UNSAFE_SINKS.get(callee)
+            if d_arg_idx is not None and d_arg_idx < len(args):
+                d_arg = args[d_arg_idx]
+                d_ref = _node_references_tainted_var(d_arg, source, tainted)
+                if d_ref and tainted[d_ref]['kind'] == 'pointer':
+                    d_info = tainted[d_ref]
+                    d_taint_line = d_info['line']
+                    if d_taint_line < call_line:
+                        d_guarded = _find_string_guard(
+                            fn_body, d_ref, d_taint_line, call_line, source,
+                        )
+                        findings.append({
+                            'function':        fn_name,
+                            'file':            str(filepath),
+                            'category':        'D',
+                            'severity':        'high',
+                            'taint_source_fn': d_info['source_fn'],
+                            'tainted_var':     d_ref,
+                            'taint_line':      d_taint_line,
+                            'taint_snippet':   get_source_line(source, d_taint_line),
+                            'sink_fn':         callee,
+                            'sink_line':       call_line,
+                            'sink_snippet':    get_source_line(source, call_line),
+                            'sink_arg_index':  d_arg_idx,
+                            'sink_arg_role':   'string_arg',
+                            'possibly_guarded': d_guarded,
+                            'reason': (
+                                f"pointer {d_ref!r} derived from "
+                                f"{d_info['source_fn']}() offset arithmetic "
+                                f"passed to {callee}() (arg {d_arg_idx}) without "
+                                f"a prior strnlen() or memchr() to verify null "
+                                f"termination within packet bounds"
+                            ),
+                        })
 
             sink_info = DANGEROUS_SINKS.get(callee)
             if not sink_info:

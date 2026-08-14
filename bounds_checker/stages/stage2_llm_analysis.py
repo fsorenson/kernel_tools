@@ -36,6 +36,7 @@ _CATEGORY_LABELS = {
     'B':     'server-supplied value → size/length/allocation argument',
     'B_OVF': 'integer overflow: server-supplied value in multiplicative/additive size expression',
     'C':     'server-supplied value → array subscript',
+    'D':     'strlen/strlcpy on server-supplied pointer without null-termination guarantee',
     'E':     'tainted pointer dereference: struct field access via pointer derived from server offset',
     'F':     'server-supplied value controls loop iteration count without buffer bounds validation',
     'H':     'server-supplied wide value silently truncated to narrower integer type',
@@ -353,6 +354,18 @@ def _format_findings(findings):
                 f"    Note: the sink is in the callee, but the fix may belong "
                 f"in THIS function (validate before calling {f['callee_fn']}()) "
                 f"or in {f['callee_fn']}() itself (validate its parameter).\n"
+            )
+        elif f.get('sink_arg_role') == 'string_arg':
+            entry += (
+                f"    String sink: {f['sink_fn']}() arg {f['sink_arg_index']}  "
+                f"line {f['sink_line']}\n"
+                f"    Sink snippet:   {f['sink_snippet']}\n"
+                f"    Note: {f['sink_fn']}() assumes the argument is null-terminated "
+                f"within the accessible buffer.  strlcpy() limits the *destination* "
+                f"copy but still calls strlen() on the source.  False positive if the "
+                f"caller established a maximum length via strnlen() or memchr() before "
+                f"this call, or if the string came from a trusted (kernel-internal) "
+                f"source rather than server-supplied packet data.\n"
             )
         elif f.get('sink_arg_role') == 'tainted_ptr_deref':
             entry += (

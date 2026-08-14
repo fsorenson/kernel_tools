@@ -97,6 +97,7 @@ def _print_summary(findings_intra, findings_cross, by_category, c_paths):
             'A': 'Cat A — server offset → pointer → memory op',
             'B': 'Cat B — server value → size/alloc argument',
             'C': 'Cat C — server value → array subscript',
+            'D': 'Cat D — strlen/strlcpy on server-supplied buffer (no null-termination guarantee)',
             'E': 'Cat E — tainted pointer dereference via ->',
             'F': 'Cat F — server value → loop iteration count',
             'H': 'Cat H — server value → narrow integer type (silent truncation)',

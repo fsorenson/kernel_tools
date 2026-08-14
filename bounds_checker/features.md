@@ -32,9 +32,20 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
 
 ## P1 — Additional Categories
 
-- [ ] **Category D**: unterminated string / missing null-termination guarantee —
-      `strlen()` / `strlcpy()` on a server-supplied buffer with no guarantee
-      a null byte exists within bounds; guard pattern is `strnlen(buf, max)`
+- [x] **Category D**: unterminated string / missing null-termination guarantee —
+      `strlen()` / `strlcpy()` / `strcat()` / `strdup()` / `kstrdup()` on a
+      server-supplied pointer (kind='pointer') without a prior `strnlen()` or
+      `memchr()` call on the same variable.  strlcpy() is included because it
+      limits the *destination* copy length but still calls strlen() internally on
+      the source.  Guard check: `_find_string_guard()` looks for a `strnlen(ptr,n)`
+      or `memchr(ptr,'\0',n)` call on the same variable between taint source and
+      sink.  Detection runs before the DANGEROUS_SINKS early-exit so functions not
+      in that table (strlen, strcat, strdup, kstrdup) are still checked.
+      **Result in fs/smb/client: zero hits** — SMB2/3 wire protocol uses explicit
+      length-counted fields (NameLength, FileNameLength, etc.) rather than
+      null-terminated strings in responses, so the code correctly avoids strlen()
+      on server-supplied buffers.  Cat D is more relevant for NFS or SMBv1 paths
+      that do use C-string APIs on network data.
 
 - [x] **Category E**: tainted pointer dereference — accessing `ptr->field` where
       `ptr` is derived from server-supplied offset arithmetic (i.e. `kind='pointer'`
