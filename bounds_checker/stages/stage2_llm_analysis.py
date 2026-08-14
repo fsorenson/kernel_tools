@@ -69,6 +69,75 @@ def _make_client():
 
 
 # ---------------------------------------------------------------------------
+# Batched analysis helpers
+# ---------------------------------------------------------------------------
+
+# Max findings per LLM call.  Above ~20 the output JSON routinely hits the
+# 8192-token cap before all finding objects are written.
+_BATCH_SIZE = 20
+
+_ASSESSMENT_SEVERITY = {
+    'real_bug': 4, 'mixed': 3, 'needs_validation': 2, 'false_positive': 1, 'error': 0,
+}
+_CONFIDENCE_ORDER = {'high': 2, 'medium': 1, 'low': 0}
+
+
+def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
+                verbose, thinking_budget, debug_fh):
+    """
+    Run LLM analysis for all findings in one function, splitting into batches
+    of _BATCH_SIZE when needed.  Batch finding_index values are remapped to
+    function-global 1-based indices before merging.
+    """
+    if len(fn_findings) <= _BATCH_SIZE:
+        prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings)
+        return _call_llm(client, model, prompt, verbose,
+                         n_findings=len(fn_findings),
+                         thinking_budget=thinking_budget,
+                         debug_fh=debug_fh,
+                         fn_label=f"{fn_name}() [{short_file}]")
+
+    total     = len(fn_findings)
+    n_batches = (total + _BATCH_SIZE - 1) // _BATCH_SIZE
+    all_fr    = []
+    assessments = []
+    confidences = []
+    notes     = []
+
+    for b, batch_start in enumerate(range(0, total, _BATCH_SIZE), 1):
+        batch = fn_findings[batch_start:batch_start + _BATCH_SIZE]
+        label = f"{fn_name}() [{short_file}] batch {b}/{n_batches}"
+        prompt = _build_prompt(fn_name, short_file, fn_source, batch)
+
+        if verbose:
+            print(f"[b{b}/{n_batches}]", end=' ', flush=True)
+
+        result = _call_llm(client, model, prompt, verbose,
+                           n_findings=len(batch),
+                           thinking_budget=thinking_budget,
+                           debug_fh=debug_fh,
+                           fn_label=label)
+
+        # Remap batch-local 1-based finding_index to function-global 1-based
+        for fr in result.get('findings', []):
+            fr['finding_index'] = fr.get('finding_index', 0) + batch_start
+        all_fr.extend(result.get('findings', []))
+        assessments.append(result.get('assessment', 'error'))
+        confidences.append(result.get('confidence', 'low'))
+        notes.append(result.get('overall_notes', ''))
+
+    merged_assessment  = max(assessments, key=lambda a: _ASSESSMENT_SEVERITY.get(a, 0))
+    merged_confidence  = min(confidences, key=lambda c: _CONFIDENCE_ORDER.get(c, 0))
+    merged_notes       = ' | '.join(n for n in notes if n)
+    return {
+        'assessment':   merged_assessment,
+        'confidence':   merged_confidence,
+        'overall_notes': merged_notes,
+        'findings':     all_fr,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Stage entry point
 # ---------------------------------------------------------------------------
 
@@ -121,28 +190,28 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     try:
         for (fn_name, filepath), fn_findings in sorted(fn_groups.items()):
             short_file = Path(filepath).name
-            print(f"  {fn_name}() [{short_file}] ...", end=' ', flush=True)
+            n = len(fn_findings)
+            n_batches = (n + _BATCH_SIZE - 1) // _BATCH_SIZE
+            batch_tag = f' [{n_batches} batches]' if n_batches > 1 else ''
+            print(f"  {fn_name}() [{short_file}]{batch_tag} ...", end=' ', flush=True)
 
             fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
             if fn_source is None:
                 print("[source not found]")
                 continue
 
-            prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings)
-
             try:
-                result = _call_llm(client, model, prompt, verbose,
-                                   n_findings=len(fn_findings),
-                                   thinking_budget=thinking_budget,
-                                   debug_fh=debug_fh,
-                                   fn_label=f"{fn_name}() [{short_file}]")
+                result = _analyze_fn(
+                    client, model, fn_name, short_file, fn_source, fn_findings,
+                    verbose, thinking_budget, debug_fh,
+                )
                 result['function'] = fn_name
                 result['file'] = short_file
                 all_analyses.append(result)
                 assessment = result.get('assessment', '?')
                 conf = result.get('confidence', '?')
                 real_n = sum(1 for f in result.get('findings', []) if f.get('real_bug'))
-                print(f"[{assessment}, {conf}, {real_n}/{len(fn_findings)} real]")
+                print(f"[{assessment}, {conf}, {real_n}/{n} real]")
             except Exception as exc:
                 print(f"[error: {exc}]")
                 if verbose:
