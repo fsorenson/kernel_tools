@@ -169,6 +169,7 @@ def _build_context(run_dir, s1, s2):
         'model':       s2.get('model', '—'),
         'source_dirs': s1.get('source_dirs', []),
         'files_scanned': s1.get('files_scanned', 0),
+        'kernel_git':  s1.get('kernel_git', {}),
         's1_total':    s1.get('findings_count', 0),
         's1_by_cat':   s1_by_cat,
         'fn_analyzed': s2.get('functions_analyzed', len(sections)),
@@ -184,6 +185,29 @@ def _build_context(run_dir, s1, s2):
 # Markdown renderer
 # ---------------------------------------------------------------------------
 
+def _git_md_block(git):
+    """Return Markdown lines for the kernel git block, or [] if no info."""
+    if not git or not git.get('version'):
+        return []
+    lines = []
+    ver    = git.get('version', '')
+    branch = git.get('branch', '')
+    commits = git.get('commits', [])
+    base   = git.get('base_ref', '')
+
+    lines.append(f"**Kernel:** `{ver}`  ")
+    if branch:
+        lines.append(f"**Branch:** `{branch}`  ")
+    if commits:
+        base_label = f" since `{base}`" if base else ''
+        lines.append(f"**Local commits**{base_label} ({len(commits)}):  ")
+        for c in commits:
+            lines.append(f"- `{c['hash']}` {c['subject']}")
+    elif base:
+        lines.append(f"**Local commits:** none (at `{base}` tip)  ")
+    return lines
+
+
 def _render_md(ctx):
     buf = []
     W = buf.append
@@ -193,6 +217,10 @@ def _render_md(ctx):
     W(f"**Model:** {ctx['model']}  ")
     W(f"**Source:** {', '.join(ctx['source_dirs'])}  ")
     W(f"**Files scanned:** {ctx['files_scanned']}\n")
+
+    for line in _git_md_block(ctx.get('kernel_git', {})):
+        W(line)
+    W("")
 
     cat_parts = ', '.join(f"Cat {c}: {n}" for c, n in sorted(ctx['s1_by_cat'].items()))
     W(f"**Stage 1 findings:** {ctx['s1_total']} ({cat_parts})  ")
@@ -403,6 +431,32 @@ def _impact_badge(impact):
     return f' <span class="impact {cls}">{_e(impact)}</span>'
 
 
+def _html_git_block(W, git):
+    """Emit an HTML git-info block inside the meta bar (collapsible commit list)."""
+    if not git or not git.get('version'):
+        return
+    ver     = _e(git.get('version', ''))
+    branch  = _e(git.get('branch', ''))
+    commits = git.get('commits', [])
+    base    = _e(git.get('base_ref', ''))
+
+    W(f'<span><span class="key">Kernel:</span> <code>{ver}</code></span>')
+    if branch:
+        W(f'<span><span class="key">Branch:</span> <code>{branch}</code></span>')
+    if commits:
+        label = f"since <code>{base}</code>" if base else "local"
+        W(f'<span style="display:block;margin-top:4px">'
+          f'<details><summary style="cursor:pointer;color:#1a5fa8">'
+          f'{len(commits)} local commit(s) {label}</summary>'
+          f'<ol style="margin:4px 0 0 1.5em;padding:0;font-size:11px">')
+        for c in commits:
+            W(f'<li><code>{_e(c["hash"])}</code> {_e(c["subject"])}</li>')
+        W('</ol></details></span>')
+    elif base:
+        W(f'<span><span class="key">Local commits:</span> '
+          f'none (at <code>{base}</code> tip)</span>')
+
+
 def _render_html(ctx):
     lines = []
     W = lines.append
@@ -430,6 +484,7 @@ def _render_html(ctx):
           f'{ctx["total_unk"]} unanalyzed</span>')
     else:
         W('<span><span class="key">Stage 2:</span> not run</span>')
+    _html_git_block(W, ctx.get('kernel_git', {}))
     W('</div><main>')
 
     # Table of contents
@@ -690,19 +745,20 @@ def write_summary(run_dir, stage1_output, stage2_output, formats=('md', 'html'))
     now_str  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     run_name = run_dir.name
     source_dirs = stage1_output.get('source_dirs', [])
+    git_info    = stage1_output.get('kernel_git', {})
 
     written = []
     if 'md' in formats:
         path = run_dir / 'summary.md'
         path.write_text(
-            _render_summary_md(rows, has_llm, run_name, now_str, source_dirs),
+            _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info),
             encoding='utf-8',
         )
         written.append(path)
     if 'html' in formats:
         path = run_dir / 'summary.html'
         path.write_text(
-            _render_summary_html(rows, has_llm, run_name, now_str, source_dirs),
+            _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info),
             encoding='utf-8',
         )
         written.append(path)
@@ -738,7 +794,7 @@ def _file_counts(rows):
 
 # -- Markdown renderer -------------------------------------------------------
 
-def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs):
+def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info=None):
     buf = []
     W = buf.append
 
@@ -746,6 +802,10 @@ def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs):
     W(f"**Date:** {now_str}  ")
     W(f"**Source:** {', '.join(source_dirs)}  ")
     W(f"**Total findings:** {len(rows)}\n")
+
+    for line in _git_md_block(git_info or {}):
+        W(line)
+    W("")
 
     # Tier breakdown
     tier_cts = _tier_counts(rows, has_llm)
@@ -895,7 +955,7 @@ def _summary_row_html(W, rank, score, s1f, llm, short_file, has_llm, max_score):
       f'</tr>')
 
 
-def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs):
+def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info=None):
     lines = []
     W = lines.append
 
@@ -927,6 +987,7 @@ def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs):
         W(f'<span><span class="key">LLM:</span> '
           f'<span class="verdict-bug">{real_n} real</span> &nbsp;|&nbsp; '
           f'{fp_n} FP &nbsp;|&nbsp; {unk_n} unanalyzed</span>')
+    _html_git_block(W, git_info or {})
     W('</div><main>')
 
     # Full ranked table

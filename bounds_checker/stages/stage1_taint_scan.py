@@ -1,11 +1,60 @@
 """Stage 1: Intra-procedural taint scanner + cross-function propagation (Cat A, B, C)."""
 
 import json
+import subprocess
 from pathlib import Path
 
 from bounds_checker.parsers.taint_scanner import scan_files, TAINT_SOURCES, DANGEROUS_SINKS
 from bounds_checker.parsers.cross_function import build_param_sink_map, scan_cross_function_calls
 from bounds_checker.report import write_reports
+
+
+def _get_kernel_git_info(kernel_src):
+    """
+    Collect git metadata from the kernel source tree.
+
+    Returns a dict with:
+      version  — output of `git describe --always --tags`
+      branch   — current branch name
+      commits  — list of (hash, subject) tuples for commits since the upstream
+                 tracking branch (or origin/master / origin/main as fallbacks)
+      base_ref — the ref used as the divergence base, or '' if none found
+    """
+    base = str(kernel_src)
+    info = {'version': '', 'branch': '', 'commits': [], 'base_ref': ''}
+
+    def _git(*args):
+        try:
+            r = subprocess.run(
+                ['git', '-C', base] + list(args),
+                capture_output=True, text=True, timeout=10,
+            )
+            return r.stdout.strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
+    info['version'] = _git('describe', '--always', '--tags')
+    info['branch']  = _git('rev-parse', '--abbrev-ref', 'HEAD')
+
+    # Try upstream tracking ref first, then common origin names
+    raw = ''
+    for ref in ('@{upstream}', 'origin/master', 'origin/main'):
+        raw = _git('log', '--oneline', f'{ref}..HEAD')
+        if raw or _git('rev-parse', '--verify', ref):
+            info['base_ref'] = ref
+            break
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(' ', 1)
+        info['commits'].append({
+            'hash':    parts[0],
+            'subject': parts[1] if len(parts) > 1 else '',
+        })
+
+    return info
 
 
 def run(cfg, run_dir, verbose=False):
@@ -31,6 +80,11 @@ def run(cfg, run_dir, verbose=False):
     if not c_paths:
         print("Stage 1: no .c files found")
         return None
+
+    git_info = _get_kernel_git_info(kernel_src)
+    if git_info['version']:
+        branch_str = f"  branch: {git_info['branch']}" if git_info['branch'] else ''
+        print(f"  Kernel: {git_info['version']}{branch_str}")
 
     print(f"  Scanning {len(c_paths)} file(s) in {', '.join(source_dirs)} ...")
 
@@ -63,6 +117,7 @@ def run(cfg, run_dir, verbose=False):
         'stage':                'taint_scan',
         'files_scanned':        len(c_paths),
         'source_dirs':          source_dirs,
+        'kernel_git':           git_info,
         'findings_count':       len(all_findings),
         'findings_intra':       len(findings_intra),
         'findings_cross':       len(findings_cross),
