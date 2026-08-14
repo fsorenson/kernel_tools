@@ -4,7 +4,9 @@ import json
 import subprocess
 from pathlib import Path
 
-from bounds_checker.parsers.taint_scanner import scan_files, TAINT_SOURCES, DANGEROUS_SINKS
+from bounds_checker.parsers.taint_scanner import (
+    scan_files, scan_copy_user_files, TAINT_SOURCES, DANGEROUS_SINKS,
+)
 from bounds_checker.parsers.cross_function import build_param_sink_map, scan_cross_function_calls
 from bounds_checker.report import write_reports
 
@@ -63,6 +65,7 @@ def run(cfg, run_dir, verbose=False):
     Writes stage1_taint_scan.json to run_dir and returns the output dict.
     """
     kernel_src = Path(cfg['kernel_source'])
+    cats = set(cfg.get('categories', []))
     source_dirs = cfg['target'].get('source_dirs', [])
     if not source_dirs:
         print("Stage 1: no source_dirs configured")
@@ -103,7 +106,16 @@ def run(cfg, run_dir, verbose=False):
     print(f"  Scanning call sites for cross-function flows ...")
     findings_cross = scan_cross_function_calls(c_paths, param_sink_map, verbose=verbose)
 
-    all_findings = findings_intra + findings_cross
+    # G1 / G2: user-copy return-value and size-validation checks
+    _G_CATS = {'G1', 'G2'}
+    active_g = cats & _G_CATS
+    findings_g = []
+    if active_g:
+        g_label = '/'.join(sorted(active_g))
+        print(f"  Scanning for {g_label} (user-copy correctness) ...")
+        findings_g = scan_copy_user_files(c_paths, active_g, verbose=verbose)
+
+    all_findings = findings_intra + findings_cross + findings_g
 
     # Categorize counts
     by_category = {}
@@ -111,7 +123,7 @@ def run(cfg, run_dir, verbose=False):
         cat = f['category']
         by_category.setdefault(cat, []).append(f)
 
-    _print_summary(findings_intra, findings_cross, by_category, c_paths)
+    _print_summary(findings_intra, findings_cross, findings_g, by_category, c_paths)
 
     output = {
         'stage':                'taint_scan',
@@ -121,6 +133,7 @@ def run(cfg, run_dir, verbose=False):
         'findings_count':       len(all_findings),
         'findings_intra':       len(findings_intra),
         'findings_cross':       len(findings_cross),
+        'findings_g':           len(findings_g),
         'findings':             all_findings,
     }
 
@@ -133,8 +146,8 @@ def run(cfg, run_dir, verbose=False):
     return output
 
 
-def _print_summary(findings_intra, findings_cross, by_category, c_paths):
-    all_findings = findings_intra + findings_cross
+def _print_summary(findings_intra, findings_cross, findings_g, by_category, c_paths):
+    all_findings = findings_intra + findings_cross + findings_g
     total    = len(all_findings)
     guarded  = sum(1 for f in all_findings if f['possibly_guarded'])
     overflow = sum(1 for f in all_findings if f.get('overflow'))
@@ -143,19 +156,22 @@ def _print_summary(findings_intra, findings_cross, by_category, c_paths):
     print(f"  Taint scan: {total} finding(s) in {len(c_paths)} file(s)")
     print(f"  Intra-procedural: {len(findings_intra)}   "
           f"Cross-function: {len(findings_cross)}   "
+          f"G1/G2: {len(findings_g)}   "
           f"Integer-overflow: {overflow}")
     print(f"  Unguarded: {total - guarded}   Possibly guarded: {guarded}")
     print()
 
     for cat in sorted(by_category):
         label = {
-            'A': 'Cat A — server offset → pointer → memory op',
-            'B': 'Cat B — server value → size/alloc argument',
-            'C': 'Cat C — server value → array subscript',
-            'D': 'Cat D — strlen/strlcpy on server-supplied buffer (no null-termination guarantee)',
-            'E': 'Cat E — tainted pointer dereference via ->',
-            'F': 'Cat F — server value → loop iteration count',
-            'H': 'Cat H — server value → narrow integer type (silent truncation)',
+            'A':  'Cat A — server offset → pointer → memory op',
+            'B':  'Cat B — server value → size/alloc argument',
+            'C':  'Cat C — server value → array subscript',
+            'D':  'Cat D — strlen/strlcpy on server-supplied buffer (no null-termination guarantee)',
+            'E':  'Cat E — tainted pointer dereference via ->',
+            'F':  'Cat F — server value → loop iteration count',
+            'G1': 'Cat G1 — copy_from/to_user return value unchecked (partial copy = success)',
+            'G2': 'Cat G2 — unvalidated size argument to copy_from/to_user',
+            'H':  'Cat H — server value → narrow integer type (silent truncation)',
         }.get(cat, f'Cat {cat}')
         entries   = by_category[cat]
         intra_n   = sum(1 for f in entries if f.get('propagation') == 'intra')

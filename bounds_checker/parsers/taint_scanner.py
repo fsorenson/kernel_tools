@@ -1167,3 +1167,249 @@ def scan_files(source_paths, verbose=False):
             all_findings.extend(findings)
 
     return all_findings
+
+
+# ---------------------------------------------------------------------------
+# Categories G1 / G2: user-copy correctness
+# ---------------------------------------------------------------------------
+
+# Functions whose return value must be checked (returns bytes NOT copied; 0 = success).
+_COPY_USER_FNS = frozenset({
+    'copy_from_user', 'copy_to_user',
+    '__copy_from_user', '__copy_to_user',
+    'get_user', 'put_user',
+    '__get_user', '__put_user',
+    'clear_user',
+})
+
+# Explicit size-argument index for the copy functions that take one.
+# get_user / put_user copy a single typed value — no explicit size arg.
+_COPY_USER_SIZE_ARG = {
+    'copy_from_user':   2,
+    'copy_to_user':     2,
+    '__copy_from_user': 2,
+    '__copy_to_user':   2,
+    'clear_user':       1,
+}
+
+
+def _g_get_callee(call_node, source):
+    fn_child = call_node.child_by_field_name('function')
+    if fn_child is None:
+        return ''
+    if fn_child.type == 'identifier':
+        return node_text(fn_child, source)
+    for n in _walk(fn_child):
+        if n.type == 'identifier':
+            return node_text(n, source)
+    return ''
+
+
+def _g1_retval_checked(fn_body, var_name, after_line, source):
+    """
+    Return True if var_name appears in a conditional check or return_statement
+    anywhere in fn_body after after_line.  Heuristic: presence of the variable
+    in any condition context is treated as a check.
+    """
+    _COND_TYPES = frozenset({
+        'if_statement', 'while_statement', 'do_statement',
+        'for_statement', 'conditional_expression',
+    })
+    for node in _walk(fn_body):
+        if node.start_point[0] + 1 <= after_line:
+            continue
+        if node.type in _COND_TYPES:
+            cond = node.child_by_field_name('condition')
+            if cond:
+                for n in _walk(cond):
+                    if n.type == 'identifier' and node_text(n, source) == var_name:
+                        return True
+        elif node.type == 'return_statement':
+            for n in _walk(node):
+                if n.type == 'identifier' and node_text(n, source) == var_name:
+                    return True
+    return False
+
+
+def _g2_size_identifiers(arg_node, source):
+    """
+    Return the set of variable-name identifiers in a size argument expression,
+    skipping identifiers inside sizeof() subexpressions (type/field names) and
+    numeric/character/string literals.  An empty set means the size is a
+    compile-time constant and needs no runtime validation.
+    """
+    names = set()
+    stack = [arg_node]
+    while stack:
+        n = stack.pop()
+        if n.type == 'sizeof_expression':
+            continue   # don't descend — contents are type names, not variables
+        if n.type in ('number_literal', 'char_literal', 'string_literal'):
+            continue
+        if n.type == 'identifier':
+            names.add(node_text(n, source))
+        else:
+            stack.extend(n.children)
+    return names
+
+
+def _scan_fn_copy_user(fn_body, fn_name, source, filepath, cats):
+    """
+    Scan one function for Category G1 (retval unchecked) and/or G2
+    (unvalidated size argument).  cats is the active category set.
+    """
+    do_g1 = 'G1' in cats
+    do_g2 = 'G2' in cats
+    findings = []
+
+    for node in _walk(fn_body):
+        if node.type != 'call_expression':
+            continue
+        callee = _g_get_callee(node, source)
+        if callee not in _COPY_USER_FNS:
+            continue
+
+        call_line    = node.start_point[0] + 1
+        call_snippet = get_source_line(source, call_line)
+        args         = _arg_nodes(node)
+        parent       = node.parent
+        if parent is None:
+            continue
+
+        # ── G1: return value not checked ─────────────────────────────────────
+        if do_g1:
+            g1_role = None
+            g1_var  = ''
+
+            if parent.type == 'expression_statement':
+                # copy_from_user(...);  — return value discarded entirely
+                g1_role = 'retval_discarded'
+
+            elif parent.type == 'assignment_expression':
+                # rc = copy_from_user(...);  — assigned in a statement
+                gp = parent.parent
+                if gp and gp.type == 'expression_statement':
+                    lhs = parent.child_by_field_name('left')
+                    if lhs is not None:
+                        g1_var = node_text(lhs, source)
+                        if not _g1_retval_checked(fn_body, g1_var, call_line, source):
+                            g1_role = 'retval_unchecked'
+
+            elif parent.type == 'init_declarator':
+                # int rc = copy_from_user(...);
+                decl = parent.child_by_field_name('declarator')
+                if decl is not None:
+                    while decl.type == 'pointer_declarator':
+                        decl = decl.child_by_field_name('declarator') or decl
+                        break
+                    g1_var = node_text(decl, source)
+                    if not _g1_retval_checked(fn_body, g1_var, call_line, source):
+                        g1_role = 'retval_unchecked'
+            # else: call is used directly in a condition or return → checked
+
+            if g1_role == 'retval_discarded':
+                findings.append({
+                    'function':        fn_name,
+                    'file':            str(filepath),
+                    'category':        'G1',
+                    'severity':        'medium',
+                    'taint_source_fn': callee,
+                    'tainted_var':     '',
+                    'taint_line':      call_line,
+                    'taint_snippet':   call_snippet,
+                    'sink_fn':         callee,
+                    'sink_line':       call_line,
+                    'sink_snippet':    call_snippet,
+                    'sink_arg_index':  -1,
+                    'sink_arg_role':   'retval_discarded',
+                    'possibly_guarded': False,
+                    'propagation':     'intra',
+                    'reason': (
+                        f"{callee}() return value discarded — partial copy silently "
+                        f"treated as success (returns bytes NOT copied; non-zero = fault)"
+                    ),
+                })
+
+            elif g1_role == 'retval_unchecked':
+                findings.append({
+                    'function':        fn_name,
+                    'file':            str(filepath),
+                    'category':        'G1',
+                    'severity':        'medium',
+                    'taint_source_fn': callee,
+                    'tainted_var':     g1_var,
+                    'taint_line':      call_line,
+                    'taint_snippet':   call_snippet,
+                    'sink_fn':         callee,
+                    'sink_line':       call_line,
+                    'sink_snippet':    call_snippet,
+                    'sink_arg_index':  -1,
+                    'sink_arg_role':   'retval_unchecked',
+                    'possibly_guarded': False,
+                    'propagation':     'intra',
+                    'reason': (
+                        f"{g1_var} = {callee}() return value assigned but never "
+                        f"checked against zero — partial copy silently treated as success"
+                    ),
+                })
+
+        # ── G2: size argument not validated before use ────────────────────────
+        if do_g2:
+            size_idx = _COPY_USER_SIZE_ARG.get(callee)
+            if size_idx is not None and size_idx < len(args):
+                size_arg  = args[size_idx]
+                size_vars = _g2_size_identifiers(size_arg, source)
+                if size_vars:
+                    fn_start = fn_body.start_point[0] + 1
+                    guarded  = _find_guards_between(
+                        fn_body, size_vars, fn_start - 1, call_line, source
+                    )
+                    if not guarded:
+                        size_text = node_text(size_arg, source)
+                        findings.append({
+                            'function':        fn_name,
+                            'file':            str(filepath),
+                            'category':        'G2',
+                            'severity':        'medium',
+                            'taint_source_fn': callee,
+                            'tainted_var':     size_text,
+                            'taint_line':      call_line,
+                            'taint_snippet':   call_snippet,
+                            'sink_fn':         callee,
+                            'sink_line':       call_line,
+                            'sink_snippet':    call_snippet,
+                            'sink_arg_index':  size_idx,
+                            'sink_arg_role':   'unvalidated_size',
+                            'possibly_guarded': False,
+                            'propagation':     'intra',
+                            'reason': (
+                                f"size argument {size_text!r} to {callee}() not "
+                                f"validated against buffer capacity before use"
+                            ),
+                        })
+
+    return findings
+
+
+def scan_copy_user_files(source_paths, cats, verbose=False):
+    """
+    Scan source files for Categories G1 (retval unchecked) and/or G2
+    (unvalidated size argument).  cats: iterable containing 'G1' and/or 'G2'.
+    Returns list of finding dicts in the same schema as scan_files().
+    """
+    from kernel_analysis.parsers.c_parser import parse_file, find_functions
+
+    cats = set(cats)
+    all_findings = []
+    for path in source_paths:
+        try:
+            tree, source = parse_file(path)
+        except Exception as e:
+            if verbose:
+                print(f"  [skip {path}: {e}]")
+            continue
+        for fn in find_functions(tree, source):
+            all_findings.extend(
+                _scan_fn_copy_user(fn['body'], fn['name'], source, path, cats)
+            )
+    return all_findings

@@ -23,7 +23,7 @@ DEFAULT_CONFIG = {
     'target': {
         'source_dirs': [],
     },
-    'categories': ['A', 'B', 'C', 'D', 'E', 'F', 'H'],   # which categories to scan
+    'categories': ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],   # which categories to scan
     'output': {
         'dir': 'bc_runs/',
     },
@@ -95,8 +95,8 @@ Examples:
                    help='Source directory to scan (relative to kernel_source); '
                         'may be repeated')
     p.add_argument('--categories', metavar='CAT', nargs='+',
-                   choices=['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'],
-                   help='Categories to scan (default: A B C)')
+                   choices=['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],
+                   help='Categories to scan (default: A B C D E F G1 G2 H)')
     p.add_argument('--output-dir', metavar='DIR',
                    help='Output directory for run artifacts')
     p.add_argument('--llm', action='store_true',

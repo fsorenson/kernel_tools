@@ -55,8 +55,10 @@ _CAT_LABEL = {
     'C': 'Cat C — server value → array subscript',
     'D': 'Cat D — strlen/strlcpy on server-supplied buffer (no null-termination guarantee)',
     'E': 'Cat E — tainted pointer dereference (->field access beyond packet bounds)',
-    'F': 'Cat F — server value → loop iteration count',
-    'H': 'Cat H — server value → narrow integer type (silent truncation)',
+    'F':  'Cat F — server value → loop iteration count',
+    'G1': 'Cat G1 — copy_from/to_user return value unchecked (partial copy = success)',
+    'G2': 'Cat G2 — unvalidated size argument to copy_from/to_user',
+    'H':  'Cat H — server value → narrow integer type (silent truncation)',
 }
 _ASSESSMENT_LABEL = {
     'real_bug': 'BUG', 'false_positive': 'FP',
@@ -318,6 +320,14 @@ def _md_finding(buf, r, has_llm):
         W(f"| String sink | `{r['sink_fn']}()` arg {r['sink_arg_index']} line {r['sink_line']} |")
     elif role == 'tainted_ptr_deref':
         W(f"| Pointer deref | `{r['tainted_var']}->{r.get('field_name','?')}` line {r['sink_line']} |")
+    elif role == 'retval_discarded':
+        W(f"| Retval discarded | `{r['sink_fn']}()` line {r['sink_line']} — return value not captured |")
+    elif role == 'retval_unchecked':
+        W(f"| Retval unchecked | `{r['sink_fn']}()` line {r['sink_line']} — "
+          f"`{r['tainted_var']}` never checked against zero |")
+    elif role == 'unvalidated_size':
+        W(f"| Unvalidated size | `{r['sink_fn']}()` arg {r['sink_arg_index']} line {r['sink_line']} — "
+          f"size `{r['tainted_var']}` |")
     elif xfn:
         W(f"| Sink (in callee) | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={role}) |")
     else:
@@ -605,6 +615,18 @@ def _html_finding(lines, r, has_llm):
         W(f'<tr><th>Pointer deref</th><td>'
           f'<code>{_e(r["tainted_var"])}->{_e(r.get("field_name","?"))}</code> '
           f'line {r["sink_line"]}</td></tr>')
+    elif role == 'retval_discarded':
+        W(f'<tr><th>Retval discarded</th><td>'
+          f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} &mdash; '
+          f'return value not captured</td></tr>')
+    elif role == 'retval_unchecked':
+        W(f'<tr><th>Retval unchecked</th><td>'
+          f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} &mdash; '
+          f'<code>{_e(r["tainted_var"])}</code> never checked against zero</td></tr>')
+    elif role == 'unvalidated_size':
+        W(f'<tr><th>Unvalidated size</th><td>'
+          f'<code>{_e(r["sink_fn"])}()</code> arg {r["sink_arg_index"]} '
+          f'line {r["sink_line"]} &mdash; size <code>{_e(r["tainted_var"])}</code></td></tr>')
     elif xfn:
         W(f'<tr><th>Sink (in callee)</th><td>'
           f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
@@ -646,7 +668,7 @@ _IMPACT_SCORE = {
     'oob_write': 100, 'stack_overflow': 90, 'oob_read': 80,
     'integer_overflow': 60, 'undersized_alloc': 60, 'info_disclosure': 40,
 }
-_CAT_BASE = {'A': 50, 'E': 50, 'C': 40, 'B': 40, 'F': 30, 'H': 20}
+_CAT_BASE = {'A': 50, 'E': 50, 'C': 40, 'B': 40, 'F': 30, 'G1': 30, 'G2': 40, 'H': 20}
 
 _TIERS = [
     (250, 'Critical'),   # LLM-confirmed real bug
@@ -690,6 +712,12 @@ def _sink_label(s1f):
         return 'subscript (callee)' if xfn else 'subscript'
     if role == 'tainted_ptr_deref':
         return f"{s1f['tainted_var']}->{s1f.get('field_name', '?')}"
+    if role == 'retval_discarded':
+        return f"{s1f['sink_fn']}() retval discarded"
+    if role == 'retval_unchecked':
+        return f"{s1f['sink_fn']}() retval unchecked"
+    if role == 'unvalidated_size':
+        return f"{s1f['sink_fn']}() unvalidated size"
     if s1f.get('overflow'):
         return (f"{s1f.get('overflow_lhs','')} "
                 f"{s1f.get('overflow_op','*')} "

@@ -39,6 +39,8 @@ _CATEGORY_LABELS = {
     'D':     'strlen/strlcpy on server-supplied pointer without null-termination guarantee',
     'E':     'tainted pointer dereference: struct field access via pointer derived from server offset',
     'F':     'server-supplied value controls loop iteration count without buffer bounds validation',
+    'G1':    'copy_from_user/copy_to_user return value unchecked: partial copy treated as success',
+    'G2':    'unvalidated size argument to copy_from_user/copy_to_user: user-controlled size',
     'H':     'server-supplied wide value silently truncated to narrower integer type',
 }
 
@@ -392,6 +394,37 @@ def _format_findings(findings):
                 f"    Note: check whether total bytes iterated "
                 f"({f['tainted_var']} * sizeof(element)) is validated "
                 f"against the packet/buffer length before the loop.\n"
+            )
+        elif f.get('sink_arg_role') == 'retval_discarded':
+            entry += (
+                f"    Call: {f['sink_fn']}()  line {f['sink_line']}\n"
+                f"    Snippet:        {f['sink_snippet']}\n"
+                f"    Note: {f['sink_fn']}() returns the number of bytes NOT copied; "
+                f"0 = success, non-zero = partial or failed copy.  Discarding this "
+                f"value means a partial copy is silently treated as success.  False "
+                f"positive if the function is intentionally best-effort and callers "
+                f"are robust to partial data.\n"
+            )
+        elif f.get('sink_arg_role') == 'retval_unchecked':
+            entry += (
+                f"    Call: {f['sink_fn']}()  line {f['sink_line']}\n"
+                f"    Snippet:        {f['sink_snippet']}\n"
+                f"    Assigned to:    {f['tainted_var']!r} (never checked against zero)\n"
+                f"    Note: {f['sink_fn']}() returns bytes NOT copied; "
+                f"0 = success, non-zero = partial/failed copy.  False positive if "
+                f"the variable is checked or returned along every subsequent path, "
+                f"or if the copy is intentionally best-effort.\n"
+            )
+        elif f.get('sink_arg_role') == 'unvalidated_size':
+            entry += (
+                f"    Call: {f['sink_fn']}()  size arg [{f['sink_arg_index']}]  "
+                f"line {f['sink_line']}\n"
+                f"    Snippet:        {f['sink_snippet']}\n"
+                f"    Size expression: {f['tainted_var']!r}\n"
+                f"    Note: if the size is user-controlled (e.g. read via get_user "
+                f"or from a user-supplied struct), it must be validated against the "
+                f"destination buffer length before the copy.  False positive if the "
+                f"size comes from a kernel-internal, already-validated source.\n"
             )
         else:
             entry += (

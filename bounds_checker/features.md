@@ -62,11 +62,24 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       extends this to callee loops whose count parameter traces back to a taint source
       in the caller
 
-- [ ] **Category G1**: `copy_from_user` / `copy_to_user` return value unchecked —
-      partial copy treated as success
+- [x] **Category G1**: `copy_from_user` / `copy_to_user` / `get_user` / `put_user` /
+      `clear_user` return value unchecked — partial copy treated as success.
+      Detects: (1) return value discarded as a void expression; (2) assigned to a
+      variable that never appears in a conditional or return after the call; (3)
+      declared as an initializer whose result is never subsequently tested.
+      `_g1_retval_checked()` walks the function body for any conditional or
+      return_statement containing the variable after the call line.  False positives
+      where the variable is re-used for other purposes are filtered by the LLM stage.
 
-- [ ] **Category G2**: user-supplied size used before validation — size checked
-      after use rather than before
+- [x] **Category G2**: unvalidated size argument to `copy_from/to_user` — a
+      variable in the size expression (arg 2) has no relational bounds check with
+      early-exit terminal between the function start and the call site.
+      `_g2_size_identifiers()` collects identifier names from the size argument,
+      skipping `sizeof()` subexpressions and numeric literals.  The existing
+      `_find_guards_between()` guard detector then checks for a bounds comparison
+      before the call.  Higher false-positive rate than other categories because
+      kernel-internal size variables may legitimately lack a range check; LLM
+      assessment is especially important for G2 findings.
 
 ## P2 — Depth and Quality
 
