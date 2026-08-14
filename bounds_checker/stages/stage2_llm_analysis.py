@@ -161,10 +161,23 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
         or os.environ.get('ANTHROPIC_DEFAULT_SONNET_MODEL', 'claude-sonnet-4-6')
     )
 
-    findings = stage1_output.get('findings', [])
-    if not findings:
+    all_findings = stage1_output.get('findings', [])
+    if not all_findings:
         print("Stage 2 (LLM): no findings to analyze.")
         return None
+
+    # Optionally restrict LLM analysis to a subset of categories.
+    llm_cats = cfg.get('llm', {}).get('categories')
+    if llm_cats:
+        llm_cat_set = set(llm_cats)
+        findings = [f for f in all_findings if f['category'] in llm_cat_set]
+        if not findings:
+            print(f"Stage 2 (LLM): no findings for LLM categories "
+                  f"{', '.join(sorted(llm_cat_set))}.")
+            return None
+    else:
+        llm_cat_set = None
+        findings = all_findings
 
     try:
         client = _make_client()
@@ -183,7 +196,10 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     workers_str = f', {n_workers} workers' if n_workers > 1 else ''
     suffix = (f', extended thinking ({thinking_budget} tokens)' if thinking_budget
               else ', debug' if debug else '')
-    print(f"Stage 2 (LLM): analyzing {len(fn_groups)} function(s) with {model}{suffix}{workers_str}")
+    cat_str = (f', cats={",".join(sorted(llm_cat_set))}'
+               f' ({len(findings)}/{len(all_findings)} findings)'
+               if llm_cat_set else '')
+    print(f"Stage 2 (LLM): analyzing {len(fn_groups)} function(s) with {model}{suffix}{workers_str}{cat_str}")
 
     run_dir = Path(run_dir)
     debug_path = run_dir / 'stage2_llm_analysis.debug'
@@ -266,6 +282,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
         'stage':              'llm_analysis',
         'model':              model,
         'source_dirs':        stage1_output.get('source_dirs', []),
+        'llm_categories':     sorted(llm_cat_set) if llm_cat_set else None,
         'functions_analyzed': len(all_analyses),
         'analyses':           all_analyses,
     }

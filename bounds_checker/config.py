@@ -70,6 +70,8 @@ def load_config(config_path=None, cli_args=None):
             cfg['llm']['model'] = cli_args.model
         if getattr(cli_args, 'llm_workers', None) is not None:
             cfg['llm']['workers'] = cli_args.llm_workers
+        if getattr(cli_args, 'llm_categories', None):
+            cfg['llm']['categories'] = cli_args.llm_categories
 
     cfg['kernel_source'] = Path(cfg['kernel_source']).expanduser().resolve()
     if not cfg['kernel_source'].exists():
@@ -113,6 +115,10 @@ Examples:
                    help='Extended thinking budget in tokens (0=disabled; min 1024)')
     p.add_argument('--llm-workers', metavar='N', type=int, default=None,
                    help='Number of parallel LLM API calls (default: 4; use 1 for serial)')
+    p.add_argument('--llm-categories', metavar='CAT', nargs='+',
+                   choices=['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],
+                   help='Limit LLM analysis to these categories (default: all scanned); '
+                        'useful to skip noisy categories like H or G2')
     p.add_argument('--debug', action='store_true',
                    help='Write full LLM prompts and responses to stage2_llm_analysis.debug')
     p.add_argument('--verbose', '-v', action='store_true')

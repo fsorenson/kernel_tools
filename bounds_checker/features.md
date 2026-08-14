@@ -130,9 +130,12 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       [K batches] [assessment, conf, N/M real]`.  Serial fallback: `--llm-workers 1`.
       Typical speedup: 4–6× on Vertex; throughput limited by API rate limits.
 
-- [ ] Category filter for LLM — `--llm-categories A B C` to skip LLM analysis for
-      noisy categories (e.g., H, G2) without re-running Stage 1; reduces call
-      count when a full re-analysis is not warranted
+- [x] Category filter for LLM — `--llm-categories A B C` (or `llm.categories` in
+      YAML) to restrict LLM analysis to a subset of categories without re-running
+      Stage 1; filter is applied per-finding before grouping by function, so a
+      function with mixed Cat A + Cat H findings sends only its Cat A finding to
+      the LLM when `--llm-categories A` is set.  Output JSON records
+      `llm_categories` for traceability.  Default (omitted): analyze all findings.
 
 - [ ] Merge/combine runs — `bc merge bc_runs/dir1 bc_runs/dir2 ...` to aggregate
       multiple run directories into a unified `summary.md` + `summary.html`; useful
