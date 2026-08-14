@@ -363,24 +363,38 @@ def collect_type_definitions_from_paths(paths):
 
 def find_functions(tree, source):
     """
-    Find all top-level function definitions.
+    Find all function definitions in a translation unit, including those nested
+    inside preprocessor conditional blocks (include guards, feature guards).
     Returns list of {name, node, body, start_line, end_line}.
     """
+    # Preprocessor node types that can directly contain function definitions
+    # (include guards, CONFIG_ guards, stub-vs-real guards).
+    _PREPROC_CONTAINERS = frozenset({
+        'preproc_ifdef', 'preproc_ifndef', 'preproc_if',
+        'preproc_else', 'preproc_elif', 'preproc_elifdef',
+    })
+
     results = []
-    for node in tree.root_node.children:
-        if node.type != 'function_definition':
-            continue
-        body = next((c for c in node.children if c.type == 'compound_statement'), None)
-        if not body:
-            continue
-        name = _fn_name_from_def(node, source)
-        results.append({
-            'name': name or '<unknown>',
-            'node': node,
-            'body': body,
-            'start_line': node.start_point[0] + 1,
-            'end_line': node.end_point[0] + 1,
-        })
+
+    def _scan(parent):
+        for node in parent.children:
+            if node.type == 'function_definition':
+                body = next(
+                    (c for c in node.children if c.type == 'compound_statement'), None
+                )
+                if body:
+                    name = _fn_name_from_def(node, source)
+                    results.append({
+                        'name':       name or '<unknown>',
+                        'node':       node,
+                        'body':       body,
+                        'start_line': node.start_point[0] + 1,
+                        'end_line':   node.end_point[0] + 1,
+                    })
+            elif node.type in _PREPROC_CONTAINERS:
+                _scan(node)   # recurse into #ifdef / #if / #else / etc.
+
+    _scan(tree.root_node)
     return results
 
 

@@ -78,7 +78,7 @@ def run(cfg, run_dir, verbose=False):
         if not dpath.exists():
             print(f"  Warning: source_dir not found: {dpath}")
             continue
-        c_paths.extend(sorted(dpath.rglob('*.c')))
+        c_paths.extend(sorted(dpath.rglob('*.c')) + sorted(dpath.rglob('*.h')))
 
     if not c_paths:
         print("Stage 1: no .c files found")
