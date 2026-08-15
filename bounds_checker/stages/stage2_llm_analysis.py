@@ -29,6 +29,7 @@ from bounds_checker.report import write_reports
 
 
 _MAX_FN_LINES = 150
+_MAX_CALLEE_LINES = 80   # callee helpers are usually compact; show whole body if possible
 _WINDOW_LINES = 60
 _VERTEX_REGION = os.environ.get('CLOUD_ML_REGION', 'us-east5')
 if _VERTEX_REGION == 'global':
@@ -93,7 +94,8 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
     function-global 1-based indices before merging.
     """
     if len(fn_findings) <= _BATCH_SIZE:
-        prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings)
+        callee_sources = _collect_callee_sources(fn_findings)
+        prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings, callee_sources)
         return _call_llm(client, model, prompt, verbose,
                          n_findings=len(fn_findings),
                          thinking_budget=thinking_budget,
@@ -111,7 +113,8 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
     for b, batch_start in enumerate(range(0, total, _BATCH_SIZE), 1):
         batch = fn_findings[batch_start:batch_start + _BATCH_SIZE]
         label = f"{fn_name}() [{short_file}] batch {b}/{n_batches}"
-        prompt = _build_prompt(fn_name, short_file, fn_source, batch)
+        callee_sources = _collect_callee_sources(batch)
+        prompt = _build_prompt(fn_name, short_file, fn_source, batch, callee_sources)
 
         if verbose:
             print(f"[b{b}/{n_batches}]", end=' ', flush=True)
@@ -351,6 +354,70 @@ def _extract_fn_source(filepath, fn_name, findings):
     return None
 
 
+def _extract_callee_source(callee_file, callee_fn, sink_line):
+    """
+    Extract the source of a callee function referenced by a cross-function
+    finding.  Full body when compact; windowed around sink_line otherwise.
+    """
+    try:
+        tree, source = parse_file(Path(callee_file))
+    except Exception:
+        return None
+
+    src_lines = source.decode('utf-8', errors='replace').splitlines()
+
+    for fn in find_functions(tree, source):
+        if fn['name'] != callee_fn:
+            continue
+
+        s, e = fn['start_line'], fn['end_line']
+
+        if e - s + 1 <= _MAX_CALLEE_LINES:
+            return '\n'.join(
+                f"{s+i:5}: {line}" for i, line in enumerate(src_lines[s-1:e])
+            )
+
+        # Large helper: signature block + window around the sink line.
+        half = _WINDOW_LINES // 2
+        include = set(range(s, min(s + 8, e + 1)))
+        include.update(range(max(s, sink_line - half), min(e, sink_line + half) + 1))
+
+        result = []
+        prev = None
+        for lineno in sorted(include):
+            if prev is not None and lineno > prev + 1:
+                result.append(f"       /* ... {lineno - prev - 1} lines omitted ... */")
+            result.append(f"{lineno:5}: {src_lines[lineno-1]}")
+            prev = lineno
+        return '\n'.join(result)
+
+    return None
+
+
+def _collect_callee_sources(findings):
+    """
+    For each unique (callee_fn, callee_file) pair among cross-function findings,
+    extract the callee's source.  Returns {(callee_fn, short_file): source}.
+    """
+    seen = set()
+    result = {}
+    for f in findings:
+        if f.get('propagation') != 'cross_function':
+            continue
+        callee_fn   = f.get('callee_fn')
+        callee_file = f.get('callee_file')
+        if not callee_fn or not callee_file:
+            continue
+        key = (callee_fn, callee_file)
+        if key in seen:
+            continue
+        seen.add(key)
+        src = _extract_callee_source(callee_file, callee_fn, f['sink_line'])
+        if src:
+            result[(callee_fn, Path(callee_file).name)] = src
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -361,6 +428,43 @@ input validation.  You review static analysis findings for missing or \
 insufficient validation of server-supplied or user-supplied values before \
 they are used in memory operations, allocations, or array indexing.
 
+Common false positive patterns in kernel taint analysis:
+
+1. Locally-written struct fields: le32_to_cpu(ptr->field) marks the value as
+   tainted, but if ptr points to a struct the kernel BUILT (allocated locally
+   with kzalloc/kmalloc/stack/compound-literal, then filled with
+   cpu_to_le32(constant) or a compile-time constant), the round-tripped value
+   is NOT server-supplied.  Check whether the struct is a server RESPONSE
+   (populated from a received network buffer) or a locally-constructed REQUEST.
+   Functions that call a request-initialisation helper (e.g. smb2_plain_req_init,
+   cifs_buf_get, small_smb2_init) before the flagged use are building a request,
+   not parsing a response.
+
+2. Validation call chains: when a function calls a dedicated validation helper
+   BEFORE the flagged pointer use, determine whether that helper covers the
+   flagged offset and size.  smb2_validate_iov(offset, len, iov, min_len) and
+   smb2_validate_and_copy_iov() verify that offset+len fits within the iov and
+   len >= min_len — subsequent field accesses on the validated struct pointer
+   ARE protected.  dacl_offset_valid() + validate_dacl() together validate an
+   ACL pointer before use in the CALLER; findings about the callee's internal
+   accesses inside validate_dacl() are usually false positives because that
+   function IS the validator.  validate_t2() in the current patched kernel
+   validates that both DataOffset+min_data_size and ParameterOffset+min_param_size
+   fall within the actual received packet boundary (frame_end computed from
+   get_bcc + header overhead) — if the caller passes sizeof(the_accessed_struct)
+   as min_data, the DataOffset-derived pointer is within the received buffer.
+
+3. Static function call-site preconditions: a static function that is only
+   ever called in contexts where a validation gate has already succeeded
+   inherits that gate's protection.  When the source shows all call sites
+   going through the same validator, treat the callee's accesses as protected.
+
+4. Callee-internal validation: when a cross-function finding reports a sink
+   inside a helper, the helper may validate its argument internally before
+   operating on it.  The callee source is included in the prompt (when
+   available) — check it to determine whether the tainted parameter is
+   validated before the flagged sink.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
@@ -370,7 +474,7 @@ _PROMPT_TEMPLATE = """\
 ```c
 {fn_source}
 ```
-
+{callee_sources_section}
 ## Taint analysis findings
 
 The static scanner flagged the following flows from server-supplied data \
@@ -386,13 +490,40 @@ For each finding above, determine:
 
 1. **Taint is genuinely server-supplied**: is the flagged value actually \
    read from a network packet / server response, or is it an internal \
-   computation that incidentally passes through an endian-conversion call?
+   computation that passes through an endian-conversion call?  If the \
+   taint source is le32_to_cpu(ptr->field), check whether 'ptr' was \
+   received from the server (a response buffer) or was allocated and \
+   initialised by the kernel in this function (a locally-built request).  \
+   If the kernel wrote 'field' via cpu_to_le32(constant) before reading it \
+   back, the value is locally controlled — not server-supplied.
 
 2. **Bounds check present and sufficient**: if "possibly guarded", is the \
    conditional actually a proper bounds check for this specific value, or is \
    it checking something unrelated?  Note: a check on one field (e.g., BCC \
    byte count) does NOT protect against an out-of-range DataOffset in the \
-   same message.
+   same message.  Also consider validation call chains one level deep: \
+   smb2_validate_iov()/smb2_validate_and_copy_iov() verify offset+len fits \
+   within the iov — accesses to the validated struct are protected.  \
+   dacl_offset_valid()+validate_dacl() in the CALLER protect ACL field \
+   accesses outside the validator itself.  validate_t2() in the patched \
+   kernel validates DataOffset+min_data ≤ actual packet boundary — \
+   DataOffset-derived pointers are safe when min_data ≥ sizeof of the \
+   accessed struct (min_param and min_data guard ParameterOffset and \
+   DataOffset independently; passing 0 for one skips its minimum-size \
+   check but the unconditional offset+count ≤ frame_end check still runs \
+   for both).  For static functions only reachable after a validation \
+   gate, they inherit that gate's guarantee.  For cross-function sinks, \
+   check the callee source (included above when available) to determine \
+   whether the callee validates its argument before the flagged operation.
+
+2a. **Counterexample test** (apply when bounds_check_present is true): \
+   before setting bounds_check_sufficient to false, construct a concrete \
+   counterexample — specific numeric values of the tainted field(s) that \
+   would pass every visible guard yet still cause OOB access.  If the \
+   guards are tight enough that no such counterexample exists, set \
+   bounds_check_sufficient to true even if the check structure looks \
+   unusual.  State in the "notes" field whether you found a counterexample \
+   or could not construct one.
 
 3. **Real bug**: combining the above, is this a genuine missing-validation bug?
 
@@ -474,7 +605,12 @@ def _format_findings(findings):
                 f"    Sink snippet:   {f['sink_snippet']}\n"
                 f"    Note: the sink is in the callee, but the fix may belong "
                 f"in THIS function (validate before calling {f['callee_fn']}()) "
-                f"or in {f['callee_fn']}() itself (validate its parameter).\n"
+                f"or in {f['callee_fn']}() itself (validate its parameter).  "
+                f"False positive if {f['callee_fn']}() IS a validation function "
+                f"(e.g. validate_dacl, validate_t2, smb2_validate_iov, "
+                f"smb2_validate_and_copy_iov, dacl_offset_valid) called specifically "
+                f"to validate the tainted argument — accesses inside the validator "
+                f"are part of the validation logic, not vulnerable sinks.\n"
             )
         elif f.get('sink_arg_role') == 'string_arg':
             entry += (
@@ -494,8 +630,13 @@ def _format_findings(findings):
                 f"line {f['sink_line']}\n"
                 f"    Deref snippet:  {f['sink_snippet']}\n"
                 f"    Note: verify that offset + sizeof(*{f['tainted_var']}) <= packet_end "
-                f"before the struct pointer is created.  False positive if the pointer "
-                f"was validated (e.g. smb2_validate_iov, pdu_length checks) before use.\n"
+                f"before the struct pointer is created.  False positive if: "
+                f"(a) smb2_validate_iov() or smb2_validate_and_copy_iov() was called "
+                f"with this offset and the struct size before the dereference; "
+                f"(b) dacl_offset_valid()+validate_dacl() were called in this function "
+                f"and the dereference is in the caller, not inside the validator; "
+                f"(c) the struct was allocated locally by the kernel (not received from "
+                f"the server) and any le32_to_cpu() reads are of locally-written fields.\n"
             )
         elif f.get('sink_arg_role') == 'narrowed_value':
             entry += (
@@ -510,9 +651,12 @@ def _format_findings(findings):
             entry += (
                 f"    Loop: {f['sink_fn']}  line {f['sink_line']}\n"
                 f"    Loop snippet:   {f['sink_snippet']}\n"
-                f"    Note: check whether total bytes iterated "
-                f"({f['tainted_var']} * sizeof(element)) is validated "
-                f"against the packet/buffer length before the loop.\n"
+                f"    Note: two forms of protection are each sufficient: "
+                f"(a) pre-loop: total bytes iterated ({f['tainted_var']} * sizeof(element)) "
+                f"validated against the packet/buffer length before the loop; "
+                f"(b) per-iteration: loop body has a bounds check (e.g. "
+                f"'if (ptr >= end) break/return') that terminates the loop before OOB — "
+                f"in this case the iteration count being unvalidated does not matter.\n"
             )
         elif f.get('sink_arg_role') == 'retval_discarded':
             entry += (
@@ -545,6 +689,21 @@ def _format_findings(findings):
                 f"destination buffer length before the copy.  False positive if the "
                 f"size comes from a kernel-internal, already-validated source.\n"
             )
+        elif f.get('sink_arg_role') == 'size':
+            entry += (
+                f"    Size arg: {f['sink_fn']}()  arg {f['sink_arg_index']}  "
+                f"line {f['sink_line']}\n"
+                f"    Sink snippet:   {f['sink_snippet']}\n"
+                f"    Note: for size-argument findings, check TWO independent "
+                f"questions: (a) is {f['tainted_var']} bounded against the SOURCE "
+                f"buffer (no OOB read of input)? (b) is it bounded against the "
+                f"DESTINATION buffer or type size (no OOB write of output)?  A "
+                f"guard covering source but not destination (or vice versa) is "
+                f"incomplete.  If {f['tainted_var']} comes from a helper function, "
+                f"consider what that function's maximum return value can be — if it "
+                f"is structurally bounded (e.g. capped by a sizeof or a max-count "
+                f"constant), the destination check may already be satisfied.\n"
+            )
         else:
             entry += (
                 f"    Sink: {f['sink_fn']}()  line {f['sink_line']}  "
@@ -559,11 +718,19 @@ def _format_findings(findings):
     return '\n\n'.join(lines)
 
 
-def _build_prompt(fn_name, short_file, fn_source, findings):
+def _build_prompt(fn_name, short_file, fn_source, findings, callee_sources=None):
+    if callee_sources:
+        parts = ['\n## Callee function source(s) — cross-function finding context\n']
+        for (callee_fn, callee_short_file), src in sorted(callee_sources.items()):
+            parts.append(f'\n### {callee_fn}() in {callee_short_file}\n```c\n{src}\n```\n')
+        callee_section = ''.join(parts)
+    else:
+        callee_section = ''
     return _PROMPT_TEMPLATE.format(
         fn_name=fn_name,
         short_file=short_file,
         fn_source=fn_source,
+        callee_sources_section=callee_section,
         findings_text=_format_findings(findings),
     )
 

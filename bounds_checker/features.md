@@ -137,9 +137,16 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       the LLM when `--llm-categories A` is set.  Output JSON records
       `llm_categories` for traceability.  Default (omitted): analyze all findings.
 
-- [ ] Merge/combine runs — `bc merge bc_runs/dir1 bc_runs/dir2 ...` to aggregate
-      multiple run directories into a unified `summary.md` + `summary.html`; useful
-      when scanning drivers/* in per-subdirectory batches and combining results
+- [x] Merge/combine runs — `bc merge bc_runs/dir1 bc_runs/dir2 ... [--output DIR]`
+      aggregates multiple run directories into a unified report; deduplicates Stage 1
+      findings by stable key `(file, function, category, sink_line, sink_fn, tainted_var)`;
+      re-maps Stage 2 `finding_index` values from each run's per-function ordering to
+      the merged ordering via `_remap_llm_findings()` so the existing renderer works
+      without changes; for functions with LLM analyses from multiple runs (e.g., different
+      `--llm-categories` passes), per-finding LLM data is combined (first-wins per position)
+      and function-level assessment is most-severe across runs.  Writes
+      `merged_stage1.json`, `merged_stage2.json`, `report.md/html`, `summary.md/html`
+      to the output directory.
 
 - [ ] Configurable taint sources and sinks — allow per-project YAML extension of
       the default `TAINT_SOURCES` and `DANGEROUS_SINKS` sets for non-CIFS subsystems

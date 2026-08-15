@@ -1,5 +1,6 @@
 """Bounds checker command-line entry point."""
 
+import argparse
 import json
 import sys
 from datetime import datetime
@@ -9,7 +10,29 @@ from bounds_checker.config import build_arg_parser, load_config, KNOWN_MODELS
 from bounds_checker.stages import stage1_taint_scan, stage2_llm_analysis
 
 
+def _main_merge(argv):
+    """Handle: bc merge DIR [DIR ...] [--output DIR] [-v]"""
+    from bounds_checker.stages import merge as merge_stage
+
+    p = argparse.ArgumentParser(
+        prog='bc merge',
+        description='Merge multiple bounds-checker run directories into a unified report',
+    )
+    p.add_argument('run_dirs', metavar='DIR', nargs='+',
+                   help='Run directories to merge (must contain stage1_taint_scan.json)')
+    p.add_argument('--output', metavar='DIR',
+                   help='Output directory (default: <first_run_parent>/merged_TIMESTAMP)')
+    p.add_argument('--verbose', '-v', action='store_true')
+    args = p.parse_args(argv)
+
+    result = merge_stage.run(args.run_dirs, output_dir=args.output, verbose=args.verbose)
+    return 0 if result else 1
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'merge':
+        return _main_merge(sys.argv[2:])
+
     parser = build_arg_parser()
     args = parser.parse_args()
 
