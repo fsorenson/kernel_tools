@@ -8,6 +8,7 @@ Writes:
 
 import html as html_mod
 import json
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +67,29 @@ _ASSESSMENT_LABEL = {
 }
 
 
+def _rel_path(filepath, kernel_root):
+    """Convert absolute filepath to repo-relative path (e.g. fs/smb/client/cifssmb.c)."""
+    if not filepath:
+        return ''
+    if kernel_root:
+        try:
+            return str(Path(filepath).relative_to(kernel_root))
+        except ValueError:
+            pass
+    return Path(filepath).name
+
+
+def _infer_kernel_root(source_dirs, filepaths):
+    """Guess kernel root from source_dirs and sample absolute filepaths."""
+    for sd in source_dirs:
+        marker = '/' + sd.lstrip('/')
+        for fp in filepaths:
+            idx = fp.find(marker)
+            if idx >= 0:
+                return fp[:idx]
+    return ''
+
+
 def _build_context(run_dir, s1, s2):
     """Assemble everything the renderers need in one dict."""
     # Group stage1 findings by (function, file) so we can cross-ref by index
@@ -73,14 +97,29 @@ def _build_context(run_dir, s1, s2):
     for f in s1.get('findings', []):
         s1_groups[(f['function'], f['file'])].append(f)
 
-    # Index stage2 analyses for fast lookup
-    s2_by_fn = {(a['function'], a['file']): a for a in s2.get('analyses', [])}
+    # Resolve kernel root for relative-path display
+    kernel_root = (s1.get('kernel_source', '')
+                   or _infer_kernel_root(
+                       s1.get('source_dirs', []),
+                       [f['file'] for f in s1.get('findings', [])[:50]],
+                   ))
 
-    # Build per-function sections, sorted alphabetically
+    # Index stage2 analyses for fast lookup.
+    # stage2 now stores filepath in 'file'; also accept old basename-only format.
+    s2_by_fn = {}
+    for a in s2.get('analyses', []):
+        s2_by_fn[(a['function'], a['file'])] = a
+
+    # Build per-function sections, sorted by (filepath, fn_name) so the same
+    # source file's functions appear together and grouped by directory.
     sections = []
-    for (fn_name, filepath), s1_findings in sorted(s1_groups.items()):
+    for (fn_name, filepath), s1_findings in sorted(s1_groups.items(),
+                                                    key=lambda kv: (kv[0][1], kv[0][0])):
         short_file = Path(filepath).name
-        analysis = s2_by_fn.get((fn_name, short_file)) or s2_by_fn.get((fn_name, filepath), {})
+        rp = _rel_path(filepath, kernel_root)
+        dp = str(Path(rp).parent) if rp and Path(rp).parent != Path('.') else rp
+        analysis = (s2_by_fn.get((fn_name, filepath))
+                    or s2_by_fn.get((fn_name, short_file), {}))
         # Build per-finding merged rows
         lkp = {f['finding_index']: f for f in analysis.get('findings', [])}
         rows = []
@@ -140,6 +179,8 @@ def _build_context(run_dir, s1, s2):
         sections.append({
             'fn_name':       fn_name,
             'short_file':    short_file,
+            'rel_path':      rp,
+            'dir_path':      dp,
             'filepath':      filepath,
             'assessment':    assessment,
             'label':         _ASSESSMENT_LABEL.get(assessment, assessment.upper()),
@@ -161,6 +202,17 @@ def _build_context(run_dir, s1, s2):
         s1_by_cat.setdefault(f['category'], 0)
         s1_by_cat[f['category']] += 1
 
+    # Precompute per-directory stats for TOC and summary grouping
+    dir_stats = {}
+    for s in sections:
+        dp = s['dir_path']
+        if dp not in dir_stats:
+            dir_stats[dp] = {'count': 0, 'real': 0, 'fp': 0, 'unk': 0}
+        dir_stats[dp]['count'] += 1
+        dir_stats[dp]['real'] += s['real_count']
+        dir_stats[dp]['fp']   += s['fp_count']
+        dir_stats[dp]['unk']  += s['unanalyzed']
+
     run_name = run_dir.name
     now_str  = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -179,6 +231,7 @@ def _build_context(run_dir, s1, s2):
         'total_fp':    total_fp,
         'total_unk':   total_unk,
         'sections':    sections,
+        'dir_stats':   dir_stats,
         'has_llm':     bool(s2.get('analyses')),
     }
 
@@ -236,14 +289,46 @@ def _render_md(ctx):
 
     W("\n---\n")
 
-    # Summary table (LLM columns only when LLM ran)
+    # Contents — grouped by directory
+    W("## Contents\n")
+    current_dir = None
+    for s in ctx['sections']:
+        dp = s['dir_path']
+        if dp != current_dir:
+            if current_dir is not None:
+                W("")
+            ds = ctx['dir_stats'][dp]
+            dir_hdr = f"### `{dp}/`"
+            if ctx['has_llm']:
+                dir_hdr += (f" — {ds['count']} function{'s' if ds['count'] != 1 else ''}"
+                            f", {ds['real']} real, {ds['fp']} FP")
+            else:
+                dir_hdr += f" — {ds['count']} function{'s' if ds['count'] != 1 else ''}"
+            W(dir_hdr + "\n")
+            current_dir = dp
+        anchor = _anchor(s['fn_name'], s['rel_path'])
+        badge_str = f" — **{s['label']}**" if ctx['has_llm'] and s['assessment'] != 'unknown' else ''
+        W(f"- [{s['fn_name']}()](#{anchor}) — `{s['short_file']}`{badge_str}")
+    W("")
+
+    W("\n---\n")
+
+    # Summary table (LLM columns only when LLM ran), grouped by directory
     W("## Summary\n")
+    current_dir = None
     if ctx['has_llm']:
         W("| Function | File | Assessment | Conf | Real | FP | Unanalyzed |")
         W("|---|---|---|---|---|---|---|")
         for s in ctx['sections']:
-            W(f"| [{s['fn_name']}](#{_anchor(s['fn_name'])}) "
-              f"| {s['short_file']} "
+            dp = s['dir_path']
+            if dp != current_dir:
+                ds = ctx['dir_stats'][dp]
+                W(f"| **`{dp}/`** ({ds['count']} fn)"
+                  f" | | | | **{ds['real']}** | **{ds['fp']}** | **{ds['unk']}** |")
+                current_dir = dp
+            anchor = _anchor(s['fn_name'], s['rel_path'])
+            W(f"| [{s['fn_name']}()](#{anchor}) "
+              f"| {s['rel_path']} "
               f"| {s['label']} "
               f"| {s['confidence']} "
               f"| {s['real_count']} "
@@ -253,14 +338,20 @@ def _render_md(ctx):
         W("| Function | File | Findings |")
         W("|---|---|---|")
         for s in ctx['sections']:
-            W(f"| {s['fn_name']} | {s['short_file']} | {len(s['findings'])} |")
+            dp = s['dir_path']
+            if dp != current_dir:
+                ds = ctx['dir_stats'][dp]
+                W(f"| **`{dp}/`** ({ds['count']} fn) | | {ds['count']} |")
+                current_dir = dp
+            W(f"| {s['fn_name']} | {s['rel_path']} | {len(s['findings'])} |")
     W("")
 
     # Per-function sections
     W("\n---\n")
     W("## Function Details\n")
     for s in ctx['sections']:
-        W(f"### {s['fn_name']}() — `{s['short_file']}`\n")
+        anchor = _anchor(s['fn_name'], s['rel_path'])
+        W(f'### <a name="{anchor}"></a>{s["fn_name"]}() — `{s["rel_path"]}`\n')
         if ctx['has_llm'] and s['assessment'] != 'unknown':
             W(f"**Assessment:** {s['label']}  |  **Confidence:** {s['confidence']}\n")
             if s['error']:
@@ -276,8 +367,12 @@ def _render_md(ctx):
     return '\n'.join(buf)
 
 
-def _anchor(name):
-    return name.lower().replace('_', '-').replace(' ', '-')
+def _anchor(fn_name, rel_path=''):
+    fn_slug = re.sub(r'[^a-z0-9]+', '-', fn_name.lower()).strip('-')
+    if rel_path:
+        path_slug = re.sub(r'[^a-z0-9]+', '-', rel_path.lower()).strip('-')
+        return f"{fn_slug}--{path_slug}"
+    return fn_slug
 
 
 def _md_finding(buf, r, has_llm):
@@ -417,9 +512,15 @@ code { background: var(--code-bg); padding: 1px 4px; border-radius: 2px; }
         padding: 4px 10px; margin: 4px 0; color: #555; }
 .overall { background: #fafbff; border: 1px solid #c8d4e8;
            padding: 8px 12px; margin: 6px 0 10px; font-style: italic; }
-.toc { column-count: 2; column-gap: 24px; }
-.toc a { display: block; padding: 2px 0; text-decoration: none; color: #1a5fa8; }
+.toc { column-count: unset; }
+.toc details { margin-bottom: 2px; }
+.toc-dir-hdr { cursor: pointer; color: var(--hdr-bg); font-weight: bold;
+               padding: 2px 4px; user-select: none; }
+.toc-dir { margin-left: 16px; column-count: 2; column-gap: 20px; padding: 2px 0 4px; }
+.toc a { display: block; padding: 1px 0; text-decoration: none; color: #1a5fa8; }
 .toc a:hover { text-decoration: underline; }
+tr.dir-hdr { background: #dde4ee; }
+tr.dir-hdr td { font-weight: bold; padding: 3px 8px; color: var(--hdr-bg); }
 .fp-dim { color: #888; }
 """
 
@@ -497,25 +598,51 @@ def _render_html(ctx):
     _html_git_block(W, ctx.get('kernel_git', {}))
     W('</div><main>')
 
-    # Table of contents
+    # Table of contents — grouped by directory
     W('<h2>Contents</h2><div class="toc">')
+    current_dir = None
     for s in ctx['sections']:
-        anchor = _anchor(s['fn_name'])
+        dp = s['dir_path']
+        if dp != current_dir:
+            if current_dir is not None:
+                W('</div></details>')
+            ds = ctx['dir_stats'][dp]
+            # Open dirs that have real bugs; always open when only one directory
+            has_bugs = ds['real'] > 0
+            open_attr = ' open' if has_bugs or len(ctx['dir_stats']) == 1 else ''
+            summary_txt = f"{_e(dp)}/ ({ds['count']} function{'s' if ds['count'] != 1 else ''})"
+            if ctx['has_llm']:
+                summary_txt += f" &mdash; {ds['real']} real, {ds['fp']} FP"
+            W(f'<details{open_attr}>'
+              f'<summary class="toc-dir-hdr">{summary_txt}</summary>'
+              f'<div class="toc-dir">')
+            current_dir = dp
+        anchor = _anchor(s['fn_name'], s['rel_path'])
         badge = _badge(s['assessment']) if ctx['has_llm'] and s['assessment'] != 'unknown' else ''
         W(f'<a href="#{anchor}">{_e(s["fn_name"])}() &mdash; {_e(s["short_file"])} {badge}</a>')
+    if current_dir is not None:
+        W('</div></details>')
     W('</div>')
 
     # Summary table
     W('<h2>Summary</h2>')
     W('<table class="summary-table">')
+    current_dir = None
     if ctx['has_llm']:
         W('<tr><th>Function</th><th>File</th><th>Assessment</th>'
           '<th>Confidence</th><th>Real</th><th>FP</th><th>Unanalyzed</th></tr>')
         for s in ctx['sections']:
-            anchor = _anchor(s['fn_name'])
+            dp = s['dir_path']
+            if dp != current_dir:
+                ds = ctx['dir_stats'][dp]
+                W(f'<tr class="dir-hdr"><td colspan="7">{_e(dp)}/'
+                  f' &mdash; {ds["count"]} function{"s" if ds["count"] != 1 else ""}'
+                  f', {ds["real"]} real, {ds["fp"]} FP</td></tr>')
+                current_dir = dp
+            anchor = _anchor(s['fn_name'], s['rel_path'])
             W(f'<tr>'
               f'<td><a href="#{anchor}">{_e(s["fn_name"])}()</a></td>'
-              f'<td>{_e(s["short_file"])}</td>'
+              f'<td>{_e(s["rel_path"])}</td>'
               f'<td>{_badge(s["assessment"])}</td>'
               f'<td>{_e(s["confidence"])}</td>'
               f'<td style="color:var(--bug)">{s["real_count"]}</td>'
@@ -525,19 +652,25 @@ def _render_html(ctx):
     else:
         W('<tr><th>Function</th><th>File</th><th>Findings</th></tr>')
         for s in ctx['sections']:
+            dp = s['dir_path']
+            if dp != current_dir:
+                ds = ctx['dir_stats'][dp]
+                W(f'<tr class="dir-hdr"><td colspan="3">{_e(dp)}/'
+                  f' &mdash; {ds["count"]} function{"s" if ds["count"] != 1 else ""}</td></tr>')
+                current_dir = dp
             W(f'<tr><td>{_e(s["fn_name"])}()</td>'
-              f'<td>{_e(s["short_file"])}</td>'
+              f'<td>{_e(s["rel_path"])}</td>'
               f'<td>{len(s["findings"])}</td></tr>')
     W('</table>')
 
     # Per-function sections
     W('<h2>Function Details</h2>')
     for s in ctx['sections']:
-        anchor = _anchor(s['fn_name'])
+        anchor = _anchor(s['fn_name'], s['rel_path'])
         badge = _badge(s['assessment']) if ctx['has_llm'] and s['assessment'] != 'unknown' else ''
         conf = f'confidence={_e(s["confidence"])}' if ctx['has_llm'] else ''
         W(f'<h3 id="{anchor}">{_e(s["fn_name"])}() &mdash; '
-          f'<code>{_e(s["short_file"])}</code> {badge} {conf}</h3>')
+          f'<code>{_e(s["rel_path"])}</code> {badge} {conf}</h3>')
 
         if ctx['has_llm']:
             if s['error']:
@@ -742,9 +875,16 @@ def _llm_verdict(llm, has_llm):
 
 
 def _build_scored_rows(stage1_output, stage2_output):
-    """Return sorted list of (score, s1f, llm, short_file)."""
-    s2_by_fn = {(a['function'], a['file']): a
-                for a in stage2_output.get('analyses', [])}
+    """Return sorted list of (score, s1f, llm, rel_path)."""
+    kernel_root = (stage1_output.get('kernel_source', '')
+                   or _infer_kernel_root(
+                       stage1_output.get('source_dirs', []),
+                       [f['file'] for f in stage1_output.get('findings', [])[:50]],
+                   ))
+
+    s2_by_fn = {}
+    for a in stage2_output.get('analyses', []):
+        s2_by_fn[(a['function'], a['file'])] = a
 
     s1_groups = defaultdict(list)
     for f in stage1_output.get('findings', []):
@@ -753,13 +893,14 @@ def _build_scored_rows(stage1_output, stage2_output):
     rows = []
     for (fn_name, filepath), s1_findings in s1_groups.items():
         short_file = Path(filepath).name
-        analysis = (s2_by_fn.get((fn_name, short_file))
-                    or s2_by_fn.get((fn_name, filepath), {}))
+        rp = _rel_path(filepath, kernel_root)
+        analysis = (s2_by_fn.get((fn_name, filepath))
+                    or s2_by_fn.get((fn_name, short_file), {}))
         lkp = {f['finding_index']: f for f in analysis.get('findings', [])}
         for i, s1f in enumerate(s1_findings, 1):
             llm = lkp.get(i, {})
             score = _score_finding(s1f, llm)
-            rows.append((score, s1f, llm, short_file))
+            rows.append((score, s1f, llm, rp))
 
     rows.sort(key=lambda x: (-x[0], x[1]['function'], x[1]['sink_line']))
     return rows
@@ -815,8 +956,8 @@ def _tier_counts(rows, has_llm):
 
 def _file_counts(rows):
     counts = {}
-    for _, s1f, _, short_file in rows:
-        counts[short_file] = counts.get(short_file, 0) + 1
+    for _, s1f, _, rel_path in rows:
+        counts[rel_path] = counts.get(rel_path, 0) + 1
     return dict(sorted(counts.items(), key=lambda x: -x[1]))
 
 
@@ -865,14 +1006,14 @@ def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info=N
     llm_hdr = ' LLM |' if has_llm else ''
     W(f"| # | Tier | Cat | Function | File | Variable | Sink | Guard |{llm_hdr}")
     W(f"|---|---|---|---|---|---|---|---|{'---|' if has_llm else ''}")
-    for rank, (score, s1f, llm, short_file) in enumerate(top, 1):
+    for rank, (score, s1f, llm, rel_path) in enumerate(top, 1):
         tier  = _tier_label(score)
         guard = 'yes?' if s1f['possibly_guarded'] else 'no'
         sink  = _sink_label(s1f)
         vrdt  = _llm_verdict(llm, has_llm)
         llm_col = f' {vrdt} |' if has_llm else ''
         W(f"| {rank} | {tier} | {s1f['category']} | `{s1f['function']}` "
-          f"| {short_file} | `{s1f['tainted_var']}` "
+          f"| {rel_path} | `{s1f['tainted_var']}` "
           f"| {sink} | {guard} |{llm_col}")
 
     if len(rows) > _SUMMARY_TOP_N:
@@ -885,7 +1026,7 @@ def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info=N
     W("---\n")
     W("## All Findings by Tier\n")
     current_tier = None
-    for rank, (score, s1f, llm, short_file) in enumerate(rows, 1):
+    for rank, (score, s1f, llm, rel_path) in enumerate(rows, 1):
         tier = _tier_label(score)
         if tier != current_tier:
             W(f"### {tier}\n")
@@ -898,7 +1039,7 @@ def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info=N
         vrdt  = _llm_verdict(llm, has_llm)
         llm_col = f' {vrdt} |' if has_llm else ''
         W(f"| {rank} | {score} | {s1f['category']} | `{s1f['function']}` "
-          f"| {short_file} | `{s1f['tainted_var']}` "
+          f"| {rel_path} | `{s1f['tainted_var']}` "
           f"| {sink} | {guard} |{llm_col}")
     W("")
 
@@ -954,7 +1095,7 @@ code { background:var(--code-bg); padding:1px 3px; border-radius:2px; }
 """
 
 
-def _summary_row_html(W, rank, score, s1f, llm, short_file, has_llm, max_score):
+def _summary_row_html(W, rank, score, s1f, llm, rel_path, has_llm, max_score):
     tier   = _tier_label(score)
     guard  = s1f['possibly_guarded']
     sink   = _e(_sink_label(s1f))
@@ -975,7 +1116,7 @@ def _summary_row_html(W, rank, score, s1f, llm, short_file, has_llm, max_score):
       f' {score}</td>'
       f'<td>{_e(s1f["category"])}</td>'
       f'<td><code>{_e(s1f["function"])}</code></td>'
-      f'<td>{_e(short_file)}</td>'
+      f'<td>{_e(rel_path)}</td>'
       f'<td><code>{_e(s1f["tainted_var"])}</code></td>'
       f'<td>{sink}</td>'
       f'<td class="{gcls}">{"yes?" if guard else "no"}</td>'
@@ -1027,8 +1168,8 @@ def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info
       f'<th>Sink</th><th>Guard</th>{llm_th}</tr>')
 
     max_score = rows[0][0] if rows else 1
-    for rank, (score, s1f, llm, short_file) in enumerate(rows, 1):
-        _summary_row_html(W, rank, score, s1f, llm, short_file, has_llm, max_score)
+    for rank, (score, s1f, llm, rel_path) in enumerate(rows, 1):
+        _summary_row_html(W, rank, score, s1f, llm, rel_path, has_llm, max_score)
 
     W('</table>')
 

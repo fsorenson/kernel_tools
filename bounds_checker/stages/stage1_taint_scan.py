@@ -129,6 +129,7 @@ def run(cfg, run_dir, verbose=False):
         'stage':                'taint_scan',
         'files_scanned':        len(c_paths),
         'source_dirs':          source_dirs,
+        'kernel_source':        str(kernel_src),
         'kernel_git':           git_info,
         'findings_count':       len(all_findings),
         'findings_intra':       len(findings_intra),

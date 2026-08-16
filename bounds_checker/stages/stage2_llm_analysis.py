@@ -218,16 +218,16 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     done_count = 0
 
     def _work(fn_name, filepath, fn_findings):
-        short_file = Path(filepath).name
         fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
+        short_file = Path(filepath).name
         if fn_source is None:
-            return fn_name, short_file, fn_findings, None, None
+            return fn_name, filepath, fn_findings, None, None
         try:
             result = _analyze_fn(
                 client, model, fn_name, short_file, fn_source, fn_findings,
                 verbose, thinking_budget, debug_fh, debug_lock,
             )
-            return fn_name, short_file, fn_findings, result, None
+            return fn_name, filepath, fn_findings, result, None
         except Exception as exc:
             if verbose:
                 import traceback; traceback.print_exc()
@@ -235,7 +235,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
                 with (debug_lock or nullcontext()):
                     debug_fh.write(f"\n[ERROR] {fn_name}(): {exc}\n")
                     debug_fh.flush()
-            return fn_name, short_file, fn_findings, None, exc
+            return fn_name, filepath, fn_findings, None, exc
 
     try:
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -247,12 +247,13 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
                 done_count += 1
                 progress = f"[{done_count}/{total_fns}]"
                 try:
-                    fn_name, short_file, fn_findings, result, exc = future.result()
+                    fn_name, filepath, fn_findings, result, exc = future.result()
                 except Exception as e:
                     key = futures[future]
                     print(f"  {progress} {key[0]}() [unexpected error: {e}]")
                     continue
 
+                short_file = Path(filepath).name
                 n = len(fn_findings)
                 n_batches = (n + _BATCH_SIZE - 1) // _BATCH_SIZE
                 batch_tag = f' [{n_batches} batches]' if n_batches > 1 else ''
@@ -263,14 +264,14 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
                     print(f"  {progress} {fn_name}() [{short_file}]{batch_tag} [error: {exc}]")
                     all_analyses.append({
                         'function': fn_name,
-                        'file': short_file,
+                        'file': filepath,
                         'assessment': 'error',
                         'error': str(exc),
                         'findings': [],
                     })
                 else:
                     result['function'] = fn_name
-                    result['file'] = short_file
+                    result['file'] = filepath
                     all_analyses.append(result)
                     assessment = result.get('assessment', '?')
                     conf = result.get('confidence', '?')
