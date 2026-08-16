@@ -31,6 +31,11 @@ from bounds_checker.report import write_reports
 _MAX_FN_LINES = 150
 _MAX_CALLEE_LINES = 80   # callee helpers are usually compact; show whole body if possible
 _WINDOW_LINES = 60
+_MAX_GUARD_LINES       = 60   # per-callee body limit for guard callees
+_MAX_GUARD_TOTAL_LINES = 240  # total line budget across all guard callees per function
+
+# Regex for extracting call-site names from annotated source lines.
+_CALL_RE = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
 _VERTEX_REGION = os.environ.get('CLOUD_ML_REGION', 'us-east5')
 if _VERTEX_REGION == 'global':
     _VERTEX_REGION = 'us-east5'
@@ -87,7 +92,7 @@ _CONFIDENCE_ORDER = {'high': 2, 'medium': 1, 'low': 0}
 
 
 def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
-                verbose, thinking_budget, debug_fh, debug_lock=None):
+                verbose, thinking_budget, debug_fh, debug_lock=None, fn_index=None):
     """
     Run LLM analysis for all findings in one function, splitting into batches
     of _BATCH_SIZE when needed.  Batch finding_index values are remapped to
@@ -95,7 +100,13 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
     """
     if len(fn_findings) <= _BATCH_SIZE:
         callee_sources = _collect_callee_sources(fn_findings)
-        prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings, callee_sources)
+        already_shown = {name for name, _ in callee_sources}
+        guard_sources = (
+            _collect_guard_sources(fn_source, fn_name, fn_findings, fn_index, already_shown)
+            if fn_index else {}
+        )
+        prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings,
+                               callee_sources, guard_sources)
         return _call_llm(client, model, prompt, verbose,
                          n_findings=len(fn_findings),
                          thinking_budget=thinking_budget,
@@ -114,7 +125,13 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
         batch = fn_findings[batch_start:batch_start + _BATCH_SIZE]
         label = f"{fn_name}() [{short_file}] batch {b}/{n_batches}"
         callee_sources = _collect_callee_sources(batch)
-        prompt = _build_prompt(fn_name, short_file, fn_source, batch, callee_sources)
+        already_shown = {name for name, _ in callee_sources}
+        guard_sources = (
+            _collect_guard_sources(fn_source, fn_name, batch, fn_index, already_shown)
+            if fn_index else {}
+        )
+        prompt = _build_prompt(fn_name, short_file, fn_source, batch,
+                               callee_sources, guard_sources)
 
         if verbose:
             print(f"[b{b}/{n_batches}]", end=' ', flush=True)
@@ -217,6 +234,17 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     total_fns = len(fn_groups)
     done_count = 0
 
+    # Build function index once before the thread pool to support guard callee
+    # body inclusion.  The index maps fn_name → (filepath, start_line, end_line)
+    # and covers the same file set as Stage 1.
+    kernel_src_str = stage1_output.get('kernel_source', '')
+    source_dirs = stage1_output.get('source_dirs', [])
+    fn_index = {}
+    if kernel_src_str and source_dirs:
+        print(f"  Building function index for guard callee lookup ...")
+        fn_index = _build_fn_index(Path(kernel_src_str), source_dirs)
+        print(f"  Function index: {len(fn_index)} function(s) indexed")
+
     def _work(fn_name, filepath, fn_findings):
         fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
         short_file = Path(filepath).name
@@ -226,6 +254,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
             result = _analyze_fn(
                 client, model, fn_name, short_file, fn_source, fn_findings,
                 verbose, thinking_budget, debug_fh, debug_lock,
+                fn_index=fn_index,
             )
             return fn_name, filepath, fn_findings, result, None
         except Exception as exc:
@@ -420,6 +449,106 @@ def _collect_callee_sources(findings):
 
 
 # ---------------------------------------------------------------------------
+# Guard callee collection (Suggestion 1)
+# ---------------------------------------------------------------------------
+
+def _build_fn_index(kernel_src, source_dirs):
+    """
+    Return {fn_name: (filepath, start_line, end_line)} for all functions in
+    source_dirs.  Files are scanned in sorted order so the last definition of a
+    duplicate name wins — same behaviour as build_param_sink_map.
+    """
+    index = {}
+    for sd in source_dirs:
+        dpath = kernel_src / sd
+        if not dpath.exists():
+            continue
+        for ext in ('*.c', '*.h'):
+            for path in sorted(dpath.rglob(ext)):
+                try:
+                    tree, source = parse_file(path)
+                except Exception:
+                    continue
+                for fn in find_functions(tree, source):
+                    index[fn['name']] = (str(path), fn['start_line'], fn['end_line'])
+    return index
+
+
+def _calls_in_source_window(fn_source_text, lo, hi):
+    """
+    Return the set of function names called on lines [lo, hi] from the
+    annotated source text produced by _extract_fn_source() ("  NNN: code").
+    """
+    calls = set()
+    for line in fn_source_text.splitlines():
+        m = re.match(r'^\s*(\d+):', line)
+        if not m:
+            continue
+        lineno = int(m.group(1))
+        if not (lo <= lineno <= hi):
+            continue
+        for cm in _CALL_RE.finditer(line[m.end():]):
+            calls.add(cm.group(1))
+    return calls
+
+
+def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index, already_shown):
+    """
+    Collect source bodies for functions called between taint_line and sink_line
+    in each finding — these are potential guard callees that may establish
+    validation postconditions the LLM should reason about.
+
+    Excludes: dangerous sinks, taint sources, read-only utilities, __-prefixed
+    kernel internals, the analyzed function itself, and anything already shown
+    in the cross-function callee section.
+
+    Returns {(callee_name, short_file): src_text}, ordered by number of
+    findings that benefit, capped at _MAX_GUARD_TOTAL_LINES total lines.
+    """
+    from bounds_checker.parsers.taint_scanner import TAINT_SOURCES, DANGEROUS_SINKS
+    from bounds_checker.parsers.cross_function import _is_read_only_callee
+
+    exclude = (
+        set(DANGEROUS_SINKS.keys())
+        | set(TAINT_SOURCES)
+        | already_shown
+        | {fn_name}
+    )
+
+    benefit = {}  # callee_name -> count of findings whose window includes it
+    for f in fn_findings:
+        lo = f.get('taint_line', 0)
+        hi = f.get('call_site_line') or f.get('sink_line', 0)
+        if lo >= hi:
+            continue
+        for name in _calls_in_source_window(fn_source_text, lo, hi):
+            if name in exclude or name.startswith('__') or _is_read_only_callee(name):
+                continue
+            if name not in fn_index:
+                continue
+            benefit[name] = benefit.get(name, 0) + 1
+
+    result = {}
+    total_lines = 0
+    for name in sorted(benefit, key=lambda n: -benefit[n]):
+        if total_lines >= _MAX_GUARD_TOTAL_LINES:
+            break
+        filepath, fn_start, fn_end = fn_index[name]
+        body_lines = fn_end - fn_start + 1
+        if body_lines > _MAX_GUARD_LINES:
+            continue
+        if total_lines + body_lines > _MAX_GUARD_TOTAL_LINES:
+            continue
+        src = _extract_callee_source(filepath, name, sink_line=None)
+        if not src:
+            continue
+        result[(name, Path(filepath).name)] = src
+        total_lines += body_lines
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
@@ -443,17 +572,15 @@ Common false positive patterns in kernel taint analysis:
 
 2. Validation call chains: when a function calls a dedicated validation helper
    BEFORE the flagged pointer use, determine whether that helper covers the
-   flagged offset and size.  smb2_validate_iov(offset, len, iov, min_len) and
-   smb2_validate_and_copy_iov() verify that offset+len fits within the iov and
-   len >= min_len — subsequent field accesses on the validated struct pointer
-   ARE protected.  dacl_offset_valid() + validate_dacl() together validate an
-   ACL pointer before use in the CALLER; findings about the callee's internal
-   accesses inside validate_dacl() are usually false positives because that
-   function IS the validator.  validate_t2() in the current patched kernel
-   validates that both DataOffset+min_data_size and ParameterOffset+min_param_size
-   fall within the actual received packet boundary (frame_end computed from
-   get_bcc + header overhead) — if the caller passes sizeof(the_accessed_struct)
-   as min_data, the DataOffset-derived pointer is within the received buffer.
+   flagged offset and size.  Guard callee sources are included in the prompt
+   when available (see "Guard callee source(s)" section) — read the body to
+   determine what postcondition it establishes and whether it covers the
+   flagged access.  Key principles: a helper that validates offset+len fits
+   within a buffer makes subsequent struct pointer accesses at that offset safe;
+   a function whose name ends in validate_*/dacl_*_valid/check_* may be the
+   validator itself — findings about its internal accesses are usually false
+   positives because those accesses ARE the validation logic; static functions
+   reachable only after a validation gate inherit that gate's guarantee.
 
 3. Static function call-site preconditions: a static function that is only
    ever called in contexts where a validation gate has already succeeded
@@ -502,20 +629,16 @@ For each finding above, determine:
    conditional actually a proper bounds check for this specific value, or is \
    it checking something unrelated?  Note: a check on one field (e.g., BCC \
    byte count) does NOT protect against an out-of-range DataOffset in the \
-   same message.  Also consider validation call chains one level deep: \
-   smb2_validate_iov()/smb2_validate_and_copy_iov() verify offset+len fits \
-   within the iov — accesses to the validated struct are protected.  \
-   dacl_offset_valid()+validate_dacl() in the CALLER protect ACL field \
-   accesses outside the validator itself.  validate_t2() in the patched \
-   kernel validates DataOffset+min_data ≤ actual packet boundary — \
-   DataOffset-derived pointers are safe when min_data ≥ sizeof of the \
-   accessed struct (min_param and min_data guard ParameterOffset and \
-   DataOffset independently; passing 0 for one skips its minimum-size \
-   check but the unconditional offset+count ≤ frame_end check still runs \
-   for both).  For static functions only reachable after a validation \
-   gate, they inherit that gate's guarantee.  For cross-function sinks, \
-   check the callee source (included above when available) to determine \
-   whether the callee validates its argument before the flagged operation.
+   same message.  Also consider validation call chains one level deep: when \
+   guard callee source(s) are included above, read each body to determine \
+   what postcondition it establishes — a helper that validates offset+len \
+   within a buffer makes subsequent struct accesses at that offset safe; a \
+   function that is itself the validator (validate_*, dacl_*_valid, etc.) \
+   performing internal bounds-walk accesses is not a vulnerable sink.  For \
+   cross-function sinks, check the callee source (included above when \
+   available) to determine whether the callee validates its argument before \
+   the flagged operation.  For static functions only reachable after a \
+   validation gate, they inherit that gate's guarantee.
 
 2a. **Counterexample test** (apply when bounds_check_present is true): \
    before setting bounds_check_sufficient to false, construct a concrete \
@@ -738,19 +861,27 @@ def _format_findings(findings):
     return '\n\n'.join(lines)
 
 
-def _build_prompt(fn_name, short_file, fn_source, findings, callee_sources=None):
+def _build_prompt(fn_name, short_file, fn_source, findings,
+                  callee_sources=None, guard_sources=None):
+    sections = []
+
+    if guard_sources:
+        parts = ['\n## Guard callee source(s) — called between taint source and sink\n']
+        for (callee_fn, callee_short_file), src in sorted(guard_sources.items()):
+            parts.append(f'\n### {callee_fn}() in {callee_short_file}\n```c\n{src}\n```\n')
+        sections.append(''.join(parts))
+
     if callee_sources:
         parts = ['\n## Callee function source(s) — cross-function finding context\n']
         for (callee_fn, callee_short_file), src in sorted(callee_sources.items()):
             parts.append(f'\n### {callee_fn}() in {callee_short_file}\n```c\n{src}\n```\n')
-        callee_section = ''.join(parts)
-    else:
-        callee_section = ''
+        sections.append(''.join(parts))
+
     return _PROMPT_TEMPLATE.format(
         fn_name=fn_name,
         short_file=short_file,
         fn_source=fn_source,
-        callee_sources_section=callee_section,
+        callee_sources_section=''.join(sections),
         findings_text=_format_findings(findings),
     )
 
