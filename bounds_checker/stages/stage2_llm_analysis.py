@@ -24,15 +24,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 
-from kernel_analysis.parsers.c_parser import parse_file, find_functions
+from kernel_analysis.parsers.c_parser import _walk, node_text, parse_file, find_functions
 from bounds_checker.report import write_reports
 
 
 _MAX_FN_LINES = 150
 _MAX_CALLEE_LINES = 80   # callee helpers are usually compact; show whole body if possible
 _WINDOW_LINES = 60
-_MAX_GUARD_LINES       = 60   # per-callee body limit for guard callees
-_MAX_GUARD_TOTAL_LINES = 240  # total line budget across all guard callees per function
+_MAX_GUARD_LINES           = 60   # per-callee body limit for guard callees
+_MAX_GUARD_TOTAL_LINES     = 240  # total line budget across all guard callees per function
+_MAX_CALL_SITE_CTX_LINES   = 15   # lines of caller context to show before each call site
+_MAX_CALL_SITES_SHOWN      = 5    # cap on number of call sites included in the prompt
 
 # Regex for extracting call-site names from annotated source lines.
 _CALL_RE = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
@@ -92,7 +94,8 @@ _CONFIDENCE_ORDER = {'high': 2, 'medium': 1, 'low': 0}
 
 
 def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
-                verbose, thinking_budget, debug_fh, debug_lock=None, fn_index=None):
+                verbose, thinking_budget, debug_fh, debug_lock=None,
+                fn_index=None, call_site_context=None):
     """
     Run LLM analysis for all findings in one function, splitting into batches
     of _BATCH_SIZE when needed.  Batch finding_index values are remapped to
@@ -106,7 +109,7 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
             if fn_index else {}
         )
         prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings,
-                               callee_sources, guard_sources)
+                               callee_sources, guard_sources, call_site_context)
         return _call_llm(client, model, prompt, verbose,
                          n_findings=len(fn_findings),
                          thinking_budget=thinking_budget,
@@ -131,7 +134,7 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
             if fn_index else {}
         )
         prompt = _build_prompt(fn_name, short_file, fn_source, batch,
-                               callee_sources, guard_sources)
+                               callee_sources, guard_sources, call_site_context)
 
         if verbose:
             print(f"[b{b}/{n_batches}]", end=' ', flush=True)
@@ -250,11 +253,13 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
         short_file = Path(filepath).name
         if fn_source is None:
             return fn_name, filepath, fn_findings, None, None
+        call_site_context = _collect_call_site_context(filepath, fn_name)
         try:
             result = _analyze_fn(
                 client, model, fn_name, short_file, fn_source, fn_findings,
                 verbose, thinking_budget, debug_fh, debug_lock,
                 fn_index=fn_index,
+                call_site_context=call_site_context if call_site_context[0] else None,
             )
             return fn_name, filepath, fn_findings, result, None
         except Exception as exc:
@@ -549,6 +554,76 @@ def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index, alrea
 
 
 # ---------------------------------------------------------------------------
+# Static function call-site context (Suggestion 2)
+# ---------------------------------------------------------------------------
+
+def _collect_call_site_context(filepath, fn_name):
+    """
+    If fn_name is a static function in filepath, return
+    (call_sites, total_count) where call_sites is a list of up to
+    _MAX_CALL_SITES_SHOWN dicts:
+        {'caller': str, 'call_line': int, 'context': str}
+
+    'context' is the source lines from the caller function leading up to
+    (and including) the call — up to _MAX_CALL_SITE_CTX_LINES lines — so
+    the LLM can see whether a validation gate always precedes the call.
+
+    Returns (None, 0) if fn_name is not static or the file cannot be parsed.
+    """
+    try:
+        tree, source = parse_file(Path(filepath))
+    except Exception:
+        return None, 0
+
+    src_lines = source.decode('utf-8', errors='replace').splitlines()
+
+    # First pass: check if fn_name is defined static in this file,
+    # and collect all function boundaries for caller context extraction.
+    is_static = False
+    for fn in find_functions(tree, source):
+        if fn['name'] == fn_name:
+            for child in fn['node'].children:
+                if child.type == 'storage_class_specifier' and node_text(child, source) == 'static':
+                    is_static = True
+                    break
+
+    if not is_static:
+        return None, 0
+
+    # Second pass: walk all other function bodies for calls to fn_name.
+    call_sites = []
+    for fn in find_functions(tree, source):
+        if fn['name'] == fn_name:
+            continue  # skip self (recursive calls add no precondition info)
+        caller_start = fn['start_line']
+
+        for node in _walk(fn['body']):
+            if node.type != 'call_expression':
+                continue
+            callee_node = node.child_by_field_name('function')
+            if not callee_node:
+                continue
+            if node_text(callee_node, source) != fn_name:
+                continue
+
+            call_line = node.start_point[0] + 1
+            lo = max(caller_start, call_line - _MAX_CALL_SITE_CTX_LINES)
+            context = '\n'.join(
+                f"{lineno:5}: {src_lines[lineno - 1]}"
+                for lineno in range(lo, call_line + 1)
+            )
+            call_sites.append({
+                'caller':    fn['name'],
+                'call_line': call_line,
+                'context':   context,
+            })
+
+    call_sites.sort(key=lambda cs: cs['call_line'])
+    total = len(call_sites)
+    return call_sites[:_MAX_CALL_SITES_SHOWN], total
+
+
+# ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
@@ -584,8 +659,11 @@ Common false positive patterns in kernel taint analysis:
 
 3. Static function call-site preconditions: a static function that is only
    ever called in contexts where a validation gate has already succeeded
-   inherits that gate's protection.  When the source shows all call sites
-   going through the same validator, treat the callee's accesses as protected.
+   inherits that gate's protection.  When a "Call sites" section is included
+   above, inspect each call site's preceding context — if every call site
+   shows the same validation gate firing (returning an error on failure)
+   before the call, the static function's accesses are protected by that
+   common precondition and findings inside it are likely false positives.
 
 4. Callee-internal validation: when a cross-function finding reports a sink
    inside a helper, the helper may validate its argument internally before
@@ -862,8 +940,27 @@ def _format_findings(findings):
 
 
 def _build_prompt(fn_name, short_file, fn_source, findings,
-                  callee_sources=None, guard_sources=None):
+                  callee_sources=None, guard_sources=None, call_site_context=None):
     sections = []
+
+    if call_site_context:
+        call_sites, total_count = call_site_context
+        shown = len(call_sites)
+        count_note = (f'First {shown} of {total_count} call site(s) shown.'
+                      if total_count > shown else
+                      f'All {total_count} call site(s) shown.')
+        parts = [
+            f'\n## Call sites — {fn_name}() is a static function (scope: {short_file})\n\n'
+            f'{count_note}  If every call site passes through a validation gate '
+            f'before this function is called, its findings may be false positives '
+            f'because the gate\'s postcondition protects all reachable paths.\n'
+        ]
+        for cs in call_sites:
+            parts.append(
+                f'\n### From {cs["caller"]}() at line {cs["call_line"]}\n'
+                f'```c\n{cs["context"]}\n```\n'
+            )
+        sections.append(''.join(parts))
 
     if guard_sources:
         parts = ['\n## Guard callee source(s) — called between taint source and sink\n']
