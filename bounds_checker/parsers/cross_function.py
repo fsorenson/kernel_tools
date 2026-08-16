@@ -29,6 +29,38 @@ from bounds_checker.parsers.taint_scanner import (
 
 
 # ---------------------------------------------------------------------------
+# Read-only callee classification
+# ---------------------------------------------------------------------------
+
+# Functions that are known to perform only reads/comparisons — they cannot
+# cause OOB writes or allocations.  Cross-function findings where the callee
+# is read-only are annotated so Stage 2 can assess them with appropriate scope.
+_READ_ONLY_CALLEES = frozenset({
+    'memcmp', 'strcmp', 'strncmp', 'strcasecmp', 'strncasecmp', 'bcmp',
+    'memchr', 'strchr', 'strrchr', 'strstr', 'strnstr',
+})
+
+# Name prefixes that reliably indicate a read-only callee (debug output,
+# comparison helpers, read-only accessors common in kernel code).
+_READ_ONLY_PREFIXES = (
+    'compare_', 'cmp_',           # comparison helpers
+    'dump_', 'show_', 'display_', # debug/display output
+    'trace_', 'pr_debug', 'pr_info', 'pr_warn', 'pr_err',  # tracing/logging
+    'debug_', 'print_',
+)
+
+
+def _is_read_only_callee(fn_name):
+    """Return True if fn_name is a read-only comparator, debug, or accessor function."""
+    if fn_name in _READ_ONLY_CALLEES:
+        return True
+    for prefix in _READ_ONLY_PREFIXES:
+        if fn_name.startswith(prefix):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Parameter name extraction
 # ---------------------------------------------------------------------------
 
@@ -223,6 +255,8 @@ def scan_cross_function_calls(c_paths, param_sink_map, verbose=False):
                         source,
                     )
 
+                    read_only = _is_read_only_callee(callee)
+
                     for sink_desc in callee_params[arg_idx]:
                         possibly_guarded = (caller_guarded or
                                             sink_desc['callee_guards'])
@@ -234,6 +268,7 @@ def scan_cross_function_calls(c_paths, param_sink_map, verbose=False):
                             'propagation':       'cross_function',
                             'callee_fn':         callee,
                             'callee_file':       sink_desc['callee_file'],
+                            'callee_is_read_only': read_only,
                             'category':          sink_desc['category'],
                             'severity':          sink_desc['severity'],
                             # Taint origin (in caller)

@@ -148,10 +148,11 @@ def _build_context(run_dir, s1, s2):
                 'taint_snippet':   s1f['taint_snippet'],
                 'tainted_var':     s1f['tainted_var'],
                 # cross-function extras
-                'callee_fn':       s1f.get('callee_fn', ''),
-                'callee_file':     s1f.get('callee_file', ''),
-                'call_site_line':  s1f.get('call_site_line', ''),
-                'call_site_snippet': s1f.get('call_site_snippet', ''),
+                'callee_fn':           s1f.get('callee_fn', ''),
+                'callee_file':         s1f.get('callee_file', ''),
+                'callee_is_read_only': s1f.get('callee_is_read_only', False),
+                'call_site_line':      s1f.get('call_site_line', ''),
+                'call_site_snippet':   s1f.get('call_site_snippet', ''),
                 'sink_fn':         s1f['sink_fn'],
                 'sink_line':       s1f['sink_line'],
                 'sink_snippet':    s1f['sink_snippet'],
@@ -388,7 +389,8 @@ def _md_finding(buf, r, has_llm):
 
     xfn = r.get('propagation') == 'cross_function'
     ovf = r.get('overflow', False)
-    xfn_tag = f" — cross-function via `{r['callee_fn']}()`" if xfn else ''
+    ro_tag = ' *(read-only callee)*' if xfn and r.get('callee_is_read_only') else ''
+    xfn_tag = f" — cross-function via `{r['callee_fn']}()`{ro_tag}" if xfn else ''
     ovf_tag = ' — **INTEGER OVERFLOW**' if ovf else ''
     W(f"#### Finding #{r['idx']} — Category {r['category']}{xfn_tag}{ovf_tag}{verdict}\n")
     W(f"| Field | Value |")
@@ -706,7 +708,9 @@ def _html_finding(lines, r, has_llm):
     verdict_sep = ' &mdash; ' if verdict else ''
     xfn = r.get('propagation') == 'cross_function'
     ovf = r.get('overflow', False)
-    xfn_str = (f' &mdash; cross-function via <code>{_e(r["callee_fn"])}()</code>'
+    ro_str = ' <span style="color:#888;font-style:italic">(read-only callee)</span>' \
+             if xfn and r.get('callee_is_read_only') else ''
+    xfn_str = (f' &mdash; cross-function via <code>{_e(r["callee_fn"])}()</code>{ro_str}'
                if xfn else '')
     ovf_str = ' &mdash; <b style="color:var(--oob_write)">INTEGER OVERFLOW</b>' if ovf else ''
     W(f'<h4 class="{hcls}">Finding #{r["idx"]} &mdash; Category {_e(r["category"])}'

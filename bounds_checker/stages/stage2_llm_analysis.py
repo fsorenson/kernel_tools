@@ -596,6 +596,7 @@ def _format_findings(findings):
             f"    Tainted variable: {f['tainted_var']}\n"
         )
         if xfn:
+            read_only_callee = f.get('callee_is_read_only', False)
             entry += (
                 f"    Call site: line {f['call_site_line']}  "
                 f"passes {f['tainted_var']} to {f['callee_fn']}()\n"
@@ -604,15 +605,29 @@ def _format_findings(findings):
                 f"{f['sink_fn']}()  line {f['sink_line']}  "
                 f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
                 f"    Sink snippet:   {f['sink_snippet']}\n"
-                f"    Note: the sink is in the callee, but the fix may belong "
-                f"in THIS function (validate before calling {f['callee_fn']}()) "
-                f"or in {f['callee_fn']}() itself (validate its parameter).  "
-                f"False positive if {f['callee_fn']}() IS a validation function "
-                f"(e.g. validate_dacl, validate_t2, smb2_validate_iov, "
-                f"smb2_validate_and_copy_iov, dacl_offset_valid) called specifically "
-                f"to validate the tainted argument — accesses inside the validator "
-                f"are part of the validation logic, not vulnerable sinks.\n"
             )
+            if read_only_callee:
+                entry += (
+                    f"    Note: {f['callee_fn']}() is a READ-ONLY function "
+                    f"(comparator, debug output, or non-mutating accessor) — "
+                    f"it cannot cause OOB writes, memory corruption, or undersized "
+                    f"allocations.  Assess only whether an OOB READ inside this callee "
+                    f"is (a) reachable with a plausible server-supplied value and "
+                    f"(b) exploitable in the kernel context (e.g. leaks kernel memory "
+                    f"to an attacker).  If the callee's internal access is bounded by "
+                    f"its own parameter validation or the kernel's memory-safe access "
+                    f"patterns, mark as false positive.\n"
+                )
+            else:
+                entry += (
+                    f"    Note: the sink is in the callee, but the fix may belong "
+                    f"in THIS function (validate before calling {f['callee_fn']}()) "
+                    f"or in {f['callee_fn']}() itself (validate its parameter).  "
+                    f"False positive if {f['callee_fn']}() is a validation function "
+                    f"called specifically to validate the tainted argument — accesses "
+                    f"inside the validator are part of the validation logic, not "
+                    f"vulnerable sinks.  Check the callee source included above.\n"
+                )
         elif f.get('sink_arg_role') == 'string_arg':
             entry += (
                 f"    String sink: {f['sink_fn']}() arg {f['sink_arg_index']}  "
@@ -652,12 +667,16 @@ def _format_findings(findings):
             entry += (
                 f"    Loop: {f['sink_fn']}  line {f['sink_line']}\n"
                 f"    Loop snippet:   {f['sink_snippet']}\n"
-                f"    Note: two forms of protection are each sufficient: "
+                f"    Note: three forms of protection are each sufficient: "
                 f"(a) pre-loop: total bytes iterated ({f['tainted_var']} * sizeof(element)) "
                 f"validated against the packet/buffer length before the loop; "
                 f"(b) per-iteration: loop body has a bounds check (e.g. "
                 f"'if (ptr >= end) break/return') that terminates the loop before OOB — "
-                f"in this case the iteration count being unvalidated does not matter.\n"
+                f"in this case the iteration count being unvalidated does not matter; "
+                f"(c) prior full-traversal: a function called before this loop on the same "
+                f"pointer/buffer already walked every element with per-step bounds checks — "
+                f"if that prior traversal would have returned early on any invalid element, "
+                f"the loop here is already protected by that earlier validation.\n"
             )
         elif f.get('sink_arg_role') == 'retval_discarded':
             entry += (
