@@ -40,6 +40,39 @@
       "is_self_validator": false,
       "postcondition": "On return true (non-zero): the DACL pointer derived from acl_base + le32_to_cpu(dacl_off) is within [acl_base, end_of_acl] with at least sizeof(smb_acl) bytes remaining; safe to pass to validate_dacl().",
       "confidence": "high"
+    },
+    "wsl_to_fattr": {
+      "checksum": "6fc301f5cf28a477",
+      "file_hint": "/home/src/linux/fs/smb/client/reparse.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "cifsConvertToUTF16": {
+      "checksum": "bd70b210c56d76bb",
+      "file_hint": "/home/src/linux/fs/smb/client/cifs_unicode.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "sid_to_id": {
+      "checksum": "24daa19fdebd0b19",
+      "file_hint": "/home/src/linux/fs/smb/client/cifsacl.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, psid->num_subauth has been verified to be <= SID_MAX_SUB_AUTHORITIES (making the psid subauthority array safe to access), and sidkey->datalen has been verified to equal sizeof(uid_t) before any memcpy from the key payload, ensuring the payload copy is bounds-safe.",
+      "confidence": "high"
+    },
+    "set_chmod_dacl": {
+      "checksum": "a368e27bbdd0595e",
+      "file_hint": "/home/src/linux/fs/smb/client/cifsacl.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
     }
+
   }
 }

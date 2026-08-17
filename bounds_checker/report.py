@@ -524,6 +524,11 @@ code { background: var(--code-bg); padding: 1px 4px; border-radius: 2px; }
 tr.dir-hdr { background: #dde4ee; }
 tr.dir-hdr td { font-weight: bold; padding: 3px 8px; color: var(--hdr-bg); }
 .fp-dim { color: #888; }
+.copy-btn { float: right; font-size: 10px; padding: 1px 7px; margin-left: 8px;
+            background: #fff; border: 1px solid #99a; border-radius: 3px;
+            cursor: pointer; color: #446; font-family: inherit; opacity: 0.65; }
+.copy-btn:hover { opacity: 1; background: #eef; }
+.copy-btn.done  { color: #080; border-color: #080; opacity: 1; }
 """
 
 
@@ -542,6 +547,82 @@ def _impact_badge(impact):
         return ''
     cls = impact.replace(' ', '_')
     return f' <span class="impact {cls}">{_e(impact)}</span>'
+
+
+def _fn_copy_text(s, has_llm):
+    """Build plain-text representation of a function section for clipboard copy."""
+    parts = [f"{s['fn_name']}() — {s['rel_path']}"]
+    if has_llm and s['assessment'] != 'unknown':
+        parts.append(f"Assessment: {s['assessment']}  Confidence: {s['confidence']}")
+    parts.append('')
+
+    if has_llm:
+        if s['error']:
+            parts.append(f"Error: {s['error']}")
+        elif s['overall_notes']:
+            parts.append(s['overall_notes'])
+        parts.append('')
+
+    for r in s['findings']:
+        real = r.get('real_bug')
+        xfn  = r.get('propagation') == 'cross_function'
+        ovf  = r.get('overflow', False)
+
+        if has_llm:
+            verdict = ('real bug' if real is True
+                       else 'false positive' if real is False else 'unanalyzed')
+        else:
+            verdict = ''
+
+        callee_part  = f" via {r['callee_fn']}()" if xfn else ''
+        verdict_part = f" — {verdict}" if verdict else ''
+        parts.append(
+            f"Finding #{r['idx']} [Category {r['category']}{callee_part}{verdict_part}]"
+            f"  {r['cat_label']}"
+        )
+        parts.append(f"  Taint source: {r['taint_source_fn']}() line {r['taint_line']}")
+        parts.append(f"  Taint snippet: {r['taint_snippet']}")
+        parts.append(f"  Tainted var:   {r['tainted_var']}")
+        if ovf:
+            parts.append(
+                f"  Overflow expr: {r.get('overflow_lhs')} "
+                f"{r.get('overflow_op')} {r.get('overflow_rhs')}"
+            )
+        if xfn:
+            parts.append(
+                f"  Call site: line {r['call_site_line']}"
+                f" — passes {r['tainted_var']} to {r['callee_fn']}()"
+            )
+            parts.append(f"  Call snippet:  {r['call_site_snippet']}")
+        role = r['sink_arg_role']
+        if role == 'narrowed_value':
+            parts.append(
+                f"  Truncation: {r.get('src_width','?')}-bit →"
+                f" {r.get('dest_width','?')}-bit {r.get('dest_type','')} line {r['sink_line']}"
+            )
+        elif role == 'tainted_ptr_deref':
+            parts.append(
+                f"  Pointer deref: {r['tainted_var']}->{r.get('field_name','?')}"
+                f" line {r['sink_line']}"
+            )
+        elif role == 'loop_bound':
+            parts.append(f"  Loop bound: {r['sink_fn']} line {r['sink_line']}")
+        else:
+            parts.append(f"  Sink: {r['sink_fn']}() line {r['sink_line']}")
+        parts.append(f"  Sink snippet:  {r['sink_snippet']}")
+        parts.append(f"  Possibly guarded: {'yes (heuristic)' if r['possibly_guarded'] else 'no'}")
+        if has_llm and real is True:
+            if r.get('symptom'):
+                parts.append(f"  Symptom: {r['symptom']}")
+            if r.get('suggested_fix'):
+                parts.append(f"  Fix: {r['suggested_fix']}")
+            if r.get('cve_pattern'):
+                parts.append(f"  CVE pattern: {r['cve_pattern']}")
+        elif has_llm and real is False and r.get('notes'):
+            parts.append(f"  Notes: {r['notes']}")
+        parts.append('')
+
+    return '\n'.join(parts).rstrip()
 
 
 def _html_git_block(W, git):
@@ -671,7 +752,10 @@ def _render_html(ctx):
         anchor = _anchor(s['fn_name'], s['rel_path'])
         badge = _badge(s['assessment']) if ctx['has_llm'] and s['assessment'] != 'unknown' else ''
         conf = f'confidence={_e(s["confidence"])}' if ctx['has_llm'] else ''
-        W(f'<h3 id="{anchor}">{_e(s["fn_name"])}() &mdash; '
+        copy_text = _fn_copy_text(s, ctx['has_llm'])
+        W(f'<h3 id="{anchor}" data-copy="{_e(copy_text)}">'
+          f'<button class="copy-btn" onclick="copyFn(this)">copy</button>'
+          f'{_e(s["fn_name"])}() &mdash; '
           f'<code>{_e(s["rel_path"])}</code> {badge} {conf}</h3>')
 
         if ctx['has_llm']:
@@ -683,6 +767,23 @@ def _render_html(ctx):
         for r in s['findings']:
             _html_finding(lines, r, ctx['has_llm'])
 
+    W("""<script>
+function copyFn(btn) {
+  const text = btn.closest('h3').getAttribute('data-copy');
+  navigator.clipboard.writeText(text).then(function() {
+    btn.textContent = 'copied!'; btn.classList.add('done');
+    setTimeout(function() { btn.textContent = 'copy'; btn.classList.remove('done'); }, 1800);
+  }).catch(function() {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); } catch(e) {}
+    document.body.removeChild(ta);
+    btn.textContent = 'copied!'; btn.classList.add('done');
+    setTimeout(function() { btn.textContent = 'copy'; btn.classList.remove('done'); }, 1800);
+  });
+}
+</script>""")
     W('</main></body></html>')
     return '\n'.join(lines)
 
