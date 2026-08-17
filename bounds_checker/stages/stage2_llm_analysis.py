@@ -95,7 +95,7 @@ _CONFIDENCE_ORDER = {'high': 2, 'medium': 1, 'low': 0}
 
 def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
                 verbose, thinking_budget, debug_fh, debug_lock=None,
-                fn_index=None, call_site_context=None):
+                fn_index=None, call_site_context=None, pc_mgr=None):
     """
     Run LLM analysis for all findings in one function, splitting into batches
     of _BATCH_SIZE when needed.  Batch finding_index values are remapped to
@@ -104,12 +104,14 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
     if len(fn_findings) <= _BATCH_SIZE:
         callee_sources = _collect_callee_sources(fn_findings)
         already_shown = {name for name, _ in callee_sources}
-        guard_sources = (
-            _collect_guard_sources(fn_source, fn_name, fn_findings, fn_index, already_shown)
-            if fn_index else {}
+        guard_sources, guard_postconditions = (
+            _collect_guard_sources(fn_source, fn_name, fn_findings, fn_index,
+                                   already_shown, pc_mgr)
+            if fn_index else ({}, {})
         )
         prompt = _build_prompt(fn_name, short_file, fn_source, fn_findings,
-                               callee_sources, guard_sources, call_site_context)
+                               callee_sources, guard_sources, call_site_context,
+                               guard_postconditions)
         return _call_llm(client, model, prompt, verbose,
                          n_findings=len(fn_findings),
                          thinking_budget=thinking_budget,
@@ -129,12 +131,14 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
         label = f"{fn_name}() [{short_file}] batch {b}/{n_batches}"
         callee_sources = _collect_callee_sources(batch)
         already_shown = {name for name, _ in callee_sources}
-        guard_sources = (
-            _collect_guard_sources(fn_source, fn_name, batch, fn_index, already_shown)
-            if fn_index else {}
+        guard_sources, guard_postconditions = (
+            _collect_guard_sources(fn_source, fn_name, batch, fn_index,
+                                   already_shown, pc_mgr)
+            if fn_index else ({}, {})
         )
         prompt = _build_prompt(fn_name, short_file, fn_source, batch,
-                               callee_sources, guard_sources, call_site_context)
+                               callee_sources, guard_sources, call_site_context,
+                               guard_postconditions)
 
         if verbose:
             print(f"[b{b}/{n_batches}]", end=' ', flush=True)
@@ -248,6 +252,11 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
         fn_index = _build_fn_index(Path(kernel_src_str), source_dirs)
         print(f"  Function index: {len(fn_index)} function(s) indexed")
 
+    # Load postconditions seed file and create the manager for pre-pass discovery.
+    from bounds_checker.stages.postconditions import PostconditionManager, load_seed
+    _seed = load_seed()
+    pc_mgr = PostconditionManager(_seed, client, model)
+
     def _work(fn_name, filepath, fn_findings):
         fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
         short_file = Path(filepath).name
@@ -260,6 +269,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
                 verbose, thinking_budget, debug_fh, debug_lock,
                 fn_index=fn_index,
                 call_site_context=call_site_context if call_site_context[0] else None,
+                pc_mgr=pc_mgr,
             )
             return fn_name, filepath, fn_findings, result, None
         except Exception as exc:
@@ -315,6 +325,13 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     finally:
         if debug_fh:
             debug_fh.close()
+
+    n_new_pc = pc_mgr.write_new(run_dir)
+    if n_new_pc:
+        print(f"\n  {n_new_pc} new validator postcondition(s) written to "
+              f"{run_dir / 'new_postconditions.json'}")
+        print(f"  Review and merge into "
+              f"bounds_checker/data/validator_postconditions.json to cache for future runs.")
 
     output = {
         'stage':              'llm_analysis',
@@ -413,9 +430,12 @@ def _extract_callee_source(callee_file, callee_fn, sink_line):
             )
 
         # Large helper: signature block + window around the sink line.
+        # sink_line is None for guard callees; in that case (e.g. #ifdef produces
+        # a longer definition than fn_index estimated), show the signature block only.
         half = _WINDOW_LINES // 2
         include = set(range(s, min(s + 8, e + 1)))
-        include.update(range(max(s, sink_line - half), min(e, sink_line + half) + 1))
+        if sink_line is not None:
+            include.update(range(max(s, sink_line - half), min(e, sink_line + half) + 1))
 
         result = []
         prev = None
@@ -497,21 +517,26 @@ def _calls_in_source_window(fn_source_text, lo, hi):
     return calls
 
 
-def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index, already_shown):
+def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index,
+                           already_shown, pc_mgr=None):
     """
-    Collect source bodies for functions called between taint_line and sink_line
-    in each finding — these are potential guard callees that may establish
-    validation postconditions the LLM should reason about.
+    Collect source bodies and postconditions for functions called between
+    taint_line and sink_line in each finding.
 
-    Excludes: dangerous sinks, taint sources, read-only utilities, __-prefixed
-    kernel internals, the analyzed function itself, and anything already shown
-    in the cross-function callee section.
+    For each guard callee candidate:
+      - body ≤ _MAX_GUARD_LINES:  body is included in the prompt (Suggestion 1).
+      - body 61–MAX_PREPASS_BODY_LINES: body too large to include; if pc_mgr is
+        supplied, trigger an LLM pre-pass to derive the postcondition instead.
+      - body > MAX_PREPASS_BODY_LINES: skipped.
 
-    Returns {(callee_name, short_file): src_text}, ordered by number of
-    findings that benefit, capped at _MAX_GUARD_TOTAL_LINES total lines.
+    Returns:
+      body_sources:      {(callee_name, short_file): src_text}
+      guard_postconditions: {fn_name: entry_dict}  — for oversized guard callees
+                             that have a known/derived postcondition but no body
     """
     from bounds_checker.parsers.taint_scanner import TAINT_SOURCES, DANGEROUS_SINKS
     from bounds_checker.parsers.cross_function import _is_read_only_callee
+    from bounds_checker.stages.postconditions import MAX_PREPASS_BODY_LINES
 
     exclude = (
         set(DANGEROUS_SINKS.keys())
@@ -533,24 +558,30 @@ def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index, alrea
                 continue
             benefit[name] = benefit.get(name, 0) + 1
 
-    result = {}
-    total_lines = 0
+    body_sources       = {}
+    guard_postconditions = {}
+    total_lines        = 0
+
     for name in sorted(benefit, key=lambda n: -benefit[n]):
         if total_lines >= _MAX_GUARD_TOTAL_LINES:
             break
         filepath, fn_start, fn_end = fn_index[name]
         body_lines = fn_end - fn_start + 1
-        if body_lines > _MAX_GUARD_LINES:
-            continue
-        if total_lines + body_lines > _MAX_GUARD_TOTAL_LINES:
-            continue
-        src = _extract_callee_source(filepath, name, sink_line=None)
-        if not src:
-            continue
-        result[(name, Path(filepath).name)] = src
-        total_lines += body_lines
 
-    return result
+        if body_lines <= _MAX_GUARD_LINES:
+            if total_lines + body_lines > _MAX_GUARD_TOTAL_LINES:
+                continue
+            src = _extract_callee_source(filepath, name, sink_line=None)
+            if not src:
+                continue
+            body_sources[(name, Path(filepath).name)] = src
+            total_lines += body_lines
+        elif pc_mgr is not None:
+            entry = pc_mgr.maybe_prepass(name, filepath, fn_start, fn_end)
+            if entry and entry.get('is_validator'):
+                guard_postconditions[name] = entry
+
+    return body_sources, guard_postconditions
 
 
 # ---------------------------------------------------------------------------
@@ -940,7 +971,8 @@ def _format_findings(findings):
 
 
 def _build_prompt(fn_name, short_file, fn_source, findings,
-                  callee_sources=None, guard_sources=None, call_site_context=None):
+                  callee_sources=None, guard_sources=None, call_site_context=None,
+                  guard_postconditions=None):
     sections = []
 
     if call_site_context:
@@ -966,6 +998,20 @@ def _build_prompt(fn_name, short_file, fn_source, findings,
         parts = ['\n## Guard callee source(s) — called between taint source and sink\n']
         for (callee_fn, callee_short_file), src in sorted(guard_sources.items()):
             parts.append(f'\n### {callee_fn}() in {callee_short_file}\n```c\n{src}\n```\n')
+        sections.append(''.join(parts))
+
+    if guard_postconditions:
+        parts = ['\n## Known validator postconditions — guard functions (body too large to include)\n\n'
+                 'These functions were called between taint source and sink but their bodies '
+                 'exceed the inclusion limit.  Use the postcondition descriptions to assess '
+                 'whether a successful call protects the flagged access.\n']
+        for fn, entry in sorted(guard_postconditions.items()):
+            self_tag = '  *(findings inside this function are part of the validation logic)*' \
+                       if entry.get('is_self_validator') else ''
+            parts.append(
+                f'\n### {fn}(){self_tag}\n'
+                f'{entry.get("postcondition", "(no postcondition recorded)")}\n'
+            )
         sections.append(''.join(parts))
 
     if callee_sources:

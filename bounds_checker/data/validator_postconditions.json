@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "entries": {
+    "validate_dacl": {
+      "checksum": "764875c9c10c76ac",
+      "file_hint": "fs/smb/client/cifsacl.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0: all ACEs within pdacl have been walked and each ACE's size and sid.num_subauth are within [pdacl, end_of_acl]; subsequent traversal of the DACL is safe. Findings about pointer arithmetic or struct field accesses INSIDE validate_dacl() are part of the validation logic, not vulnerable sinks.",
+      "confidence": "high"
+    },
+    "validate_t2": {
+      "checksum": "516c1e161c8d7e58",
+      "file_hint": "fs/smb/client/cifssmb.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0: if min_param_size > 0, ParameterOffset + min_param_size <= frame_end (actual received packet end); if min_data_size > 0, DataOffset + min_data_size <= frame_end. A caller that passes sizeof(struct) as min_data_size can safely dereference that struct at DataOffset. Passing 0 for one skips its size check but both offsets are still bounded by CIFSMaxBufSize + MAX_CIFS_HDR_SIZE.",
+      "confidence": "high"
+    },
+    "smb2_validate_iov": {
+      "checksum": "163cfa3c99991c27",
+      "file_hint": "fs/smb/client/smb2pdu.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0: offset + sizeof_hdr fits within the iov and the actual response length >= min_len; the struct pointer derived by adding offset to the iov base is within the received buffer.",
+      "confidence": "high"
+    },
+    "smb2_validate_and_copy_iov": {
+      "checksum": "ca7bc6d49e2c3122",
+      "file_hint": "fs/smb/client/smb2pdu.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0: calls smb2_validate_iov (same postcondition), then copies the validated region to a fresh buffer; the returned pointer and length are safe to dereference up to min_len bytes.",
+      "confidence": "high"
+    },
+    "dacl_offset_valid": {
+      "checksum": "95ca9af1cf4868cc",
+      "file_hint": "fs/smb/client/cifsacl.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return true (non-zero): the DACL pointer derived from acl_base + le32_to_cpu(dacl_off) is within [acl_base, end_of_acl] with at least sizeof(smb_acl) bytes remaining; safe to pass to validate_dacl().",
+      "confidence": "high"
+    }
+  }
+}
