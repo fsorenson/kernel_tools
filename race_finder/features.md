@@ -35,7 +35,7 @@ Prioritized. Check marks indicate completed features.
 
 - [ ] Multi-target parallel analysis — analyze multiple structs or subsystem directories concurrently
 - [ ] CVE/fix cross-reference — search fixes.git / git log for similar patterns already fixed upstream; surface commit messages for comparison
-- [ ] Userspace reproducer harness generator — skeleton test programs using /proc/sys or ioctls to trigger racy paths under controlled concurrency
+- [x] Reproducer designer — interactive LLM-guided tool (tools/reproducer_designer.py) that brainstorms, designs, and generates complete reproducer artifacts (C test program, bpftrace widening script, setup/teardown/orchestration scripts, test plan) for found races
 - [ ] Progress dashboard / live UI — terminal or web-based view of pipeline progress and live findings
 - [ ] Incremental re-analysis — re-run only stages whose inputs changed (kernel source updated, config changed)
 - [ ] Multi-struct dependency analysis — when struct A embeds or references struct B, propagate lock requirements across struct boundaries
