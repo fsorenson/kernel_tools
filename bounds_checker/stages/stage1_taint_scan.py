@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from bounds_checker.parsers.taint_scanner import (
@@ -59,6 +60,35 @@ def _get_kernel_git_info(kernel_src):
     return info
 
 
+_IS_TTY = sys.stdout.isatty()
+
+
+def _progress_wrap(paths, label, verbose=False):
+    """
+    Yield paths while printing in-place percentage progress on stdout.
+
+    In verbose mode or when stdout is not a TTY (piped/redirected), prints
+    the label once and yields silently — avoids cluttering log files with CR.
+    """
+    total = len(paths)
+    if not total:
+        return
+
+    if verbose or not _IS_TTY:
+        print(label)
+        yield from paths
+        return
+
+    prev_pct = -1
+    for i, path in enumerate(paths):
+        pct = min(99, i * 100 // total)
+        if pct != prev_pct:
+            print(f'\r{label} {pct:3d}%', end='', flush=True)
+            prev_pct = pct
+        yield path
+    print(f'\r{label} 100%')
+
+
 def run(cfg, run_dir, verbose=False):
     """
     Scan all .c files in cfg['target']['source_dirs'] for taint flows.
@@ -89,22 +119,25 @@ def run(cfg, run_dir, verbose=False):
         branch_str = f"  branch: {git_info['branch']}" if git_info['branch'] else ''
         print(f"  Kernel: {git_info['version']}{branch_str}")
 
-    print(f"  Scanning {len(c_paths)} file(s) in {', '.join(source_dirs)} ...")
-
     # Intra-procedural scan
-    findings_intra = scan_files(c_paths, verbose=verbose)
+    _pfx_intra = f"  Scanning {len(c_paths)} file(s) in {', '.join(source_dirs)} ..."
+    findings_intra = scan_files(_progress_wrap(c_paths, _pfx_intra, verbose), verbose=verbose)
     for f in findings_intra:
         f['propagation'] = 'intra'
 
     # Cross-function taint propagation
-    print(f"  Building parameter sink map ({len(c_paths)} file(s)) ...")
-    param_sink_map = build_param_sink_map(c_paths, verbose=verbose)
+    _pfx_psm = f"  Building parameter sink map ({len(c_paths)} file(s)) ..."
+    param_sink_map = build_param_sink_map(
+        _progress_wrap(c_paths, _pfx_psm, verbose), verbose=verbose
+    )
     n_propagating = sum(len(v) for v in param_sink_map.values())
     print(f"  {len(param_sink_map)} function(s) with "
           f"{n_propagating} taint-propagating parameter(s)")
 
-    print(f"  Scanning call sites for cross-function flows ...")
-    findings_cross = scan_cross_function_calls(c_paths, param_sink_map, verbose=verbose)
+    _pfx_xfn = "  Scanning call sites for cross-function flows ..."
+    findings_cross = scan_cross_function_calls(
+        _progress_wrap(c_paths, _pfx_xfn, verbose), param_sink_map, verbose=verbose
+    )
 
     # G1 / G2: user-copy return-value and size-validation checks
     _G_CATS = {'G1', 'G2'}
@@ -112,8 +145,10 @@ def run(cfg, run_dir, verbose=False):
     findings_g = []
     if active_g:
         g_label = '/'.join(sorted(active_g))
-        print(f"  Scanning for {g_label} (user-copy correctness) ...")
-        findings_g = scan_copy_user_files(c_paths, active_g, verbose=verbose)
+        _pfx_g = f"  Scanning for {g_label} (user-copy correctness) ..."
+        findings_g = scan_copy_user_files(
+            _progress_wrap(c_paths, _pfx_g, verbose), active_g, verbose=verbose
+        )
 
     all_findings = findings_intra + findings_cross + findings_g
 
