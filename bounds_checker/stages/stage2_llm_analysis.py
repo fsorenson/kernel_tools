@@ -612,6 +612,9 @@ def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index,
                 if not checksum:
                     continue
                 entry = pc_mgr.get(name, checksum)
+                if entry is None:
+                    # Stale or absent — run a pre-pass to derive/refresh.
+                    entry = pc_mgr.maybe_prepass(name, fpath, fn_start, fn_end)
                 if entry and entry.get('is_validator'):
                     tagged = dict(entry)
                     tagged['pre_taint'] = True
