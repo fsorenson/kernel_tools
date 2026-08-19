@@ -33,7 +33,8 @@ _MAX_CALLEE_LINES = 80   # callee helpers are usually compact; show whole body i
 _WINDOW_LINES = 60
 _MAX_GUARD_LINES           = 60   # per-callee body limit for guard callees
 _MAX_GUARD_TOTAL_LINES     = 240  # total line budget across all guard callees per function
-_MAX_CALL_SITE_CTX_LINES   = 15   # lines of caller context to show before each call site
+_CALL_SITE_ENTRY_LINES     = 40   # lines from caller function start (entry-level guards)
+_CALL_SITE_PRE_LINES       = 40   # lines immediately before the call site
 _MAX_CALL_SITES_SHOWN      = 5    # cap on number of call sites included in the prompt
 
 # Regex for extracting call-site names from annotated source lines.
@@ -595,9 +596,13 @@ def _collect_call_site_context(filepath, fn_name):
     _MAX_CALL_SITES_SHOWN dicts:
         {'caller': str, 'call_line': int, 'context': str}
 
-    'context' is the source lines from the caller function leading up to
-    (and including) the call — up to _MAX_CALL_SITE_CTX_LINES lines — so
-    the LLM can see whether a validation gate always precedes the call.
+    'context' is a two-part excerpt from the caller:
+      - Entry segment: first _CALL_SITE_ENTRY_LINES lines of the caller
+        function (where function-entry guards and early-return checks live).
+      - Pre-call segment: _CALL_SITE_PRE_LINES lines immediately before the
+        call (where adjacent guards live).
+    When the two segments overlap or are adjacent they are merged; otherwise
+    an ellipsis marker spans the gap, so the LLM knows code was omitted.
 
     Returns (None, 0) if fn_name is not static or the file cannot be parsed.
     """
@@ -608,8 +613,6 @@ def _collect_call_site_context(filepath, fn_name):
 
     src_lines = source.decode('utf-8', errors='replace').splitlines()
 
-    # First pass: check if fn_name is defined static in this file,
-    # and collect all function boundaries for caller context extraction.
     is_static = False
     for fn in find_functions(tree, source):
         if fn['name'] == fn_name:
@@ -621,11 +624,17 @@ def _collect_call_site_context(filepath, fn_name):
     if not is_static:
         return None, 0
 
-    # Second pass: walk all other function bodies for calls to fn_name.
+    def _fmt_lines(lo, hi):
+        return '\n'.join(
+            f"{n:5}: {src_lines[n - 1]}"
+            for n in range(lo, hi + 1)
+            if n <= len(src_lines)
+        )
+
     call_sites = []
     for fn in find_functions(tree, source):
         if fn['name'] == fn_name:
-            continue  # skip self (recursive calls add no precondition info)
+            continue
         caller_start = fn['start_line']
 
         for node in _walk(fn['body']):
@@ -638,11 +647,26 @@ def _collect_call_site_context(filepath, fn_name):
                 continue
 
             call_line = node.start_point[0] + 1
-            lo = max(caller_start, call_line - _MAX_CALL_SITE_CTX_LINES)
-            context = '\n'.join(
-                f"{lineno:5}: {src_lines[lineno - 1]}"
-                for lineno in range(lo, call_line + 1)
-            )
+
+            # Entry segment: first N lines of the caller.
+            entry_lo = caller_start
+            entry_hi = caller_start + _CALL_SITE_ENTRY_LINES - 1
+
+            # Pre-call segment: N lines before (and including) the call.
+            pre_lo = max(caller_start, call_line - _CALL_SITE_PRE_LINES)
+            pre_hi = call_line
+
+            if pre_lo <= entry_hi + 1:
+                # Segments overlap or are adjacent — one continuous block.
+                context = _fmt_lines(entry_lo, pre_hi)
+            else:
+                gap = pre_lo - entry_hi - 1
+                context = (
+                    _fmt_lines(entry_lo, entry_hi)
+                    + f"\n    [... {gap} line(s) omitted ...]\n"
+                    + _fmt_lines(pre_lo, pre_hi)
+                )
+
             call_sites.append({
                 'caller':    fn['name'],
                 'call_line': call_line,
@@ -690,17 +714,33 @@ Common false positive patterns in kernel taint analysis:
 
 3. Static function call-site preconditions: a static function that is only
    ever called in contexts where a validation gate has already succeeded
-   inherits that gate's protection.  When a "Call sites" section is included
-   above, inspect each call site's preceding context — if every call site
-   shows the same validation gate firing (returning an error on failure)
-   before the call, the static function's accesses are protected by that
-   common precondition and findings inside it are likely false positives.
+   inherits that gate's protection.  When a "Call sites" section is included,
+   each entry shows two segments of the caller: the function entry (where
+   function-entry guards and early-return error checks typically appear) and
+   the lines immediately before the call.  A guard does NOT need to be
+   adjacent to the call — check the entry segment for validators called
+   earlier in the caller function.  If every call site shows the same
+   validation gate firing (returning error on failure) before the call, the
+   static function's accesses are protected by that common precondition and
+   findings inside it are likely false positives.
 
 4. Callee-internal validation: when a cross-function finding reports a sink
    inside a helper, the helper may validate its argument internally before
    operating on it.  The callee source is included in the prompt (when
    available) — check it to determine whether the tainted parameter is
    validated before the flagged sink.
+
+5. Container-level validation covers field-level and traversal-level safety:
+   when a validator is called on a parent struct or buffer pointer BEFORE a
+   field is extracted from it, and the validator performs a full traversal of
+   that buffer with per-element bounds checks, any subsequent code that (a)
+   extracts a field from the same pointer and (b) traverses the buffer using
+   structurally identical arithmetic (same base pointer, same per-element
+   size field, same iteration count) is already proven safe by that prior
+   traversal.  Check: does the validator walk the same data with the same
+   arithmetic?  Was it called before the tainted field was extracted or
+   before the flagged loop?  If yes to both and the same kernel buffer is
+   used (no TOCTOU), the finding is a false positive.
 
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
@@ -905,10 +945,15 @@ def _format_findings(findings):
                 f"(b) per-iteration: loop body has a bounds check (e.g. "
                 f"'if (ptr >= end) break/return') that terminates the loop before OOB — "
                 f"in this case the iteration count being unvalidated does not matter; "
-                f"(c) prior full-traversal: a function called before this loop on the same "
-                f"pointer/buffer already walked every element with per-step bounds checks — "
-                f"if that prior traversal would have returned early on any invalid element, "
-                f"the loop here is already protected by that earlier validation.\n"
+                f"(c) prior full-traversal: a function called before this loop — in this "
+                f"function OR in the caller (visible in the Call sites section) — already "
+                f"walked the same buffer/pointer using structurally equivalent arithmetic "
+                f"(same base, same per-element size field, same iteration count) with "
+                f"per-step bounds checks.  If that traversal would have returned early on "
+                f"any invalid element, this loop is already protected.  The traversal can "
+                f"be anywhere before the loop in the same execution path — proximity does "
+                f"not matter, only that the same buffer was fully validated before reaching "
+                f"this loop.\n"
             )
         elif f.get('sink_arg_role') == 'retval_discarded':
             entry += (
@@ -983,9 +1028,13 @@ def _build_prompt(fn_name, short_file, fn_source, findings,
                       f'All {total_count} call site(s) shown.')
         parts = [
             f'\n## Call sites — {fn_name}() is a static function (scope: {short_file})\n\n'
-            f'{count_note}  If every call site passes through a validation gate '
-            f'before this function is called, its findings may be false positives '
-            f'because the gate\'s postcondition protects all reachable paths.\n'
+            f'{count_note}  Each entry shows two segments of the caller: the function '
+            f'entry (first ~{_CALL_SITE_ENTRY_LINES} lines, where entry-level guards '
+            f'and early-return checks typically appear) and the lines immediately before '
+            f'the call.  A validation gate does not need to be adjacent to the call — '
+            f'inspect the entry segment too.  If every call site shows a validation gate '
+            f'firing (returning error on failure) before the call, its postcondition '
+            f'protects all reachable paths inside {fn_name}().\n'
         ]
         for cs in call_sites:
             parts.append(
