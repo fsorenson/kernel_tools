@@ -521,23 +521,30 @@ def _calls_in_source_window(fn_source_text, lo, hi):
 def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index,
                            already_shown, pc_mgr=None):
     """
-    Collect source bodies and postconditions for functions called between
-    taint_line and sink_line in each finding.
+    Collect source bodies and postconditions for functions called in the
+    vicinity of each finding's taint→sink path.
 
-    For each guard callee candidate:
-      - body ≤ _MAX_GUARD_LINES:  body is included in the prompt (Suggestion 1).
-      - body 61–MAX_PREPASS_BODY_LINES: body too large to include; if pc_mgr is
-        supplied, trigger an LLM pre-pass to derive the postcondition instead.
-      - body > MAX_PREPASS_BODY_LINES: skipped.
+    Two passes:
+      Pass 1 — in-window [taint_line, sink_line]: any non-excluded callee.
+        - body ≤ _MAX_GUARD_LINES: body included in prompt.
+        - body 61–MAX_PREPASS_BODY_LINES: LLM pre-pass for postcondition.
+        - body > MAX_PREPASS_BODY_LINES: skipped.
+
+      Pass 2 — pre-taint [1, taint_line): ONLY postconditions-table validators.
+        Validators are often called on the containing struct/buffer BEFORE the
+        tainted field is extracted (e.g. validate_t2 before
+        le16_to_cpu(pSMBr->t2.DataOffset)).  Only known validators are surfaced
+        here to avoid noise; their postconditions are added to guard_postconditions
+        and marked 'pre_taint' so the prompt can distinguish them.
 
     Returns:
-      body_sources:      {(callee_name, short_file): src_text}
-      guard_postconditions: {fn_name: entry_dict}  — for oversized guard callees
-                             that have a known/derived postcondition but no body
+      body_sources:        {(callee_name, short_file): src_text}
+      guard_postconditions: {fn_name: entry_dict}  — validators with known
+                             postconditions (entry may have 'pre_taint': True)
     """
     from bounds_checker.parsers.taint_scanner import TAINT_SOURCES, DANGEROUS_SINKS
     from bounds_checker.parsers.cross_function import _is_read_only_callee
-    from bounds_checker.stages.postconditions import MAX_PREPASS_BODY_LINES
+    from bounds_checker.stages.postconditions import MAX_PREPASS_BODY_LINES, fn_checksum as _fn_checksum
 
     exclude = (
         set(DANGEROUS_SINKS.keys())
@@ -546,6 +553,7 @@ def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index,
         | {fn_name}
     )
 
+    # Pass 1: in-window [taint_line, sink_line]
     benefit = {}  # callee_name -> count of findings whose window includes it
     for f in fn_findings:
         lo = f.get('taint_line', 0)
@@ -581,6 +589,33 @@ def _collect_guard_sources(fn_source_text, fn_name, fn_findings, fn_index,
             entry = pc_mgr.maybe_prepass(name, filepath, fn_start, fn_end)
             if entry and entry.get('is_validator'):
                 guard_postconditions[name] = entry
+
+    # Pass 2: pre-taint [1, taint_line) — known validators only.
+    # Validators called on the parent struct/buffer before a field is extracted
+    # are invisible to Pass 1 but still establish safety for derived uses.
+    if pc_mgr is not None:
+        body_source_names = {n for n, _ in body_sources}
+        pre_taint_checked = set()
+        for f in fn_findings:
+            hi_pre = f.get('taint_line', 0)
+            if hi_pre <= 1:
+                continue
+            for name in _calls_in_source_window(fn_source_text, 1, hi_pre - 1):
+                if (name in exclude or name in pre_taint_checked
+                        or name in guard_postconditions or name in body_source_names):
+                    continue
+                if name not in fn_index:
+                    continue
+                pre_taint_checked.add(name)
+                fpath, fn_start, fn_end = fn_index[name]
+                checksum = _fn_checksum(fpath, fn_start, fn_end)
+                if not checksum:
+                    continue
+                entry = pc_mgr.get(name, checksum)
+                if entry and entry.get('is_validator'):
+                    tagged = dict(entry)
+                    tagged['pre_taint'] = True
+                    guard_postconditions[name] = tagged
 
     return body_sources, guard_postconditions
 
@@ -732,15 +767,22 @@ Common false positive patterns in kernel taint analysis:
 
 5. Container-level validation covers field-level and traversal-level safety:
    when a validator is called on a parent struct or buffer pointer BEFORE a
-   field is extracted from it, and the validator performs a full traversal of
-   that buffer with per-element bounds checks, any subsequent code that (a)
-   extracts a field from the same pointer and (b) traverses the buffer using
-   structurally identical arithmetic (same base pointer, same per-element
-   size field, same iteration count) is already proven safe by that prior
-   traversal.  Check: does the validator walk the same data with the same
-   arithmetic?  Was it called before the tainted field was extracted or
-   before the flagged loop?  If yes to both and the same kernel buffer is
-   used (no TOCTOU), the finding is a false positive.
+   field is extracted from it, the validator's postcondition still applies to
+   subsequent uses of that field.  Two common patterns:
+   (a) Offset/size validation: a validator called with DataOffset and
+       sizeof(struct) as arguments establishes that DataOffset+sizeof(struct)
+       fits within the received buffer — a pointer formed from that offset is
+       safe to dereference.  This validator appears BEFORE le16/le32_to_cpu()
+       reads DataOffset from the struct; look for it in the "Known validator
+       postconditions" section (marked "[called before taint source]").
+   (b) Full-traversal validation: a validator that walks a buffer with
+       per-element bounds checks proves that any subsequent traversal using
+       identical arithmetic (same base pointer, same per-element size field,
+       same iteration count) stays in bounds — even if the iteration count
+       is separately extracted as a tainted value.
+   In both cases, check: was the validator called on the same buffer (no
+   TOCTOU)?  Does its postcondition cover the flagged offset/size/count?
+   If yes, the finding is a false positive.
 
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
@@ -919,8 +961,10 @@ def _format_findings(findings):
                 f"    Deref snippet:  {f['sink_snippet']}\n"
                 f"    Note: verify that offset + sizeof(*{f['tainted_var']}) <= packet_end "
                 f"before the struct pointer is created.  False positive if: "
-                f"(a) smb2_validate_iov() or smb2_validate_and_copy_iov() was called "
-                f"with this offset and the struct size before the dereference; "
+                f"(a) a validator (e.g. smb2_validate_iov, validate_t2) was called with "
+                f"this offset and sizeof(*{f['tainted_var']}) — or DataCount >= sizeof — "
+                f"before the offset was extracted; check 'Known validator postconditions' "
+                f"for entries marked [called before taint source]; "
                 f"(b) dacl_offset_valid()+validate_dacl() were called in this function "
                 f"and the dereference is in the caller, not inside the validator; "
                 f"(c) the struct was allocated locally by the kernel (not received from "
@@ -1050,15 +1094,24 @@ def _build_prompt(fn_name, short_file, fn_source, findings,
         sections.append(''.join(parts))
 
     if guard_postconditions:
-        parts = ['\n## Known validator postconditions — guard functions (body too large to include)\n\n'
-                 'These functions were called between taint source and sink but their bodies '
-                 'exceed the inclusion limit.  Use the postcondition descriptions to assess '
-                 'whether a successful call protects the flagged access.\n']
+        parts = ['\n## Known validator postconditions\n\n'
+                 'Validators detected in the function body.  '
+                 'A validator marked [called before taint source] was called on the '
+                 'parent struct/buffer BEFORE the tainted field was extracted from it — '
+                 'it still establishes safety for subsequent uses of that field if its '
+                 'postcondition covers the relevant offset and size.  '
+                 'A validator marked [called between taint source and sink] guards the '
+                 'specific path from taint to use.  '
+                 'In both cases, a successful return (0 / non-NULL) establishes the '
+                 'stated postcondition.\n']
         for fn, entry in sorted(guard_postconditions.items()):
             self_tag = '  *(findings inside this function are part of the validation logic)*' \
                        if entry.get('is_self_validator') else ''
+            timing = ('[called before taint source]'
+                      if entry.get('pre_taint') else
+                      '[called between taint source and sink]')
             parts.append(
-                f'\n### {fn}(){self_tag}\n'
+                f'\n### {fn}()  {timing}{self_tag}\n'
                 f'{entry.get("postcondition", "(no postcondition recorded)")}\n'
             )
         sections.append(''.join(parts))
