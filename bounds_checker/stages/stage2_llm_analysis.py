@@ -1223,11 +1223,15 @@ def _call_llm(client, model, prompt, verbose,
             suffix = ' (retry)' if attempt else ''
             print(f"[{len(response_text)} chars{suffix}]", end=' ')
 
-        # Strip accidental fences, then use raw_decode to find the first valid JSON object
+        # Strip accidental fences, then extract the JSON object.
+        # Search for {whitespace"assessment" to anchor on the schema root —
+        # prose before the JSON may contain bare {} (e.g. "query_data = {}")
+        # that raw_decode would parse as a valid but empty dict.
         text = re.sub(r'^```(?:json)?\s*', '', response_text, flags=re.MULTILINE)
         text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE).strip()
 
-        start = text.find('{')
+        m = re.search(r'\{\s*"assessment"', text)
+        start = m.start() if m else text.find('{')
         if start == -1:
             last_exc = ValueError(f"No JSON object in response: {text[:200]!r}")
             continue
