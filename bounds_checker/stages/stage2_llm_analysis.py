@@ -162,6 +162,20 @@ def _analyze_fn(client, model, fn_name, short_file, fn_source, fn_findings,
     merged_assessment  = max(assessments, key=lambda a: _ASSESSMENT_SEVERITY.get(a, 0))
     merged_confidence  = min(confidences, key=lambda c: _CONFIDENCE_ORDER.get(c, 0))
     merged_notes       = ' | '.join(n for n in notes if n)
+
+    # Normalize: the per-finding real_bug flags are more reliable than the
+    # top-level summary field — the LLM sometimes forgets to update the
+    # summary after reasoning its way to a false positive.  Derive the
+    # assessment from the findings when any exist.
+    if all_fr:
+        n_bugs = sum(1 for f in all_fr if f.get('real_bug'))
+        if n_bugs == 0:
+            merged_assessment = 'false_positive'
+        elif n_bugs == len(all_fr):
+            merged_assessment = 'real_bug'
+        else:
+            merged_assessment = 'mixed'
+
     return {
         'assessment':   merged_assessment,
         'confidence':   merged_confidence,
