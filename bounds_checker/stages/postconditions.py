@@ -104,13 +104,14 @@ class PostconditionManager:
     (the function will be in the table for the next run).
     """
 
-    def __init__(self, seed, client, model):
-        self._table   = dict(seed)   # fn_name -> entry dict (seed + pre-pass results)
-        self._new     = {}           # newly-derived entries not in the seed
-        self._lock    = threading.Lock()
-        self._pending = set()        # fn_names currently being pre-passed
-        self._client  = client
-        self._model   = model
+    def __init__(self, seed, client, model, kernel_src=None):
+        self._table      = dict(seed)   # fn_name -> entry dict (seed + pre-pass results)
+        self._new        = {}           # newly-derived entries not in the seed
+        self._lock       = threading.Lock()
+        self._pending    = set()        # fn_names currently being pre-passed
+        self._client     = client
+        self._model      = model
+        self._kernel_src = Path(kernel_src) if kernel_src else None
 
     def get(self, fn_name, checksum):
         """
@@ -154,7 +155,8 @@ class PostconditionManager:
 
         try:
             entry = _run_prepass(self._client, self._model,
-                                 filepath, fn_name, fn_start, fn_end, checksum)
+                                 filepath, fn_name, fn_start, fn_end, checksum,
+                                 kernel_src=self._kernel_src)
             if entry:
                 with self._lock:
                     self._table[fn_name] = entry
@@ -178,7 +180,8 @@ class PostconditionManager:
         return len(new)
 
 
-def _run_prepass(client, model, filepath, fn_name, fn_start, fn_end, checksum):
+def _run_prepass(client, model, filepath, fn_name, fn_start, fn_end, checksum,
+                 kernel_src=None):
     """
     Run the LLM on the function body to extract its postcondition.
 
@@ -211,10 +214,19 @@ def _run_prepass(client, model, filepath, fn_name, fn_start, fn_end, checksum):
     except Exception:
         return None
 
+    fpath = Path(filepath)
+    if kernel_src:
+        try:
+            file_hint = str(fpath.relative_to(kernel_src))
+        except ValueError:
+            file_hint = str(fpath)
+    else:
+        file_hint = str(fpath)
+
     # Reject if LLM says it's not a validator (store as negative cache entry).
     entry = {
         'checksum':        checksum,
-        'file_hint':       str(filepath),
+        'file_hint':       file_hint,
         'is_validator':    bool(data.get('is_validator', False)),
         'is_self_validator': bool(data.get('is_self_validator', False)),
         'postcondition':   data.get('postcondition', ''),

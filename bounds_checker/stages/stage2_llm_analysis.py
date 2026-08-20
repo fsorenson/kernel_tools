@@ -270,7 +270,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     # Load postconditions seed file and create the manager for pre-pass discovery.
     from bounds_checker.stages.postconditions import PostconditionManager, load_seed
     _seed = load_seed()
-    pc_mgr = PostconditionManager(_seed, client, model)
+    pc_mgr = PostconditionManager(_seed, client, model, kernel_src=kernel_src_str)
 
     def _work(fn_name, filepath, fn_findings):
         fn_source = _extract_fn_source(filepath, fn_name, fn_findings)
