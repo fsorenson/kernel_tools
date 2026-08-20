@@ -6,15 +6,15 @@
       "file_hint": "fs/smb/client/cifsacl.c",
       "is_validator": true,
       "is_self_validator": true,
-      "postcondition": "On return 0: all ACEs within pdacl have been walked and each ACE's size and sid.num_subauth are within [pdacl, end_of_acl]; subsequent traversal of the DACL is safe. Findings about pointer arithmetic or struct field accesses INSIDE validate_dacl() are part of the validation logic, not vulnerable sinks.",
+      "postcondition": "On return 0, the entire DACL buffer starting at pdacl is confirmed to fit within [pdacl, end_of_acl): the DACL header fits, dacl_size is consistent, and every ACE entry (including its header, num_subauth field, and full sub-authority array) lies within the declared DACL bounds without exceeding end_of_acl.",
       "confidence": "high"
     },
     "validate_t2": {
-      "checksum": "516c1e161c8d7e58",
+      "checksum": "924d749ba3c0abf7",
       "file_hint": "fs/smb/client/cifssmb.c",
       "is_validator": true,
       "is_self_validator": true,
-      "postcondition": "On return 0: if min_param_size > 0, ParameterOffset + min_param_size <= frame_end (actual received packet end); if min_data_size > 0, DataOffset + min_data_size <= frame_end. A caller that passes sizeof(struct) as min_data_size can safely dereference that struct at DataOffset. Passing 0 for one skips its size check but both offsets are still bounded by CIFSMaxBufSize + MAX_CIFS_HDR_SIZE.",
+      "postcondition": "On return 0, the caller knows: (1) param_off and data_off each lie within CIFSMaxBufSize+MAX_CIFS_HDR_SIZE; (2) if min_param_size>0, the byte range [param_off, param_off+min_param_size) lies entirely within the received frame and clears the fixed T2 header; (3) if min_data_size>0, the byte range [data_off, data_off+min_data_size) likewise fits in the frame; (4) param_off+ParameterCount and data_off+DataCount both fit within frame_end (the actual received byte count); and (5) ParameterCount+DataCount does not exceed the BCC field and is less than CIFSMaxBufSize+MAX_CIFS_HDR_SIZE.",
       "confidence": "high"
     },
     "smb2_validate_iov": {
@@ -43,7 +43,7 @@
     },
     "wsl_to_fattr": {
       "checksum": "6fc301f5cf28a477",
-      "file_hint": "/home/src/linux/fs/smb/client/reparse.c",
+      "file_hint": "fs/smb/client/reparse.c",
       "is_validator": false,
       "is_self_validator": false,
       "postcondition": "",
@@ -51,7 +51,7 @@
     },
     "cifsConvertToUTF16": {
       "checksum": "bd70b210c56d76bb",
-      "file_hint": "/home/src/linux/fs/smb/client/cifs_unicode.c",
+      "file_hint": "fs/smb/client/cifs_unicode.c",
       "is_validator": false,
       "is_self_validator": false,
       "postcondition": "",
@@ -59,20 +59,1251 @@
     },
     "sid_to_id": {
       "checksum": "24daa19fdebd0b19",
-      "file_hint": "/home/src/linux/fs/smb/client/cifsacl.c",
+      "file_hint": "fs/smb/client/cifsacl.c",
       "is_validator": true,
-      "is_self_validator": true,
-      "postcondition": "On return 0, psid->num_subauth has been verified to be <= SID_MAX_SUB_AUTHORITIES (making the psid subauthority array safe to access), and sidkey->datalen has been verified to equal sizeof(uid_t) before any memcpy from the key payload, ensuring the payload copy is bounds-safe.",
+      "is_self_validator": false,
+      "postcondition": "On return 0, psid->num_subauth has been verified to not exceed SID_MAX_SUB_AUTHORITIES (so subauth array accesses are within bounds), and sidkey->datalen has been verified to equal sizeof(uid_t) before any memcpy from key payload data.",
       "confidence": "high"
     },
     "set_chmod_dacl": {
       "checksum": "a368e27bbdd0595e",
-      "file_hint": "/home/src/linux/fs/smb/client/cifsacl.c",
+      "file_hint": "fs/smb/client/cifsacl.c",
       "is_validator": false,
       "is_self_validator": false,
       "postcondition": "",
       "confidence": "high"
+    },
+    "SendReceive": {
+      "checksum": "930e2a8917ba1069",
+      "file_hint": "fs/smb/client/smb1transport.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that in_len does not exceed CIFSMaxBufSize+MAX_CIFS_HDR_SIZE, and if out_buf was provided, copy_len (the SMB response size) also does not exceed CIFSMaxBufSize+MAX_CIFS_HDR_SIZE, so the memcpy into out_buf is bounded within a valid CIFS-sized buffer.",
+      "confidence": "high"
+    },
+    "SMBQueryInformation": {
+      "checksum": "e3eaa4a355d58a8c",
+      "file_hint": "fs/smb/client/cifssmb.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "CIFSFindFirst": {
+      "checksum": "2accf429c1272418",
+      "file_hint": "fs/smb/client/cifssmb.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the response buffer has been validated by validate_t2() to contain at least sizeof(T2_FFIRST_RSP_PARMS) bytes of parameter data, and the LastNameOffset (lnoff) has been checked to be within the DataCount boundary, so psrch_inf->last_entry (if non-NULL) points within the valid data region of the response buffer.",
+      "confidence": "high"
+    },
+    "cifs_sb_tlink": {
+      "checksum": "7efa5ed47a181ec3",
+      "file_hint": "fs/smb/client/connect.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "CIFS_open": {
+      "checksum": "e0a0aebbaf063cb4",
+      "file_hint": "fs/smb/client/cifssmb.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "smb2_parse_contexts": {
+      "checksum": "dcea89a4c9e1cd8d",
+      "file_hint": "fs/smb/client/smb2pdu.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the entire chain of SMB2 create_context records fits within the response IOV buffer: the initial offset+length sum does not overflow and stays within rsp_iov->iov_len, and for each context record the name region (noff+nlen) and data region (doff+dlen) are both within the remaining buffer, and the Next-offset advances are non-overflowing and bounded by the remaining length.",
+      "confidence": "high"
+    },
+    "populate_new_aces": {
+      "checksum": "07beb75c51af4f6b",
+      "file_hint": "fs/smb/client/cifsacl.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "smb2_query_info_compound": {
+      "checksum": "0ff1f11d4defe751",
+      "file_hint": "fs/smb/client/smb2ops.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "SMB2_ioctl": {
+      "checksum": "a8342c7e55364e5b",
+      "file_hint": "fs/smb/client/smb2pdu.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On success (rc == 0), *out_data points to a kmemdup'd buffer of exactly *plen bytes, where *plen has been verified to be non-zero, not exceed rsp_iov.iov_len, not exceed 0xFF00, and the OutputOffset has been verified such that (rsp_iov.iov_len - *plen) >= outoff, guaranteeing the source region [(char*)rsp + outoff, (char*)rsp + outoff + *plen) lies entirely within the received response buffer.",
+      "confidence": "high"
+    },
+    "AdvExeScsiQueue": {
+      "checksum": "2eab9e43145e2723",
+      "file_hint": "drivers/scsi/advansys.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On ADV_SUCCESS return, the caller knows that scsiq->target_id is within bounds (\u2264 ADV_MAX_TID) and a free carrier was available, so the SCSI request has been safely enqueued without out-of-bounds target ID or carrier exhaustion.",
+      "confidence": "high"
+    },
+    "netdev_rx": {
+      "checksum": "257f9e8609527e27",
+      "file_hint": "drivers/net/ethernet/natsemi/natsemi.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return, any packet forwarded via netif_receive_skb() has pkt_len that is both non-negative and no greater than np->rx_buf_sz (buflen), ensuring the skb data region accessed is within the allocated receive buffer. The entry index is always kept within [0, RX_RING_SIZE) via modulo arithmetic.",
+      "confidence": "high"
+    },
+    "c4iw_reconnect": {
+      "checksum": "68db8d97394ac205",
+      "file_hint": "drivers/infiniband/hw/cxgb4/cm.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "send_fw_act_open_req": {
+      "checksum": "a4956fd20640157d",
+      "file_hint": "drivers/infiniband/hw/cxgb4/cm.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "altera_shrink": {
+      "checksum": "97dd2ce6494e67db",
+      "file_hint": "drivers/misc/altera-stapl/altera-comp.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On a non-zero return value (data_length), the decompressed data written to `out` fits within `out_length` bytes, since the function checks `data_length > out_length` and returns 0 if it would overflow. The caller can rely that at most `out_length` bytes of `out` were written and the returned value indicates the actual decompressed data length.",
+      "confidence": "medium"
+    },
+    "scsi_device_set_state": {
+      "checksum": "575411c83be7db8e",
+      "file_hint": "drivers/scsi/scsi_lib.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "amdgpu_bo_create_reserved": {
+      "checksum": "c516a5805c583025",
+      "file_hint": "drivers/gpu/drm/amd/amdgpu/amdgpu_object.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ath10k_mac_tx_push_txq": {
+      "checksum": "e9a8dc8295051945",
+      "file_hint": "drivers/net/wireless/ath/ath10k/mac.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ath6kl_uapsd_trigger_frame_rx": {
+      "checksum": "467087cb305a5f0b",
+      "file_hint": "drivers/net/wireless/ath/ath6kl/txrx.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "altera_drscan": {
+      "checksum": "c2e9e2c647152ba9",
+      "file_hint": "drivers/misc/altera-stapl/altera-jtag.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, js->dr_buffer is guaranteed to have at least ((js->dr_pre + count + js->dr_post + 7) / 8) bytes allocated, so that shift_count bits fit within the buffer without overflow.",
+      "confidence": "high"
+    },
+    "altera_irscan": {
+      "checksum": "d0b54894f740dbf7",
+      "file_hint": "drivers/misc/altera-stapl/altera-jtag.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, js->ir_buffer is allocated with at least ceil(shift_count/8) bytes, where shift_count = js->ir_pre + count + js->ir_post, guaranteeing the buffer is large enough to hold the concatenated preamble, IR data, and postamble for the subsequent scan operations.",
+      "confidence": "high"
+    },
+    "ath6kl_wmi_dot11_hdr_remove": {
+      "checksum": "17378bf7541cd22c",
+      "file_hint": "drivers/net/wireless/ath/ath6kl/wmi.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "aggr_process_recv_frm": {
+      "checksum": "bee1b920ea0be8d7",
+      "file_hint": "drivers/net/wireless/ath/ath6kl/txrx.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "handle_xsr_succ_status": {
+      "checksum": "e5dd505cca51ffbf",
+      "file_hint": "drivers/usb/gadget/udc/bdc/bdc_ep.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "altera_export_bool_array": {
+      "checksum": "2cb6d20ebbe146ea",
+      "file_hint": "drivers/misc/altera-stapl/altera.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "altera_swap_ir": {
+      "checksum": "3bded0155aa6cb60",
+      "file_hint": "drivers/misc/altera-stapl/altera-jtag.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, js->ir_buffer is allocated with at least ((js->ir_pre + count + js->ir_post + 7) / 8) bytes, sufficient to hold the concatenated preamble, IR data, and postamble bit sequence for the requested shift_count bits.",
+      "confidence": "high"
+    },
+    "altera_swap_dr": {
+      "checksum": "74ef1156c6517d3d",
+      "file_hint": "drivers/misc/altera-stapl/altera-jtag.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, js->dr_buffer is guaranteed to have at least ceil(shift_count/8) bytes allocated (where shift_count = dr_pre + count + dr_post), so subsequent calls to altera_concatenate_data and alt_jtag_drscan with shift_count bits are safe to access within that buffer.",
+      "confidence": "medium"
+    },
+    "ath6kl_data_tx": {
+      "checksum": "7efa316db6cf7edc",
+      "file_hint": "drivers/net/wireless/ath/ath6kl/txrx.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "bnx2x_tpa_stop": {
+      "checksum": "9cbeae5d193d1d05",
+      "file_hint": "drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "bnxt_event_error_report": {
+      "checksum": "96f649c81d77f85c",
+      "file_hint": "drivers/net/ethernet/broadcom/bnxt/bnxt.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "bnxt_rx_xdp": {
+      "checksum": "6af258c6d56734e7",
+      "file_hint": "drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "dma_getnexttxp": {
+      "checksum": "aa1271a4fcef04ed",
+      "file_hint": "drivers/net/wireless/broadcom/brcm80211/brcmsmac/dma.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "cdnsp_trb_in_td": {
+      "checksum": "7c8555eae72aa9fb",
+      "file_hint": "drivers/usb/cdns3/cdnsp-ring.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On non-NULL return, the caller knows that `suspect_dma` falls within the DMA address range of the TD spanning from `start_trb` to `end_trb`, and the returned segment is the specific ring segment that contains `suspect_dma`.",
+      "confidence": "high"
+    },
+    "chcr_ktls_write_tcp_options": {
+      "checksum": "fe99bb3d9dd07e0a",
+      "file_hint": "drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that sufficient TX queue descriptors are available (credits >= 0) to accommodate ndesc descriptors computed from the packet/WR sizes, and the packet headers fit within the 150-byte local buffer (pktlen <= 150 is implicitly assumed by the memcpy). The TX ring has been advanced and the hardware notified.",
+      "confidence": "medium"
+    },
+    "chcr_ktls_tx_plaintxt": {
+      "checksum": "c985e7d72ede8e64",
+      "file_hint": "drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the transmit queue has sufficient descriptors available (credits >= 0) to hold the computed number of descriptors (ndesc) derived from the plaintext data length and fragment count, and the SKB has been successfully DMA-mapped; the descriptor ring wrap-around has been handled so that last_desc is a valid index within q->q.sdesc[].",
+      "confidence": "high"
+    },
+    "ci_parse_pplib_clock_info": {
+      "checksum": "7e30716b53adad4e",
+      "file_hint": "drivers/gpu/drm/radeon/ci_dpm.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "radeon_crtc_handle_vblank": {
+      "checksum": "c5da1daaacda733f",
+      "file_hint": "drivers/gpu/drm/radeon/radeon_display.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "config_desc": {
+      "checksum": "b585800438c45f90",
+      "file_hint": "drivers/usb/gadget/composite.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "get_string": {
+      "checksum": "48ead0fc12b2b6f8",
+      "file_hint": "drivers/usb/gadget/composite.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "bos_desc": {
+      "checksum": "aab9e2e1033c3eec",
+      "file_hint": "drivers/usb/gadget/composite.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "set_config": {
+      "checksum": "df5641622f0887db",
+      "file_hint": "drivers/usb/gadget/composite.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "cxgb4_dcb_state_fsm": {
+      "checksum": "29431eb23d58cc4b",
+      "file_hint": "drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "func": {
+      "checksum": "b67c8344402660d0",
+      "file_hint": "drivers/gpu/drm/i915/display/intel_display_device.h",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "cxgb4_dcb_handle_fw_update": {
+      "checksum": "925caaee70148179",
+      "file_hint": "drivers/net/ethernet/chelsio/cxgb4/cxgb4_dcb.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "genwqe_alloc_sync_sgl": {
+      "checksum": "4ae10ddec9023c99",
+      "file_hint": "drivers/misc/genwqe/card_utils.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the scatter-gather list (sgl->sgl) has been allocated with size sgl->sgl_size (bounded by MAX_PAGE_ORDER pages), and any partial first page (sgl->fpage) and last page (sgl->lpage) have been allocated as full PAGE_SIZE buffers and safely populated via copy_from_user with exactly sgl->fpage_size and sgl->lpage_size bytes respectively from the user buffer \u2014 all offsets and sizes are guaranteed within their respective page-sized allocations.",
+      "confidence": "high"
+    },
+    "genwqe_setup_sgl": {
+      "checksum": "b0215242076d0004",
+      "file_hint": "drivers/misc/genwqe/card_utils.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "_dln2_transfer": {
+      "checksum": "ba38b4479cf52bbe",
+      "file_hint": "drivers/mfd/dln2.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, *ibuf_len has been clamped so that *ibuf_len <= (rsp->hdr.size - sizeof(*rsp)), guaranteeing that the memcpy of *ibuf_len bytes from the response payload (rsp+1) stays within the received USB transfer buffer, and the caller's ibuf buffer receives exactly *ibuf_len bytes of valid response data.",
+      "confidence": "high"
+    },
+    "rtc_time64_to_tm": {
+      "checksum": "01ab721d0cb5342c",
+      "file_hint": "drivers/rtc/lib.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "fc_exch_abts_resp": {
+      "checksum": "b51f020effd6a331",
+      "file_hint": "drivers/scsi/libfc/fc_exch.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ffs_ep0_write": {
+      "checksum": "7c428ee20f831f5b",
+      "file_hint": "drivers/usb/gadget/function/f_fs.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On success, the caller knows that `len` is at least 16 bytes (for descriptor/string states), and in the FFS_ACTIVE state `len` has been clamped to `min(len, wLength)` so the data buffer prepared from user space is within the USB setup packet's declared transfer size.",
+      "confidence": "high"
+    },
+    "gaudi2_handle_qm_sei_err": {
+      "checksum": "9e603664931c8473",
+      "file_hint": "drivers/accel/habanalabs/gaudi2/gaudi2.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "gaudi_handle_qman_err": {
+      "checksum": "87f46ec3b4d27031",
+      "file_hint": "drivers/accel/habanalabs/gaudi/gaudi.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "gaudi2_handle_hbm_mc_sei_err": {
+      "checksum": "d413818a002e4025",
+      "file_hint": "drivers/accel/habanalabs/gaudi2/gaudi2.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "When the function proceeds past the bounds check (i.e., does not return early at line 9744), the caller knows that cause_idx is within [0, GAUDI2_NUM_OF_HBM_SEI_CAUSE - 1], making it safe to index into the hbm_mc_sei_cause[] array and use cause_idx in the switch statement without out-of-bounds access.",
+      "confidence": "high"
+    },
+    "gaudi_patch_dma_packet": {
+      "checksum": "b47203b8eec75e60",
+      "file_hint": "drivers/accel/habanalabs/gaudi/gaudi.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that (1) the user-supplied DMA address range [addr, addr+tsize) is pinned/mapped in the job's userptr list, and (2) *new_dma_pkt_size equals dma_desc_cnt * sizeof(struct packet_lin_dma), reflecting exactly how many scatter-gather-derived DMA packets were written into the new_dma_pkt buffer.",
+      "confidence": "medium"
+    },
+    "gaudi2_handle_qman_err": {
+      "checksum": "4420e1a7ba601991",
+      "file_hint": "drivers/accel/habanalabs/gaudi2/gaudi2.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "event_id_to_engine_id": {
+      "checksum": "1c7c79e24e7b7115",
+      "file_hint": "drivers/accel/habanalabs/gaudi2/gaudi2.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "amdgpu_ucode_print_rlc_hdr": {
+      "checksum": "4e42cd37b6b26240",
+      "file_hint": "drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "goya_patch_dma_packet": {
+      "checksum": "61b27faf750c0547",
+      "file_hint": "drivers/accel/habanalabs/goya/goya.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the user DMA packet's host memory address range (addr + tsize) is confirmed to be pinned/mapped in the job's userptr list, and *new_dma_pkt_size is set to the exact byte size of the patched DMA descriptor array written into new_dma_pkt (either sizeof(struct packet_lin_dma) for simple cases or dma_desc_cnt * sizeof(struct packet_lin_dma) for scatter-gather expansion), meaning the caller can safely use that many bytes of new_dma_pkt.",
+      "confidence": "medium"
+    },
+    "process_ctrl_td": {
+      "checksum": "3380b8ddc0f55729",
+      "file_hint": "drivers/usb/host/xhci-ring.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "configure_filter_tcb": {
+      "checksum": "4b41b231db71d46d",
+      "file_hint": "drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "rvt_copy_sge": {
+      "checksum": "115e41a24a0599d7",
+      "file_hint": "drivers/infiniband/sw/rdmavt/qp.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "adjust_hwmon_flags": {
+      "checksum": "d460b67f0ae151cc",
+      "file_hint": "drivers/accel/habanalabs/common/hwmon.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "idpf_parse_protocol_ids": {
+      "checksum": "cbb84432d69125af",
+      "file_hint": "drivers/net/ethernet/intel/idpf/idpf_virtchnl.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "il4965_tx_status_reply_compressed_ba": {
+      "checksum": "b47eb69a83eaf260",
+      "file_hint": "drivers/net/wireless/intel/iwlegacy/4965-mac.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that agg->frame_count fits within the 64-bit block-ack bitmap after the computed shift sh (i.e., frame_count <= 64 - sh), ensuring the bitmap operations will not overflow the 64-bit window.",
+      "confidence": "high"
+    },
+    "get_tdp_table": {
+      "checksum": "12485f76991d0bb5",
+      "file_hint": "drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega10_processpptables.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "il4965_tx_status_reply_tx": {
+      "checksum": "9628d0f21ea60109",
+      "file_hint": "drivers/net/wireless/intel/iwlegacy/4965-mac.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "irdma_negotiate_mpa_v2_ird_ord": {
+      "checksum": "4394b27d69d3b3d1",
+      "file_hint": "drivers/infiniband/hw/irdma/cm.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "lpfc_sli4_seq_abort_rsp": {
+      "checksum": "0ef273a6e52ea8fb",
+      "file_hint": "drivers/scsi/lpfc/lpfc_sli.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "set_and_calc_slave_port_state": {
+      "checksum": "b871475cda2f0583",
+      "file_hint": "drivers/net/ethernet/mellanox/mlx4/eq.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On successful return (ret >= 0), the caller knows that 'slave' is less than dev->num_slaves, 'port' is within [1, dev->caps.num_ports], and the port is active for the given slave, making accesses to priv->mfunc.master.slave_state[slave] and related port-indexed structures safe.",
+      "confidence": "high"
+    },
+    "mpi3mr_add_expander_phy": {
+      "checksum": "d56fb34712f60065",
+      "file_hint": "drivers/scsi/mpi3mr/mpi3mr_transport.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "mpi3mr_sas_host_add": {
+      "checksum": "880f42a90ad14507",
+      "file_hint": "drivers/scsi/mpi3mr/mpi3mr_transport.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "hw_event_sas_phy_up": {
+      "checksum": "2480cb1852e9ba41",
+      "file_hint": "drivers/scsi/pm8001/pm80xx_hwi.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "hw_event_phy_down": {
+      "checksum": "e45d556e9981a38f",
+      "file_hint": "drivers/scsi/pm8001/pm80xx_hwi.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "mptsas_probe_hba_phys": {
+      "checksum": "3ea5909a7cee319a",
+      "file_hint": "drivers/message/fusion/mptsas.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ms_read_readpage": {
+      "checksum": "52ea88f5214335fa",
+      "file_hint": "drivers/usb/storage/ene_ub6250.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "mt7603_wtbl_set_rates": {
+      "checksum": "eb54617de53d717b",
+      "file_hint": "drivers/net/wireless/mediatek/mt76/mt7603/mac.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "mt7615_mac_set_rates": {
+      "checksum": "a3de48d627d1d103",
+      "file_hint": "drivers/net/wireless/mediatek/mt76/mt7615/mac.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "mt76_connac2_mac_fill_rx_rate": {
+      "checksum": "f43ddd4f2ce15771",
+      "file_hint": "drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the extracted rate index `i` is within valid bounds for the detected PHY mode (\u226431 for HT, \u226411 for VHT, masked to 4 bits for HE), the bandwidth value is one of the recognized IEEE80211 bandwidth constants, and all fields of `status` and `*mode` have been safely populated from the rxv descriptor words.",
+      "confidence": "high"
+    },
+    "mt7925_mac_fill_rx_rate": {
+      "checksum": "a606ea354c24b295",
+      "file_hint": "drivers/net/wireless/mediatek/mt76/mt7925/mac.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the decoded rate index `i` is within valid bounds for the detected PHY mode (\u226431 for HT, \u226411 for VHT, 0\u201315 for HE/EHT via mask), the bandwidth value `bw` is a recognized enum, and `status->rate_idx`, `status->bw`, and related encoding fields are safely populated. The caller can rely on these fields being consistent and within range for further processing.",
+      "confidence": "high"
+    },
+    "mt7996_mac_fill_rx_rate": {
+      "checksum": "b4e11b2190330dd2",
+      "file_hint": "drivers/net/wireless/mediatek/mt76/mt7996/mac.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the parsed rate index `i` is within valid bounds for the detected PHY mode (\u226431 for HT, \u226411 for VHT, masked to 4 bits for HE/EHT), the bandwidth field `bw` is a recognized value, and `status->rate_idx`, `status->encoding`, `status->bw`, and related fields are safely populated from the rxv descriptor.",
+      "confidence": "high"
+    },
+    "mwifiex_process_mgmt_packet": {
+      "checksum": "903899fc634a48ad",
+      "file_hint": "drivers/net/wireless/marvell/mwifiex/util.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that pkt_len is at least sizeof(struct ieee80211_hdr) + sizeof(u16), meaning the skb data (after pulling the rx_pkt_offset and pkt_len prefix) contains at least a full ieee80211_hdr structure, making it safe to dereference ieee_hdr fields (frame_control, addr2, addr3) and pass pkt_len bytes to cfg80211 callbacks.",
+      "confidence": "high"
+    },
+    "mwifiex_process_rx_packet": {
+      "checksum": "3b09fc5d77d2139d",
+      "file_hint": "drivers/net/wireless/marvell/mwifiex/sta_rx.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On successful return (non-negative), the caller knows that rx_pkt_off is small enough that sizeof(rx_pkt_hdr->eth803_hdr) + sizeof(rfc1042_header) + rx_pkt_off <= skb->len, guaranteeing that the rx_pkt_hdr pointer derived from local_rx_pd + rx_pkt_off lies within the skb data buffer and the ethernet/rfc1042 header fields are accessible without overflow.",
+      "confidence": "high"
+    },
+    "check_link": {
+      "checksum": "1a908945770262cf",
+      "file_hint": "drivers/net/ethernet/natsemi/natsemi.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "nfp_nfdk_parse_meta": {
+      "checksum": "1083926bf5b63fe8",
+      "file_hint": "drivers/net/ethernet/netronome/nfp/nfdk/dp.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return true (with data == pkt), the caller knows that the metadata region has been fully and consistently parsed: all meta fields were valid types, each 4-byte (or sizeof(nfp_net_tls_resync_req)) read advanced `data` exactly to the start of the packet buffer `pkt`, confirming the declared meta_len was consumed without overrun or underrun.",
+      "confidence": "medium"
+    },
+    "nvmet_alloc_ctrl": {
+      "checksum": "af2449acac5e46a3",
+      "file_hint": "drivers/nvme/target/core.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "p54_parse_rssical": {
+      "checksum": "366802e0fdac5a43",
+      "file_hint": "drivers/net/wireless/intersil/p54/eeprom.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that `len` (minus any 2-byte header offset) is an exact multiple of the relevant calibration entry structure size, contains at least one entry, and that a `priv->rssi_db` buffer of exactly the right size has been allocated and filled with `entries` valid calibration records safely read from `data[0..len-1]`.",
+      "confidence": "high"
+    },
+    "qcom_glink_rx_data": {
+      "checksum": "cd72e2e204fc2930",
+      "file_hint": "drivers/rpmsg/qcom_glink_native.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the caller knows that: (1) at least sizeof(hdr) + chunk_size bytes are available in the RX FIFO (so the header and payload peek are safe), and (2) the intent buffer has at least chunk_size bytes remaining beyond its current offset (intent->size - intent->offset >= chunk_size), making the write into intent->data + intent->offset safe.",
+      "confidence": "high"
+    },
+    "qcom_smd_create_channel": {
+      "checksum": "ba0db13d5697eeb0",
+      "file_hint": "drivers/rpmsg/qcom_smd.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On non-ERR return, the channel's info region is exactly 2*sizeof(smd_channel_info_word) or 2*sizeof(smd_channel_info) bytes (verified against actual SMEM item size), and the fifo region is split into two equal halves (tx_fifo and rx_fifo each of channel->fifo_size bytes) backed by a valid SMEM allocation, so accesses within those bounds are safe.",
+      "confidence": "high"
+    },
+    "qed_iwarp_send_fpdu": {
+      "checksum": "ba76aacde65a831a",
+      "file_hint": "drivers/net/ethernet/qlogic/qed/qed_iwarp.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "qede_rx_xdp": {
+      "checksum": "e168c75007671a08",
+      "file_hint": "drivers/net/ethernet/qlogic/qede/qede_fp.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "qtnf_event_handle_radar": {
+      "checksum": "49b48232711a92b7",
+      "file_hint": "drivers/net/wireless/quantenna/qtnfmac/event.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the caller knows that `len` is at least `sizeof(struct qlink_event_radar)`, so the entire `ev` structure (including `ev->chan` and `ev->event`) is within the valid buffer region and safe to access.",
+      "confidence": "high"
+    },
+    "qtnf_event_handle_scan_results": {
+      "checksum": "207d3112e09f5425",
+      "file_hint": "drivers/net/wireless/quantenna/qtnfmac/event.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the caller knows that: (1) `len` is at least sizeof(*sr), so the fixed header is fully contained; (2) the TLV chain within `sr->payload` of length `len - sizeof(*sr)` is well-formed and every TLV fits within that payload region; (3) any QTN_TLV_ID_IE_SET TLV has a value length large enough to contain its own sub-header, so `ie_set->ie_data` access and the derived `ies_len` are within bounds.",
+      "confidence": "high"
+    },
+    "qtnf_event_handle_bss_join": {
+      "checksum": "402473d1ac49da7b",
+      "file_hint": "drivers/net/wireless/quantenna/qtnfmac/event.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return, the caller knows that `len` is at least `sizeof(*join_info)`, so the fixed-size header of the join_info structure is fully accessible. Additionally, TLV entries parsed from `join_info->ies` within `payload_len = len - sizeof(*join_info)` bytes have been validated to contain at least the minimum IE_SET payload before their data pointers (rsp_ies) are used.",
+      "confidence": "high"
+    },
+    "raid5_compute_blocknr": {
+      "checksum": "e8f55f724ae33d49",
+      "file_hint": "drivers/md/raid5.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "qtnf_event_handle_sta_assoc": {
+      "checksum": "cf65f3d18222105d",
+      "file_hint": "drivers/net/wireless/quantenna/qtnfmac/event.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the caller knows that `len` is at least `sizeof(*sta_assoc)`, that all TLV entries within the `payload_len`-byte IEs buffer are well-formed (each TLV fits within the buffer), and that any QTN_TLV_ID_IE_SET TLV has sufficient length to contain the fixed ie_set header fields before the ie_data payload.",
+      "confidence": "high"
+    },
+    "radeon_atombios_parse_pplib_clock_info": {
+      "checksum": "9cd8f3785d6f140a",
+      "file_hint": "drivers/gpu/drm/radeon/radeon_atombios.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return true, the caller knows that rdev->pm.power_state[state_index].clock_info[mode_index] contains valid non-zero clock values (sclk non-zero for IGP; both mclk and sclk non-zero for discrete GPUs), meaning the mode entry represents a usable power state that can be safely referenced.",
+      "confidence": "high"
+    },
+    "radeon_atombios_parse_pplib_non_clock_info": {
+      "checksum": "9256444472a80695",
+      "file_hint": "drivers/gpu/drm/radeon/radeon_atombios.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "handle_write_conflicts": {
+      "checksum": "b68e3e55ce84a968",
+      "file_hint": "drivers/block/drbd/drbd_receiver.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "drbd_submit_peer_request": {
+      "checksum": "b25297ed24a53c77",
+      "file_hint": "drivers/block/drbd/drbd_receiver.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "read_in_block": {
+      "checksum": "82f89d390c0e88ec",
+      "file_hint": "drivers/block/drbd/drbd_receiver.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On non-NULL return, the caller knows: ds is 512-byte aligned; ds does not exceed DRBD_MAX_BIO_SIZE (or DRBD_MAX_BBIO_SECTORS<<9 for trim/zeroes); sector+ds/512 does not exceed the device capacity; data_size accounts for the digest; and for normal writes the page chain has been fully populated with exactly data_size bytes from the network and (if a digest was configured) integrity-verified.",
+      "confidence": "high"
+    },
+    "qlcnic_process_rcv": {
+      "checksum": "c9ce99cb98e45e90",
+      "file_hint": "drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On non-NULL return, the caller knows that `ring` is a valid index into `recv_ctx->rds_rings[]` and `index` (derived from sts_data0) is a valid index into `rds_ring->rx_buf_arr[]`, so the returned `buffer` pointer references a legitimate rx_buf_arr element. Additionally, the skb data written via skb_put is bounded by at most `rds_ring->skb_size` bytes, ensuring no out-of-bounds write into the skb.",
+      "confidence": "high"
+    },
+    "radeon_add_atom_encoder": {
+      "checksum": "b02d12cf2412ced9",
+      "file_hint": "drivers/gpu/drm/radeon/atombios_encoders.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "prot_verify_write": {
+      "checksum": "adee5977416adc58",
+      "file_hint": "drivers/scsi/scsi_debug.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, every protection tuple in the SCSI protection scatter-gather list has been verified against the corresponding data sector (via dif_verify), confirming that the T10 PI guard tags, app tags, and ref tags are consistent with the data buffers for all 'sectors' sectors starting at 'start_sec'. The caller can rely on the data payload and its protection information being mutually consistent before committing the write.",
+      "confidence": "high"
+    },
+    "rtl8139_rx_err": {
+      "checksum": "4fb148f09e61a085",
+      "file_hint": "drivers/net/ethernet/realtek/8139too.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "get_or_create_srv": {
+      "checksum": "9ea596fef804c8ca",
+      "file_hint": "drivers/infiniband/ulp/rtrs/rtrs-srv.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "si_parse_pplib_clock_info": {
+      "checksum": "aa84aac8569553e7",
+      "file_hint": "drivers/gpu/drm/radeon/si_dpm.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "get_pcie_lane_support": {
+      "checksum": "696b8b97730bc940",
+      "file_hint": "drivers/gpu/drm/amd/include/amd_pcie_helpers.h",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "process_status": {
+      "checksum": "75f9b8bae4a5ddfb",
+      "file_hint": "drivers/atm/solos-pci.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "tc35815_check_tx_stat": {
+      "checksum": "b0d5c2f112205563",
+      "file_hint": "drivers/net/ethernet/toshiba/tc35815.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "tpm_buf_append_name": {
+      "checksum": "f76cd57918ada05f",
+      "file_hint": "drivers/char/tpm/tpm2-sessions.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the computed slot index is within [0, AUTH_MAX_NAMES), and the buffer's current position matches the expected session state (auth->session == tpm_buf_length(buf)), guaranteeing that subsequent writes to auth->name[slot] and auth->name_h[slot] are within the fixed-size arrays.",
+      "confidence": "high"
+    },
+    "tulip_rx": {
+      "checksum": "dbed6be05fc66aa2",
+      "file_hint": "drivers/net/ethernet/dec/tulip/interrupt.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On successful processing of a packet (the else branch at line 435), the caller knows that pkt_len is in the range [0, 1518], the packet status indicates no errors and a complete whole-packet reception, and the rx_work_limit has not been exhausted; the skb data region of pkt_len bytes has been safely copied or handed off to the network stack.",
+      "confidence": "high"
+    },
+    "validate_vid_hdr": {
+      "checksum": "7f3774321ed9f513",
+      "file_hint": "drivers/mtd/ubi/io.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the caller knows that the VID header fields are internally consistent and within device bounds: data_pad < ubi->leb_size/2, data_size <= ubi->leb_size, vol_id and lnum are non-negative and in valid ranges, and for static volumes the lnum does not exceed used_ebs-1, ensuring no out-of-bounds logical eraseblock access will result from trusting these header values.",
+      "confidence": "high"
+    },
+    "ubi_io_read_vid_hdr": {
+      "checksum": "60a983740cbad7fc",
+      "file_hint": "drivers/mtd/ubi/io.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0 (or UBI_IO_BITFLIPS), the VID header read from PEB `pnum` into `vidb->buffer` is verified to contain the correct UBI_VID_HDR_MAGIC, a matching CRC32 over UBI_VID_HDR_SIZE_CRC bytes, and passes structural validation via validate_vid_hdr(); the caller can safely treat the `ubi_vid_hdr` pointed to by `ubi_get_vid_hdr(vidb)` as a fully valid, internally consistent VID header.",
+      "confidence": "high"
+    },
+    "ubi_resize_volume": {
+      "checksum": "023dfe036e36cdea",
+      "file_hint": "drivers/mtd/ubi/vmt.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ubi_io_read_ec_hdr": {
+      "checksum": "ef3aebc8c4bf3b29",
+      "file_hint": "drivers/mtd/ubi/io.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0 (or UBI_IO_BITFLIPS), the ec_hdr buffer contains exactly UBI_EC_HDR_SIZE bytes of a valid EC header: the magic number matches UBI_EC_HDR_MAGIC, the CRC over the first UBI_EC_HDR_SIZE_CRC bytes matches the stored hdr_crc field, and validate_ec_hdr() has confirmed the header fields are internally consistent and within expected ranges.",
+      "confidence": "high"
+    },
+    "eventid2name": {
+      "checksum": "78bea75a78dad237",
+      "file_hint": "drivers/net/wireless/ath/wil6210/wmi.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "xhci_invalidate_cancelled_tds": {
+      "checksum": "771bd18619cc9d81",
+      "file_hint": "drivers/usb/host/xhci-ring.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "find_valid_gpt": {
+      "checksum": "59f6ffc727122211",
+      "file_hint": "block/partitions/efi.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return value 1, *gpt points to a kernel-allocated, validated GPT header and *ptes points to a kernel-allocated, validated array of partition entries that have been verified to be consistent with the disk's sector boundaries and GPT structural constraints. On return value 0, both *gpt and *ptes are set to NULL and all intermediate allocations are freed.",
+      "confidence": "high"
+    },
+    "is_gpt_valid": {
+      "checksum": "224834dd638b5430",
+      "file_hint": "block/partitions/efi.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return value 1, *gpt points to a valid GPT header whose signature, CRC, my_lba, header_size (between sizeof(gpt_header) and one logical block size), first_usable_lba, last_usable_lba (both within disk bounds), and sizeof_partition_entry are all verified correct; *ptes points to a partition entry array of num_partition_entries * sizeof(gpt_entry) bytes whose CRC has been verified, and pt_size does not exceed KMALLOC_MAX_SIZE, making it safe to iterate over all partition entries.",
+      "confidence": "high"
+    },
+    "blk_trace_setup_prepare": {
+      "checksum": "76186242238ec520",
+      "file_hint": "kernel/trace/blktrace.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "kimage_alloc_page": {
+      "checksum": "d6e75f26ff94b74e",
+      "file_hint": "kernel/kexec_core.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On non-NULL return, the caller receives a page whose physical address (addr) is within KEXEC_SOURCE_MEMORY_LIMIT and is either equal to the requested destination address or is not currently used as any other destination range, ensuring the page can be safely used as a kexec source page without overwriting needed destination data.",
+      "confidence": "high"
+    },
+    "__perf_read_group_add": {
+      "checksum": "460ee09e5ceab79f",
+      "file_hint": "kernel/events/core.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "finish_task_switch": {
+      "checksum": "3e7e8e0237a4fa7d",
+      "file_hint": "kernel/sched/core.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "user_event_enabler_create": {
+      "checksum": "6146cd3fe347a6a5",
+      "file_hint": "kernel/trace/trace_events_user.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "record_print_text": {
+      "checksum": "8e867eb0e61885de",
+      "file_hint": "kernel/printk/printk.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return, the formatted text (with prefixes, newlines, and NUL terminator) fits entirely within r->text_buf[0..buf_size-1], and the returned length `len` satisfies len < buf_size so that r->text_buf[len] = '\\0' is always a valid write. All memmove/memcpy operations within the loop are guaranteed not to exceed buf_size.",
+      "confidence": "high"
+    },
+    "user_event_put": {
+      "checksum": "e750e04d1c385bdf",
+      "file_hint": "kernel/trace/trace_events_user.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ring_buffer_read_page": {
+      "checksum": "18b39784341ec156",
+      "file_hint": "kernel/trace/ring_buffer.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On successful return (>= 0), the caller knows that: (1) `len` was sufficient to hold at least BUF_PAGE_HDR_SIZE plus one event, (2) copied event data fits within the destination page's data region (enforced by clamping len to size-read and checking each event_size against remaining len), and (3) if missed_events are stored, there is at least sizeof(missed_events) bytes of space beyond the committed data within buffer->subbuf_size.",
+      "confidence": "high"
+    },
+    "ieee80211_handle_filtered_frame": {
+      "checksum": "f3ef35e467e19ae8",
+      "file_hint": "net/mac80211/status.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "batadv_v_ogm_metric_update": {
+      "checksum": "34b5cc9653b70f9a",
+      "file_hint": "net/batman-adv/bat_v_ogm.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "cfg80211_gen_new_ie": {
+      "checksum": "8f35ffa0d60eb20b",
+      "file_hint": "net/wireless/scan.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On a non-zero return value, the caller knows that exactly (return value) bytes have been written into new_ie[], and all writes stayed within the new_ie[0..new_ie_len-1] boundary (enforced via cfg80211_copy_elem_with_frags returning 0 on overflow, which causes the function to return 0 instead). The returned size is also the exact number of bytes populated in new_ie.",
+      "confidence": "high"
+    },
+    "cfg80211_defrag_mle": {
+      "checksum": "1676828881e42443",
+      "file_hint": "net/wireless/scan.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On non-NULL return, the caller receives a heap-allocated cfg80211_mle whose 'data' buffer of size buf_len safely contains the fully defragmented MLE, 'mle' points into that buffer at a validated MLE structure, and each 'sta_prof[i]'/'sta_prof_len[i]' pair points into the same buffer at a defragmented per-STA profile whose bytes are all within the allocated region. All element iteration was verified complete (for_each_element_completed) and all defragmentation operations succeeded.",
+      "confidence": "high"
+    },
+    "cfg80211_gen_reporter_rnr": {
+      "checksum": "656c6361471e3295",
+      "file_hint": "net/wireless/scan.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "decode_MOSDOpReply": {
+      "checksum": "6f35cb6183e6e3f6",
+      "file_hint": "net/ceph/osd_client.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, all fields of the MOSDOpReply struct (pgid, flags, result, epoch, num_ops, outdata_len[], retry_attempt, rval[], replay_version, user_version, redirect) have been decoded from the message front buffer with every read verified to lie within [msg->front.iov_base, msg->front.iov_base + msg->front.iov_len), and num_ops is bounded by ARRAY_SIZE(m->outdata_len) ensuring no out-of-bounds array access occurred.",
+      "confidence": "high"
+    },
+    "hci_mgmt_cmd": {
+      "checksum": "9e9bd774bfc42393",
+      "file_hint": "net/bluetooth/hci_sock.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On successful dispatch (non-negative return), the caller (handler->func) can rely on: (1) skb->data contains a valid mgmt_hdr followed by exactly len bytes of command parameters (len == skb->len - sizeof(*hdr)); (2) len matches handler->data_len exactly, or is >= handler->data_len for variable-length handlers; (3) opcode is within chan->handlers bounds and maps to a non-NULL handler; (4) if hdev is non-NULL it is a valid, properly configured HCI device.",
+      "confidence": "high"
+    },
+    "hci_logging_frame": {
+      "checksum": "e8e4128bf47a2719",
+      "file_hint": "net/bluetooth/hci_sock.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On success (return > 0), the caller knows that skb->len >= sizeof(struct hci_mon_hdr) + 3, that hdr->len exactly matches skb->len - sizeof(*hdr), that the opcode field is 0x0000, that priority is 0-7, that ident_len <= skb->len - sizeof(*hdr) - 3 (so skb->data[sizeof(*hdr) + ident_len + 1] is within bounds and NUL-terminated), and that skb->data[skb->len - 1] == 0x00 (message is NUL-terminated).",
+      "confidence": "high"
+    },
+    "ieee802_11_parse_elems_full": {
+      "checksum": "d8a2ae0d606aed13",
+      "file_hint": "net/mac80211/parse.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On non-NULL return, the caller receives a fully parsed ieee802_11_elems structure where all element pointers (tim, bssid_index, ml_basic, ml_reconf, ml_epcs, etc.) have been validated to lie within the input buffer of length params->len, and length-guarded fields like bssid_index_len have been checked before any dereference (e.g., dtim_period/dtim_count accesses are gated by offsetofend checks).",
+      "confidence": "medium"
+    },
+    "ieee80211_mesh_process_chnswitch": {
+      "checksum": "9bafe26bd174d94a",
+      "file_hint": "net/mac80211/mesh.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ieee80211_ht_cap_ie_to_sta_ht_cap": {
+      "checksum": "f8f1131a159454b7",
+      "file_hint": "net/mac80211/ht.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "cfg80211_defragment_element": {
+      "checksum": "c5c0212a6e4cdc75",
+      "file_hint": "net/wireless/scan.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On a non-negative return value, the caller knows that the element `elem` lies fully within the `[ies, ies+ieslen)` buffer, all fragment elements consumed also lie within that buffer, and if `data` is non-NULL the total defragmented payload of `copied` bytes has been written without exceeding `data_len` bytes of the `data` buffer.",
+      "confidence": "high"
+    },
+    "skb_copy_bits": {
+      "checksum": "9bb96b6d4cd079e2",
+      "file_hint": "net/core/skbuff.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, exactly `len` bytes starting at byte offset `offset` within the skb's data (spanning linear header, paged fragments, and frag_iter sub-skbs) have been safely copied into the `to` buffer; the caller knows that [offset, offset+len) is entirely within the skb's valid data range (skb->len) and that all referenced memory regions were accessible.",
+      "confidence": "high"
+    },
+    "ieee80211_handle_beacon_sig": {
+      "checksum": "3cb2e9d550d64148",
+      "file_hint": "net/mac80211/mlme.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "fils_decrypt_assoc_resp": {
+      "checksum": "ff2794807e4f9bcb",
+      "file_hint": "net/mac80211/fils_aead.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the caller knows that: (1) the frame is at least 30 bytes long (24+6), (2) a valid FILS Session element with exactly 9 data bytes exists within the frame boundaries, (3) there are at least AES_BLOCK_SIZE bytes of encrypted data after the FILS Session element, and (4) AES-SIV decryption succeeded, so *frame_len has been reduced by AES_BLOCK_SIZE and the decrypted payload is valid within the adjusted frame bounds.",
+      "confidence": "high"
+    },
+    "cfg80211_get_p2p_attr": {
+      "checksum": "b09939bb084ae915",
+      "file_hint": "net/wireless/util.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On a non-negative return value, the caller knows that the requested P2P attribute was found within the IE buffer (all accesses stayed within the `len`-byte `ies` array), and up to `bufsize` bytes of the attribute's value have been safely written into `buf`; the return value is the total attribute length.",
+      "confidence": "high"
+    },
+    "ieee80211_mgd_check_cross_link_csa": {
+      "checksum": "b3320f624c15634d",
+      "file_hint": "net/mac80211/mlme.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ieee80211_handle_pwr_constr": {
+      "checksum": "274e51a919741ce5",
+      "file_hint": "net/mac80211/mlme.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "ieee80211_apply_vhtcap_overrides": {
+      "checksum": "58f4c12a342b18e2",
+      "file_hint": "net/mac80211/vht.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "iptfs_reassem_cont": {
+      "checksum": "e56a5b09ec2398c4",
+      "file_hint": "net/xfrm/xfrm_iptfs.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On successful return (non-abandon path), the caller knows that the fragment data starting at offset `data` for `copylen` bytes fits within the skb payload (remaining = skb->len - data), that the reassembled IP packet length is consistent with the runt/block offset bounds, and that the IP header fits within the allocated newskb linear space. The returned value is a validated byte offset into the skb indicating where continuation parsing should begin.",
+      "confidence": "high"
+    },
+    "mesh_plink_frame_tx": {
+      "checksum": "d20c6923a5f3e20a",
+      "file_hint": "net/mac80211/mesh_plink.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On return 0, the allocated skb has sufficient tailroom for all planned IE writes: line 317 explicitly checks `skb_tailroom(skb) < 2 + ie_len` before writing the peering management element, and the initial skb allocation conservatively reserves space for all possible IEs (HT/VHT/HE/EHT caps, mesh IDs, vendor IEs, etc.), so all subsequent skb_put/put_unaligned writes into the skb are within the pre-allocated buffer bounds.",
+      "confidence": "high"
+    },
+    "mesh_plink_get_event": {
+      "checksum": "9ab846be0520fc05",
+      "file_hint": "net/mac80211/mesh_plink.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "vlan_do_receive": {
+      "checksum": "1ebbd29a06c85c4d",
+      "file_hint": "net/8021q/vlan_core.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "prep_next_sparse_read": {
+      "checksum": "502049dea3b29540",
+      "file_hint": "net/ceph/osd_client.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "rxgk_extract_token": {
+      "checksum": "72315606319a5467",
+      "file_hint": "net/rxrpc/rxgk_app.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return 0, the caller knows that the token buffer contains at least a valid container header (sizeof(*container) bytes) and that the declared ticket_len field fits within the remaining buffer (token_len - sizeof(*container)) after XDR alignment, so subsequent accesses to the token data up to ticket_len bytes are within bounds.",
+      "confidence": "high"
+    },
+    "sctp_assoc_add_peer": {
+      "checksum": "d8e6cb558b831226",
+      "file_hint": "net/sctp/associola.c",
+      "is_validator": true,
+      "is_self_validator": false,
+      "postcondition": "On non-NULL return, the transport count has not exceeded U16_MAX (checked at line 621-622), the new peer transport was successfully allocated, hashed, and linked into the association's transport list, so the caller can safely use the returned peer pointer and asoc->peer.transport_count reflects the valid bounded count.",
+      "confidence": "medium"
+    },
+    "sctp_association_free": {
+      "checksum": "8ff58e3e971e6065",
+      "file_hint": "net/sctp/associola.c",
+      "is_validator": false,
+      "is_self_validator": false,
+      "postcondition": "",
+      "confidence": "high"
+    },
+    "sctp_process_init": {
+      "checksum": "4a619ab45140c1ca",
+      "file_hint": "net/sctp/sm_make_chunk.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On return value 1 (success), the peer_init parameters have all been walked and validated (each via sctp_process_param), the source address matches at least one advertised peer address, stream counts are bounded by peer's advertised in/outbound stream counts (sinit_num_ostreams <= peer num_inbound_streams and sinit_max_instreams <= peer num_outbound_streams), the TSN map is initialized, and stream structures are allocated \u2014 so all subsequent accesses to asoc->stream, asoc->peer.tsn_map, and transport structures are safe within those validated bounds.",
+      "confidence": "medium"
     }
-
   }
 }
