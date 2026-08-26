@@ -793,6 +793,18 @@ Common false positive patterns in kernel taint analysis:
    test: if remaining_size == 1 passes the loop guard but a field at
    offset 4 is read, that is an OOB read.
 
+7. Missing lower-bound check on struct-internal offsets: when a
+   server-supplied offset (e.g., DfsPathOffset, DataOffset) is used to
+   derive a pointer into a structured record, the offset must be at
+   least sizeof(header_struct) — values below that point into the
+   fixed header rather than the variable-length payload.  A check that
+   only validates offset <= buffer_end - base (upper bound) is
+   INSUFFICIENT if it allows offsets below sizeof(header).  Apply the
+   counterexample test: offset=0 means the derived pointer aliases the
+   struct header itself, and string/data reads will misinterpret header
+   fields as payload.  Both bounds are required: offset >= sizeof(*hdr)
+   AND base + offset <= buffer_end.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
@@ -978,10 +990,15 @@ def _format_findings(findings):
                 f"and the dereference is in the caller, not inside the validator; "
                 f"(c) the struct was allocated locally by the kernel (not received from "
                 f"the server) and any le32_to_cpu() reads are of locally-written fields.  "
-                f"Real bug if: the pointer was advanced inside a loop by a server-supplied "
+                f"Real bug if: (1) the pointer was advanced inside a loop by a server-supplied "
                 f"offset and the loop guard only checks remaining > 0 rather than "
                 f"remaining >= sizeof(*ptr) — a small remaining value passes the guard "
-                f"but the struct field reads are OOB.\n"
+                f"but the struct field reads are OOB; "
+                f"(2) a server-supplied offset into a structured record is checked "
+                f"against the buffer end (upper bound) but not against sizeof(header) "
+                f"(lower bound) — an offset smaller than the header size places the "
+                f"derived pointer inside the fixed header, and subsequent reads "
+                f"misinterpret header fields as payload data.\n"
             )
         elif f.get('sink_arg_role') == 'narrowed_value':
             entry += (
