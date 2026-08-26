@@ -816,6 +816,19 @@ Common false positive patterns in kernel taint analysis:
    unconditionally — if the server returned fewer bytes than sizeof,
    the copy reads past the buffer end.
 
+9. Tainted trust boundary: when an end-of-buffer pointer or
+   remaining-length variable is DERIVED from a server-supplied field
+   (e.g., OutputBufferLength) without validating it against the actual
+   received buffer size (iov_len), all subsequent bounds checks against
+   that boundary are meaningless — they guard against a fabricated
+   limit, not the real buffer.  A function like posix_info_sid_size()
+   checking ptr + len <= end is sound only if end itself was validated.
+   Do NOT assume a caller's validator covers a specific field — check
+   the validator's postcondition for exactly which fields it validates.
+   If the end pointer is derived from an unvalidated server field, every
+   finding that depends on that boundary is a real bug regardless of
+   how thorough the downstream guards appear.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
