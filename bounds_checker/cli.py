@@ -37,9 +37,14 @@ def main():
     args = parser.parse_args()
 
     if args.list_models:
-        print("Known Claude model IDs (pass to --model or set llm.model in config):\n")
+        print("Known model IDs (pass to --model or set llm.model in config):\n")
         for model_id, desc in KNOWN_MODELS:
             print(f"  {model_id:<36}  {desc}")
+        print("\nProvider is auto-detected from environment variables (first match wins):")
+        print("  GOOGLE_CLOUD_PROJECT          → Gemini via Vertex AI (uses ADC)")
+        print("  GEMINI_API_KEY                → Gemini via API key")
+        print("  ANTHROPIC_VERTEX_PROJECT_ID   → Anthropic via Vertex AI")
+        print("  ANTHROPIC_API_KEY             → Anthropic direct")
         print()
         sys.exit(0)
 

@@ -203,14 +203,13 @@ def _run_prepass(client, model, filepath, fn_name, fn_start, fn_end, checksum,
     )
 
     try:
-        response = client.messages.create(
+        resp = client.generate(
             model=model,
             max_tokens=512,
             system=_PREPASS_SYSTEM,
-            messages=[{'role': 'user', 'content': prompt}],
+            prompt=prompt,
         )
-        text = response.content[0].text.strip()
-        data = json.loads(text)
+        data = json.loads(resp.text)
     except Exception:
         return None
 

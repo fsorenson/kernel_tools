@@ -1,7 +1,7 @@
 """
 Stage 2: LLM Deep Analysis for bounds / data validation findings.
 
-Feeds each flagged finding from Stage 1 to Claude for reasoning about:
+Feeds each flagged finding from Stage 1 to an LLM for reasoning about:
   - Whether the tainted value is genuinely server-supplied
   - Whether any present bounds check is actually sufficient
   - Real impact (OOB read/write, integer overflow, undersized allocation, etc.)
@@ -9,8 +9,10 @@ Feeds each flagged finding from Stage 1 to Claude for reasoning about:
 
 Groups findings by function, sends full or windowed source context.
 
-Gated behind --llm flag.  Uses AnthropicVertex when ANTHROPIC_VERTEX_PROJECT_ID
-is set; falls back to Anthropic() with ANTHROPIC_API_KEY.
+Gated behind --llm flag.  Provider selection via bounds_checker.llm_client:
+  GEMINI_API_KEY                → Google Gemini
+  ANTHROPIC_VERTEX_PROJECT_ID   → Anthropic via Vertex AI
+  ANTHROPIC_API_KEY             → Anthropic direct
 """
 
 import json
@@ -39,9 +41,6 @@ _MAX_CALL_SITES_SHOWN      = 5    # cap on number of call sites included in the 
 
 # Regex for extracting call-site names from annotated source lines.
 _CALL_RE = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
-_VERTEX_REGION = os.environ.get('CLOUD_ML_REGION', 'us-east5')
-if _VERTEX_REGION == 'global':
-    _VERTEX_REGION = 'us-east5'
 
 _CATEGORY_LABELS = {
     'A':     'server-supplied value → pointer arithmetic → memory operation',
@@ -60,24 +59,6 @@ _IMPACT_CHOICES = (
     'oob_read', 'oob_write', 'integer_overflow', 'undersized_alloc',
     'stack_overflow', 'info_disclosure', 'none'
 )
-
-
-# ---------------------------------------------------------------------------
-# Anthropic client
-# ---------------------------------------------------------------------------
-
-def _make_client():
-    project_id = os.environ.get('ANTHROPIC_VERTEX_PROJECT_ID')
-    if project_id:
-        from anthropic import AnthropicVertex
-        return AnthropicVertex(project_id=project_id, region=_VERTEX_REGION)
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if api_key:
-        from anthropic import Anthropic
-        return Anthropic(api_key=api_key)
-    raise RuntimeError(
-        'No Anthropic credentials: set ANTHROPIC_VERTEX_PROJECT_ID or ANTHROPIC_API_KEY'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +179,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
         print("Stage 2 (LLM): disabled — pass --llm to enable")
         return None
 
-    model = (
-        cfg.get('llm', {}).get('model')
-        or os.environ.get('ANTHROPIC_DEFAULT_SONNET_MODEL', 'claude-sonnet-4-6')
-    )
+    cfg_model = cfg.get('llm', {}).get('model')
 
     all_findings = stage1_output.get('findings', [])
     if not all_findings:
@@ -222,7 +200,8 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
         findings = all_findings
 
     try:
-        client = _make_client()
+        from bounds_checker.llm_client import make_client
+        client, model = make_client(model=cfg_model)
     except RuntimeError as e:
         print(f"Stage 2 (LLM): {e}", file=sys.stderr)
         return None
@@ -241,7 +220,8 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     cat_str = (f', cats={",".join(sorted(llm_cat_set))}'
                f' ({len(findings)}/{len(all_findings)} findings)'
                if llm_cat_set else '')
-    print(f"Stage 2 (LLM): analyzing {len(fn_groups)} function(s) with {model}{suffix}{workers_str}{cat_str}")
+    provider_tag = f" [{client.provider}]" if client.provider != 'anthropic' else ''
+    print(f"Stage 2 (LLM): analyzing {len(fn_groups)} function(s) with {model}{provider_tag}{suffix}{workers_str}{cat_str}")
 
     run_dir = Path(run_dir)
     debug_path = run_dir / 'stage2_llm_analysis.debug'
@@ -351,6 +331,7 @@ def run(cfg, run_dir, stage1_output, verbose=False, debug=False, thinking_budget
     output = {
         'stage':              'llm_analysis',
         'model':              model,
+        'provider':           client.provider,
         'source_dirs':        stage1_output.get('source_dirs', []),
         'llm_categories':     sorted(llm_cat_set) if llm_cat_set else None,
         'functions_analyzed': len(all_analyses),
@@ -1162,13 +1143,6 @@ def _call_llm(client, model, prompt, verbose,
     _MIN   = 3072
     _MAX   = 8192
     json_tokens = min(_MAX, max(_MIN, _BASE + n_findings * _PER))
-    kwargs = dict(
-        model=model,
-        max_tokens=json_tokens + thinking_budget if thinking_budget else json_tokens,
-        system=_SYSTEM,
-    )
-    if thinking_budget:
-        kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': thinking_budget}
 
     _RETRY_NOTE = (
         "IMPORTANT: your previous response was not valid JSON.  "
@@ -1192,26 +1166,24 @@ def _call_llm(client, model, prompt, verbose,
     last_exc = None
     for attempt in range(2):
         msg_prompt = (_RETRY_NOTE + prompt) if attempt else prompt
-        kwargs['messages'] = [{'role': 'user', 'content': msg_prompt}]
 
         _dbg(f"{'PROMPT (retry)' if attempt else 'PROMPT'} — {fn_label}", msg_prompt)
 
-        msg = client.messages.create(**kwargs)
+        msg = client.generate(
+            model=model,
+            system=_SYSTEM,
+            prompt=msg_prompt,
+            max_tokens=json_tokens,
+            thinking_budget=thinking_budget,
+        )
 
-        thinking_text = ''
-        response_text = ''
-        for block in msg.content:
-            if block.type == 'thinking':
-                thinking_text = block.thinking
-            elif block.type == 'text':
-                response_text = block.text.strip()
+        response_text = msg.text
 
-        if thinking_text:
-            _dbg(f'THINKING — {fn_label}', thinking_text)
-        usage = msg.usage
+        if msg.thinking:
+            _dbg(f'THINKING — {fn_label}', msg.thinking)
         _dbg(f'RESPONSE — {fn_label}', response_text,
              footer=(f"stop={msg.stop_reason}  "
-                     f"in={usage.input_tokens}  out={usage.output_tokens}"))
+                     f"in={msg.input_tokens}  out={msg.output_tokens}"))
 
         if msg.stop_reason == 'max_tokens':
             raise ValueError(
