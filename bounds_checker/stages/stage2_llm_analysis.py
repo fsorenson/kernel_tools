@@ -782,6 +782,17 @@ Common false positive patterns in kernel taint analysis:
    TOCTOU)?  Does its postcondition cover the flagged offset/size/count?
    If yes, the finding is a false positive.
 
+6. Loop pointer advance with insufficient remaining-size check: when a
+   pointer is advanced inside a loop by a server-supplied offset, and the
+   loop guard only checks remaining_size > 0, the guard is INSUFFICIENT
+   if the next iteration reads struct fields at offsets > 0 — the struct
+   may not fit in the remaining bytes.  The correct guard is
+   remaining_size >= sizeof(*ptr).  Do NOT treat remaining_size > 0 as
+   equivalent to "enough bytes remain for a full struct access."  This is
+   a common real bug, not a false positive — apply the counterexample
+   test: if remaining_size == 1 passes the loop guard but a field at
+   offset 4 is read, that is an OOB read.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
@@ -966,7 +977,11 @@ def _format_findings(findings):
                 f"(b) dacl_offset_valid()+validate_dacl() were called in this function "
                 f"and the dereference is in the caller, not inside the validator; "
                 f"(c) the struct was allocated locally by the kernel (not received from "
-                f"the server) and any le32_to_cpu() reads are of locally-written fields.\n"
+                f"the server) and any le32_to_cpu() reads are of locally-written fields.  "
+                f"Real bug if: the pointer was advanced inside a loop by a server-supplied "
+                f"offset and the loop guard only checks remaining > 0 rather than "
+                f"remaining >= sizeof(*ptr) — a small remaining value passes the guard "
+                f"but the struct field reads are OOB.\n"
             )
         elif f.get('sink_arg_role') == 'narrowed_value':
             entry += (
