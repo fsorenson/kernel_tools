@@ -805,6 +805,17 @@ Common false positive patterns in kernel taint analysis:
    fields as payload.  Both bounds are required: offset >= sizeof(*hdr)
    AND base + offset <= buffer_end.
 
+8. Value inflation after validation: a validated size or length variable
+   may be REASSIGNED to a larger value after the initial bounds check.
+   Do not assume a variable remains bounded by its original assignment —
+   trace every reassignment between the validation point and the sink.
+   If any code path overwrites the variable with a constant or computed
+   value that can exceed the buffer size, the original validation is
+   voided.  Example: ret_data_len is set by an ioctl to actual received
+   bytes, but a later branch sets ret_data_len = sizeof(struct header)
+   unconditionally — if the server returned fewer bytes than sizeof,
+   the copy reads past the buffer end.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
@@ -852,14 +863,20 @@ For each finding above, determine:
    the flagged operation.  For static functions only reachable after a \
    validation gate, they inherit that gate's guarantee.
 
-2a. **Counterexample test** (apply when bounds_check_present is true): \
-   before setting bounds_check_sufficient to false, construct a concrete \
-   counterexample — specific numeric values of the tainted field(s) that \
-   would pass every visible guard yet still cause OOB access.  If the \
-   guards are tight enough that no such counterexample exists, set \
-   bounds_check_sufficient to true even if the check structure looks \
-   unusual.  State in the "notes" field whether you found a counterexample \
-   or could not construct one.
+2a. **Counterexample test** (MANDATORY — apply to EVERY finding, not just \
+   when bounds_check_present is true): before setting real_bug to false, \
+   you MUST attempt to construct a concrete counterexample — specific \
+   numeric values of the tainted field(s) and buffer sizes that would \
+   cause OOB access.  Walk the code path step by step with those values.  \
+   Check: does the tainted variable get REASSIGNED between the guard and \
+   the sink?  If so, re-evaluate with the new value — the original guard \
+   may no longer apply.  Check edge cases: size=0, size=1, offset=0, \
+   offset=sizeof(header)-1, remaining_bytes < sizeof(struct).  If the \
+   guards are tight enough that no counterexample exists, set \
+   bounds_check_sufficient to true.  State in the "notes" field the \
+   specific values you tested and whether they produced OOB or were \
+   caught by a guard.  "No counterexample found" without stating the \
+   values tested is not acceptable.
 
 3. **Real bug**: combining the above, is this a genuine missing-validation bug?
 
