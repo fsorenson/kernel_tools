@@ -262,6 +262,32 @@ def _rhs_has_additive_arith(rhs_node):
     return False
 
 
+# Compound assignment operators.  `acc op= rhs` is `acc = acc op rhs`, so the
+# LHS keeps any taint it already carried and additionally picks up the RHS's —
+# a merge, not a replace.  Size accumulation in kernel protocol parsers is
+# written this way almost exclusively.
+_COMPOUND_ASSIGN_OPS = frozenset({
+    '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=',
+})
+
+
+def _merged_kind(lhs_var, prev, assign_op, var_widths):
+    """
+    Classify the LHS of a compound assignment as 'value' or 'pointer'.
+
+    Unlike the plain-'=' case there is no RHS shape to read the answer off:
+    `p += n` and `acc += n` are the same expression.  Membership in var_widths
+    is authoritative (it is built from scalar integer declarations and skips
+    pointer declarators); failing that, an existing classification wins, and
+    only `+=`/`-=` on an otherwise-unknown name is guessed as pointer walking.
+    """
+    if lhs_var in var_widths:
+        return 'value'
+    if prev:
+        return prev['kind']
+    return 'pointer' if assign_op in ('+=', '-=') else 'value'
+
+
 def _extract_lhs_var(assign_node, source):
     """
     Extract the variable name from the left-hand side of an assignment or
@@ -616,25 +642,44 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
         # ── Taint source: direct assignment or init with taint source in RHS ──
         if node.type in ('assignment_expression', 'init_declarator'):
             children = node.children
-            if len(children) < 3 or children[1].type != '=':
+            if len(children) < 3:
+                continue
+            assign_op = children[1].type
+            is_merge = assign_op in _COMPOUND_ASSIGN_OPS
+            if assign_op != '=' and not is_merge:
                 continue
             rhs = children[2]
             lhs_var = _extract_lhs_var(node, source)
             if lhs_var is None:
                 continue
 
+            prev = tainted.get(lhs_var) if is_merge else None
+
             src_fn = _node_has_taint_source_call(rhs, source)
             if src_fn:
-                kind = 'pointer' if _rhs_has_additive_arith(rhs) else 'value'
+                width = TAINT_SOURCE_WIDTHS.get(src_fn)
+                if is_merge:
+                    kind = _merged_kind(lhs_var, prev, assign_op, var_widths)
+                    # The accumulator's own type bounds the value, not the
+                    # source's; otherwise Cat H fires on every u16 += u32 read.
+                    width = var_widths.get(lhs_var, width)
+                else:
+                    kind = 'pointer' if _rhs_has_additive_arith(rhs) else 'value'
                 tainted[lhs_var] = {
-                    'source_fn': src_fn,
-                    'line': node.start_point[0] + 1,
+                    # An already-tainted accumulator keeps its first contact
+                    # with server data as the reported origin.
+                    'source_fn': prev['source_fn'] if prev else src_fn,
+                    'line': prev['line'] if prev else node.start_point[0] + 1,
                     'kind': kind,
-                    'width': TAINT_SOURCE_WIDTHS.get(src_fn),
+                    'width': width,
                 }
                 # Cat H: assignment_expression narrowing (not init_declarator —
-                # that case is handled in the declaration branch above).
-                if (node.type == 'assignment_expression' and lhs_var in var_widths):
+                # that case is handled in the declaration branch above).  A
+                # compound assignment is an accumulation, not a truncating
+                # store; its overflow belongs to the integer-wrap check, and
+                # treating it as Cat H fires on every `u16 acc += le32_to_cpu()`.
+                if (node.type == 'assignment_expression' and not is_merge
+                        and lhs_var in var_widths):
                     dest_width_h = var_widths[lhs_var]
                     src_width_h = TAINT_SOURCE_WIDTHS.get(src_fn)
                     if src_width_h and src_width_h > dest_width_h:
@@ -670,17 +715,25 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             ref = _node_references_tainted_var(rhs, source, tainted)
             if ref:
                 ref_kind = tainted[ref]['kind']
-                kind = 'pointer' if (
-                    _rhs_has_additive_arith(rhs) or ref_kind == 'pointer'
-                ) else 'value'
+                width = tainted[ref].get('width')   # propagate source width
+                if is_merge:
+                    kind = _merged_kind(lhs_var, prev, assign_op, var_widths)
+                    width = var_widths.get(lhs_var, width)
+                else:
+                    kind = 'pointer' if (
+                        _rhs_has_additive_arith(rhs) or ref_kind == 'pointer'
+                    ) else 'value'
+                origin = prev or tainted[ref]
                 tainted[lhs_var] = {
-                    'source_fn': tainted[ref]['source_fn'],
-                    'line': tainted[ref]['line'],   # keep the original source line
+                    'source_fn': origin['source_fn'],
+                    'line': origin['line'],   # keep the original source line
                     'kind': kind,
-                    'width': tainted[ref].get('width'),  # propagate source width
+                    'width': width,
                 }
-                # Cat H: narrowing via tainted variable (assignment_expression only)
-                if (node.type == 'assignment_expression' and lhs_var in var_widths):
+                # Cat H: narrowing via tainted variable (assignment_expression only;
+                # see the note above for why compound assignments are excluded)
+                if (node.type == 'assignment_expression' and not is_merge
+                        and lhs_var in var_widths):
                     dest_width_h = var_widths[lhs_var]
                     src_width_h = tainted[ref].get('width')
                     if src_width_h and src_width_h > dest_width_h:

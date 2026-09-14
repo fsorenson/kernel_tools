@@ -121,6 +121,23 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       shift-then-mask truncation (e.g. `u8 x = (u32_val >> 24) & 0xFF`) where the
       mask makes the narrowing safe — these require LLM assessment.
 
+- [x] Compound assignment taint propagation — `+= -= *= /= %= &= |= ^= <<= >>=`
+      were skipped outright by the assignment handler, so a variable built up with
+      `acc += le16_to_cpu(...)` never entered the taint table and no downstream sink
+      on it was reachable.  Size accumulation in kernel protocol parsers is written
+      this way almost exclusively.  Treated as a taint *merge* (LHS stays tainted if
+      it already was, and additionally picks up the RHS), keeping the earliest taint
+      line as the reported origin.  Width comes from the accumulator's own
+      declaration rather than the source's, and Cat H is suppressed for the compound
+      forms — an accumulation is not a truncating store, and treating it as one fires
+      on every `u16 acc += le32_to_cpu(x)`.  Pointer-vs-value classification can't be
+      read off the RHS here (`p += n` and `acc += n` are the same expression), so it
+      comes from the scalar-locals table, then any prior classification, then a
+      `+=`/`-=`-only guess.  Recovers the missed Cat B on `kzalloc(nsecdesclen)` in
+      `id_mode_to_cifs_acl()` (Bjoern Doebel's `0ee150794c75`).  Net effect on
+      fs/smb/client: +2 findings, none lost — of 775 compound assignments only 12
+      have a taint source in the RHS, so the `|=` flag-accumulation bulk is inert.
+
 - [x] Parallel LLM calls — `ThreadPoolExecutor` with configurable worker count
       (`llm.workers` in YAML, `--llm-workers N` on CLI, default 4); each worker
       independently calls `_analyze_fn()` for one function; all debug file writes
