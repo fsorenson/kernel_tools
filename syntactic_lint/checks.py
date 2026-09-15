@@ -595,6 +595,51 @@ def _externally_sourced(node):
     return any(n.type in _EXTERNAL_OPERAND for n in _walk(node))
 
 
+def _cursor_pointers(body, source):
+    """Return {var: set(pointers assigned `base + var`)}."""
+    cursors = {}
+    for n in _walk(body):
+        if n.type == 'init_declarator':
+            lhs, rhs = n.children[0], n.children[-1]
+        elif n.type == 'assignment_expression' and len(n.children) >= 3:
+            lhs, rhs = n.children[0], n.children[2]
+        else:
+            continue
+        if lhs.type != 'identifier':
+            continue
+        inner = _unwrap(rhs)
+        if (inner is None or inner.type != 'binary_expression'
+                or len(inner.children) < 3 or inner.children[1].type != '+'):
+            continue
+        ptr = node_text(lhs, source)
+        for side in (inner.children[0], inner.children[2]):
+            side = _unwrap(side)
+            if side is not None and side.type == 'identifier':
+                cursors.setdefault(node_text(side, source), set()).add(ptr)
+    return cursors
+
+
+def _walks_a_record_chain(operands, source, ptrs):
+    """
+    True when the addend is a length field read through a pointer the
+    accumulator itself positioned — `size += le16_to_cpu(pntace->size)` with
+    `pntace = acl_base + size`.  That is a walk over length-prefixed records,
+    and the sum is bounded by the containing object's own size field, so the
+    wrap question belongs to whoever validated the chain rather than here.
+    Deliberately requires a field read and not a mere mention of the pointer:
+    `nsize += cifs_copy_ace(pnntace, ...)` accumulates bytes written, which is
+    the shape this check exists to catch.
+    """
+    for f in _walk(operands):
+        if f.type != 'field_expression':
+            continue
+        base = _unwrap(f.child_by_field_name('argument'))
+        if (base is not None and base.type == 'identifier'
+                and node_text(base, source) in ptrs):
+            return True
+    return False
+
+
 def _sink_uses(body, source, scalars):
     """
     Return {var: [(line, role)]} for variables appearing in a position where a
@@ -692,6 +737,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         return findings
     sinks = _sink_uses(body, source, set(declared))
     flow = _value_flow(body, source)
+    cursors = _cursor_pointers(body, source)
 
     compound = ops['compound']
     binary_op = ops['binary']
@@ -765,6 +811,8 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             'guarded': _relational_guard(var, rhs_ids, body, source, line),
             'in_loop': loop is not None,
             'external': _externally_sourced(operands),
+            'chain': _walks_a_record_chain(operands, source,
+                                           cursors.get(var, ())),
         })
 
     # One accumulator is one bug however many statements feed it; emitting a
@@ -778,8 +826,14 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         guarded = all(s['guarded'] for s in sites)
         in_loop = any(s['in_loop'] for s in sites)
         external = any(s['external'] for s in sites)
+        chain = all(s['chain'] for s in sites)
 
-        if check == 'narrow-sub':
+        if chain:
+            what = (f"{bits}-bit {var!r} walks a chain of length-prefixed "
+                    f"records, stepping by each record's own length field; "
+                    f"the sum is bounded by the container's size, so whether "
+                    f"it can run long depends on who validated the chain")
+        elif check == 'narrow-sub':
             what = (f"unsigned {bits}-bit {var!r} is decremented without "
                     f"establishing that it is large enough; on wrap it becomes "
                     f"nearly 2^{bits}")
@@ -798,7 +852,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         # request-header idiom (`offset = param_offset + params`) — fourteen
         # copies of it in cifssmb.c, none reachable.  Subtraction is exempt:
         # one underflowing decrement is enough, whatever fed it.
-        if role not in _MEMORY_SINKS:
+        if role not in _MEMORY_SINKS or chain:
             severity = 'low'
         elif check == 'narrow-add' and not (in_loop or external):
             severity = 'low'
@@ -812,7 +866,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             f"{through}{more}",
             var=var, bits=bits, sink_role=role, sink_line=sink_line,
             sink_var=via, in_loop=in_loop, possibly_guarded=guarded,
-            external_addend=external,
+            external_addend=external, record_chain=chain,
             sites=[s['line'] for s in sites],
         ))
     return findings

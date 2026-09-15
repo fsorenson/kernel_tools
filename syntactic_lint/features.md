@@ -102,6 +102,17 @@ usable rather than a 72-line wall.
       finding in all of `fs/nfs`); a relational guard on the variable against
       its own operands demotes to medium rather than dropping.
 
+- [x] Record-chain walks — `size += le16_to_cpu(pntace->size)` where
+      `pntace = acl_base + size` is not a size accumulation, it is a cursor
+      stepping through length-prefixed records, and the sum is bounded by the
+      container's own size field. Whether it can run long is a question about
+      whoever validated the chain, not about this loop, so it is reported at
+      `low` with a message that says what it actually is. The test is narrow
+      on purpose: the addend must be a *field read through* a pointer the
+      accumulator positioned. Merely passing that pointer to a call —
+      `nsize += cifs_copy_ace(pnntace, ...)`, which accumulates bytes written
+      — is exactly the shape this check exists for, and stays at `high`.
+
 ## Validation
 
 Each check was developed against a known upstream bug, using the parent commit
@@ -119,22 +130,43 @@ sibling branch stays silent — in `smb2_parse_native_symlink()` the
 `abs_path` copy, whose length *was* measured after the advance, is not
 flagged alongside the `smb_target` one.
 
-Whole-subsystem run over `fs/smb/client` (~80 kLOC, 5 s): **5 findings**, of
-which 4 are real —
+Whole-subsystem run over `fs/smb/client` (~80 kLOC, 5 s) at `b4ea2789e060`:
+**2 findings**, of which 1 is real —
 
-- `reparse.c` `smb2_parse_native_symlink()` — the scan loop, still unfixed in
-  this checkout
 - `reparse.c` `create_native_symlink()` — `plen -= 2 * poff`, still unfixed
-- `cifsacl.c` ×2 — `size += le16_to_cpu(pntace->size)` in both DACL walks, the
-  long-standing integer-wrap case
 - `cifssmb.c` `CIFSSMBNegotiate()` — false positive; `count` accumulates
   `strlen()` over `CIFS_NUM_PROT` (2) short literal protocol names, and the
   comment immediately above the loop says so
 
-`ptr-advance` reports nothing on the current tree, which is correct: that bug
-is fixed in this checkout, and the fixture shows the check catches it.
+`ptr-advance` and `scan-loop` report nothing here, which is correct: both bugs
+are fixed in this checkout (`cb26524ef4ac`, `46a3190c9264`), and the fixtures
+show the checks catch them.
 
 Second tree, as a noise control: `fs/nfs` (~60 kLOC) reports **nothing**.
+
+**Read the 1-of-2 honestly.** It is not a 50% false-positive rate in any
+useful sense — the sample is two, on a tree where every bug the tool was built
+against has already been fixed. What it does say is that the floor is low
+enough that each finding can be read by hand.
+
+**Correction, 2026-09-15.** This section previously claimed 5 findings of
+which 4 were real, counting the two `cifsacl.c` `size += le16_to_cpu(pntace->size)`
+DACL walks as true positives. They are false positives, and the reasoning is
+worth recording because it is the exact failure mode this tool is exposed to:
+`validate_dacl()` (`cifsacl.c:852`) walks the identical chain and checks
+`end_of_dacl - acl_base >= ace_size` before every advance, establishing
+`sizeof(smb_acl) + Σ le16_to_cpu(pace->size) <= dacl_size <= U16_MAX`.
+`build_sec_desc()` is the only caller of either function and calls it at
+`:1456`, bailing before both call sites. So `size` cannot wrap. Worse, the
+linter was pointing at the wrong accumulator in those loops: `nsize`, the one
+that genuinely was dangerous, is already `u32` with `> U16_MAX` checks
+(`0ee150794c75`, `d05045177a85`) — and locally it looks *more* suspicious than
+`size`, not less.
+
+The safety here is a non-local invariant, two frames up, which a per-function
+syntactic check cannot see. The record-chain rule above recovers most of this
+case without leaving the function, but the general problem does not have a
+local answer, and any finding of this shape needs the caller checked by hand.
 
 ## P1 — Not yet
 
