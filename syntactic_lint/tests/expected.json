@@ -90,10 +90,34 @@
     ]
   ],
   "suppress_for_loop_update": [],
+  "suppress_macro_base_offset": [
+    [
+      "narrow-sub",
+      "low",
+      "ntfs_create_inode",
+      379
+    ]
+  ],
+  "suppress_one_shot_difference": [
+    [
+      "narrow-sub",
+      "low",
+      "xive_scan_interrupts",
+      41
+    ]
+  ],
+  "suppress_reflected_subtrahend": [
+    [
+      "narrow-sub",
+      "low",
+      "create_sid_map",
+      24
+    ]
+  ],
   "demote_post_hoc_bound": [
     [
       "narrow-sub",
-      "medium",
+      "low",
       "ntfs_readlink_hlp",
       125
     ]
@@ -123,17 +147,9 @@
     ],
     [
       "narrow-sub",
-      "high",
+      "low",
       "ocfs2_cp_xattr_block_to_bucket",
       48
-    ]
-  ],
-  "suppress_macro_base_offset": [
-    [
-      "narrow-sub",
-      "low",
-      "ntfs_create_inode",
-      379
     ]
   ]
 }

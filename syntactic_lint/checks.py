@@ -584,9 +584,14 @@ def check_scan_loop(fn, body, source, path):
         guarded = _prior_length_evidence(buf, line, body, source)
         findings.append(_finding(
             'scan-loop', 'medium' if guarded else 'high', fn, path, source, line,
+            # Not phrased with strlen(): the same shape occurs over
+            # NULL-terminated pointer arrays (`for (i = 1; info[i]; i++)` over
+            # a `struct hwmon_channel_info * const *`), where strlen means
+            # nothing.
             f"scan of {buf!r} starts at index {start}, so the terminator is "
-            f"never tested for positions 0..{start - 1}; if strlen({buf}) < "
-            f"{start} the loop runs off the end of the buffer unbounded",
+            f"never tested for positions 0..{start - 1}; if {buf} holds fewer "
+            f"than {start} element{'' if start == 1 else 's'} before its "
+            f"terminator the loop runs off the end unbounded",
             buffer=buf, start=start, possibly_guarded=guarded,
         ))
     return findings
@@ -663,6 +668,25 @@ def _walks_a_record_chain(operands, source, ptrs):
                 and node_text(base, source) in ptrs):
             return True
     return False
+
+
+def _spends_down(var, operands, source):
+    """
+    True when `var` is the minuend of `operands`, i.e. the assignment is
+    `var = var - d` and not `var = C - var`.  Subtraction is the one place
+    where "appears on both sides" is not enough to call something a decrement:
+    `sid_map_mask = SID_MAP_MASK - sid_map_mask` is a reflection within a
+    fixed range, and asking whether it underflows is the same unanswerable
+    relational question as any other one-shot difference.
+    """
+    left = operands
+    while True:
+        left = _unwrap(left.children[0])
+        if left is None:
+            return False
+        if left.type != 'binary_expression' or len(left.children) < 3:
+            break
+    return left.type == 'identifier' and node_text(left, source) == var
 
 
 def _sink_uses(body, source, pointers):
@@ -951,6 +975,12 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
                    key=lambda r: (r[0] != var, _SINK_RANK.index(r[1]), r[2]))
 
         rhs_ids = _identifiers(operands, source) - {var}
+        if op == compound:
+            accumulates = True
+        elif check == 'narrow-sub':
+            accumulates = _spends_down(var, operands, source)
+        else:
+            accumulates = var in _identifiers(operands, source)
         hits.setdefault(var, []).append({
             'line': line,
             'bits': bits,
@@ -961,8 +991,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             'external': _externally_sourced(operands),
             'chain': _walks_a_record_chain(operands, source,
                                            cursors.get(var, ())),
-            'accumulates': op == compound or var in _identifiers(operands,
-                                                                 source),
+            'accumulates': accumulates,
         })
 
     # One accumulator is one bug however many statements feed it; emitting a
@@ -988,6 +1017,10 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             what = (f"unsigned {bits}-bit {var!r} is computed as a sum in one "
                     f"expression, so it truncates rather than accumulates; it "
                     f"is wrong only if that single sum can exceed 2^{bits}")
+        elif check == 'narrow-sub' and not accumulates:
+            what = (f"unsigned {bits}-bit {var!r} is computed as a difference "
+                    f"in one expression, so it is wrong only if the subtrahend "
+                    f"can exceed the minuend; nothing here is being spent down")
         elif check == 'narrow-sub':
             what = (f"unsigned {bits}-bit {var!r} is decremented without "
                     f"establishing that it is large enough; on wrap it becomes "
@@ -1008,12 +1041,23 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         # copies of it in cifssmb.c, none reachable.  A one-expression sum is
         # a narrowing computation, which is Cat H's question, not this one:
         # `log2_bits = sb->s_blocksize_bits + 3` was most of what a whole-fs/
-        # run turned up.  Subtraction is exempt from both — one underflowing
-        # decrement is enough, whatever fed it and however it is written.
+        # run turned up.
+        #
+        # Both checks then need the variable to be on both sides.  For addition
+        # that is because one sum rarely reaches 2^bits; for subtraction it is
+        # not — `a - b` wraps the moment b exceeds a.  The reason to demote it
+        # anyway is that the two forms ask different questions.  `x -= d` is a
+        # budget being spent, and the function is the place where the budget's
+        # size is known.  `x = a - b` asks whether b can exceed a, a relational
+        # fact about two values the function was handed, which nothing local can
+        # settle.  Empirically that form is 83% of a whole-kernel run and
+        # essentially all noise (`prio = ffs(xc->pending_prio) - 1`,
+        # `active_tbl = 1 - lq_sta->active_tbl`, 185 more).
         if role not in _MEMORY_SINKS or chain:
             severity = 'low'
-        elif check == 'narrow-add' and not (accumulates
-                                            and (in_loop or external)):
+        elif not accumulates:
+            severity = 'low'
+        elif check == 'narrow-add' and not (in_loop or external):
             severity = 'low'
         else:
             severity = 'medium' if guarded else 'high'

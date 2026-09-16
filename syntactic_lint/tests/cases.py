@@ -156,6 +156,39 @@ CASES = (
     ),
 
     Case(
+        name='suppress_one_shot_difference',
+        rev='b4ea2789e060',
+        path='arch/powerpc/sysdev/xive/common.c',
+        functions=('xive_scan_interrupts',),
+        verdict='clean',
+        note="`prio = ffs(xc->pending_prio) - 1` indexing `xc->queue[prio]`, "
+             "inside `while (xc->pending_prio != 0)` — so `ffs()` is at least "
+             "1.  The guard is on neither operand of the subtraction and no "
+             "local rule will ever connect the two, which is the argument for "
+             "demoting the whole `x = a - b` form: it asks whether one value "
+             "can exceed another, and that is not a question about this "
+             "statement.  185 of the 224 `narrow-sub` findings in a "
+             "whole-kernel run were this shape.  The only non-`fs/` fixture, "
+             "and deliberately so.",
+    ),
+
+    Case(
+        name='suppress_reflected_subtrahend',
+        rev='b4ea2789e060',
+        path='arch/powerpc/kvm/book3s_32_mmu_host.c',
+        functions=('create_sid_map',),
+        verdict='clean',
+        note="`sid_map_mask = SID_MAP_MASK - sid_map_mask` indexing "
+             "`sid_map[sid_map_mask]`.  `kvmppc_sid_hash()` already returns a "
+             "value masked to `SID_MAP_MASK`, so this reflects within a fixed "
+             "range.  Subtraction is the one place where \"appears on both "
+             "sides\" does not mean \"decrement\": the variable has to be the "
+             "minuend.  This case pins that, and it is the reason "
+             "`idx = idx + 1 - delta_ind` in `phy_n.c` is *not* demoted "
+             "alongside it.",
+    ),
+
+    Case(
         name='demote_post_hoc_bound',
         rev='b4ea2789e060',
         path='fs/ntfs3/inode.c',
@@ -165,8 +198,10 @@ CASES = (
              "REPARSE_POINT)` really does underflow — the only preceding guard "
              "is on `size`, the attribute data size, which is independent.  "
              "`if (!ulen || uname + ulen > Add2Ptr(rp, size)) goto out` catches "
-             "it two lines later.  Demoted rather than suppressed, because a "
-             "post-hoc check can still be the wrong check.",
+             "it two lines later.  It sat at `medium` on the post-hoc-bound "
+             "rule until the one-shot-difference rule took it to `low` for a "
+             "different reason; the post-hoc rule now has no fixture of its "
+             "own, and this case pins the composite, not that rule.",
     ),
 
     # -- False positives the tool cannot yet clear -------------------------

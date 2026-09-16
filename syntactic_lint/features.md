@@ -48,7 +48,8 @@ Shares parsing infrastructure with the other two tools
 - [x] **`narrow-sub`** — a narrow unsigned local decremented with no
       lower-bound test, where the result then reaches memory.  One underflowing
       `-=` is enough to produce a near-`2^bits` length whatever fed it, so
-      unlike `narrow-add` this check makes no demand on the operands.
+      unlike `narrow-add` this check makes no demand on the operands — but it
+      does demand a decrement; see the one-shot-difference rule below.
 
 - [x] **`narrow-add`** — a narrow unsigned local accumulated past its width,
       where the result then reaches memory.  Both `acc += n` and
@@ -120,6 +121,23 @@ usable rather than a 72-line wall.
       the nine `narrow-add` hits in a whole-`fs/` run were this
       (`log2_bits = sb->s_blocksize_bits + 3`).
 
+- [x] One-shot differences — `x = a - b` is not a decrement, and the message
+      saying it was "decremented" was false for 185 of the 224 `narrow-sub`
+      findings in a whole-kernel run. The two forms ask different questions.
+      `x -= d` is a budget being spent, and the function is where the budget's
+      size is known. `x = a - b` asks whether `b` can exceed `a` — a relational
+      fact about two values the function was handed, which nothing local can
+      settle. So `narrow-sub` now demands the variable on both sides before it
+      will report above `low`, the same `accumulates` test `narrow-add` already
+      used. `prio = ffs(xc->pending_prio) - 1` is the archetype: the guard is
+      `while (xc->pending_prio != 0)`, which mentions neither operand.
+
+      One refinement that "appears on both sides" does not give you: the
+      variable has to be the *minuend*. `sid_map_mask = SID_MAP_MASK -
+      sid_map_mask` is a reflection within a fixed range, not a decrement, and
+      it is the same relational question again. `idx = idx + 1 - delta_ind`,
+      whose leftmost operand really is `idx`, stays.
+
 - [x] Declared-pointer base — `base + off` is a buffer offset only when `base`
       is declared a pointer somewhere in the function, parameters included.
       Asking merely that it not be a *known integer local* let a macro through:
@@ -175,10 +193,10 @@ flagged alongside the `smb_target` one.
 
     python3 -m syntactic_lint.tests.test_checks     # or: pytest syntactic_lint/tests/
 
-Thirteen cases in `tests/`, running in about a fifth of a second. Three are the
-pre-fix bugs above; the rest are functions that the whole-`fs/` run reported
-and a hand triage cleared, so each suppression is pinned against the exact
-code that motivated it rather than against an invented reproduction. Every
+Fifteen cases in `tests/`, running in about a fifth of a second. Three are the
+pre-fix bugs above; the rest are functions that a whole-tree run reported and a
+hand triage cleared, so each suppression is pinned against the exact code that
+motivated it rather than against an invented reproduction. Every
 fixture is verbatim kernel source, extracted from a named revision by
 
     python3 -m syntactic_lint.tests.extract --kernel-source /home/src/linux
@@ -273,6 +291,43 @@ number is the reason the memory-reaching requirement and the unbounded-input
 rule are defaults rather than options: `low` is where narrowing arithmetic that
 nobody has shown to be reachable goes to be ignored, and reading it is a
 different activity from reading the six.
+
+## Whole-kernel run
+
+The user ran the whole tree (~30 MLOC) at `d6aa84234686` on 2026-09-16: 11
+minutes, **356 findings**, 256 of them `high`. Triaging that number rather than
+the findings turned up one defect worth the name. Of the 224 `narrow-sub`
+hits, 185 were the `x = a - b` assignment form, so the message — "is
+decremented without establishing that it is large enough" — was simply false
+for 83% of them; the one-shot-difference and reflected-subtrahend rules above
+are the fix. Same tree after: **176 findings, 127 `high`**, with `narrow-sub`
+down 224 → 44 and `narrow-add` unchanged at 128, which is the check-level
+evidence that the rewrite did not leak across.
+
+`drivers/net` is 63 of the 127 `high`, and the shape it contributes is
+uniform: a narrow cursor advanced by a literal inside a loop over a
+fixed-extent table (`offset += 3`, `chnlgroup += 4`, `offs += 2`). 28 of the 94
+`high` `narrow-add` findings are a literal addend inside a loop and 4 more a
+`sizeof`; in every one sampled the bound is the loop's own trip count, which is
+exactly the argument the for-update suppression already makes in the
+degenerate case. **Loop trip counts are the next precision lever**, and they
+are worth more than callee parameter roles now. The discriminator has to be
+the loop bound and not the addend: `nsize += cifs_copy_ace(...)` sits in a loop
+whose trip count comes off the wire, and must stay.
+
+A smaller one, 8 of the 94: `len += scnprintf(buf + len, SIZE - len, ...)`,
+where the accumulator is both the offset and part of the size argument of the
+same call. `scnprintf` returns at most `size - 1`, so the idiom is
+self-bounding and recognisable without leaving the statement.
+
+`scan-loop` reports 4 across 30 MLOC, which is the signal-to-noise the check
+was built for. One is the known `reparse.c:970`; two are selftests;
+`drivers/hwmon/hwmon.c:275` is `for (i = 1; info[i]; i++)` over a
+NULL-terminated `const struct hwmon_channel_info * const *`, live only if a
+driver registers a `chip->info` whose first element is already NULL —
+`hwmon_device_register_with_info()` checks `!chip->info` at `:1074` but not
+`info[0]`. Not attacker-reachable. That case is also why the message no longer
+says `strlen()`.
 
 ## P1 — Not yet
 
