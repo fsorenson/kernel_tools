@@ -120,6 +120,15 @@ usable rather than a 72-line wall.
       the nine `narrow-add` hits in a whole-`fs/` run were this
       (`log2_bits = sb->s_blocksize_bits + 3`).
 
+- [x] Declared-pointer base — `base + off` is a buffer offset only when `base`
+      is declared a pointer somewhere in the function, parameters included.
+      Asking merely that it not be a *known integer local* let a macro through:
+      `asize = SIZEOF_NONRESIDENT + ALIGN(err, 8)` was recorded as a pointer
+      offset, and `ntfs_create_inode()`'s `t16` was then reported as reaching
+      it "via `err`", which is nonsense. Losing a sink is cheap here — pointer
+      offset is the lowest-ranked memory role — and the archetype
+      (`nacl_base + nsize`, a `char *` parameter) still works.
+
 - [x] Pointer differences — `max_non_overlap = dp_addr - dp_back_addr` is a
       distance between two pointers into one object, not a narrow quantity
       being spent down. Whoever ordered the two pointers ordered them; there is
@@ -166,7 +175,7 @@ flagged alongside the `smb_target` one.
 
     python3 -m syntactic_lint.tests.test_checks     # or: pytest syntactic_lint/tests/
 
-Twelve cases in `tests/`, running in about a fifth of a second. Three are the
+Thirteen cases in `tests/`, running in about a fifth of a second. Three are the
 pre-fix bugs above; the rest are functions that the whole-`fs/` run reported
 and a hand triage cleared, so each suppression is pinned against the exact
 code that motivated it rather than against an invented reproduction. Every
@@ -236,8 +245,8 @@ local answer, and any finding of this shape needs the caller checked by hand.
 The real coverage test, run at `b4ea2789e060`: all of `fs/` (~1.5 MLOC) in 32 s.
 The first pass gave **17 findings**, and three of them were checker defects
 rather than kernel bugs — the constant lower bound, the overflow rollback and
-the single-expression sum above. Fixing those and adding the two later
-suppressions gives **7**, of which 3 are `high`:
+the single-expression sum above. Fixing those and adding the three later
+suppressions gives **6**, of which 2 are `high`:
 
 | Finding | Verdict |
 |---|---|
@@ -245,21 +254,25 @@ suppressions gives **7**, of which 3 are `high`:
 | `ocfs2/xattr.c:4457` `size = blocksize - offset` | FP — `ocfs2_validate_xattr_entries_flat()` rejects `xe_name_offset > region_size` when the block is read, and `region_size` is `blocksize - off_change` |
 | `smb/server/smbacl.c:839` `size += le16_to_cpu(pace->size)` | FP — five ACEs over fixed SIDs; the POSIX-ACL path `goto out`s before these and uses `check_add_overflow()` throughout |
 | `ntfs/compress.c:426` `length -= max_non_overlap` | FP — the `else` arm of `if (length <= max_non_overlap)` |
-| `ntfs3/inode.c:1742` `t16 = sbi->record_size - t16 - SIZEOF_NONRESIDENT` | FP — `t16` is `PtrOffset(rec, attr)`, an offset into the record it is subtracted from |
 | `ntfs3/inode.c:2230` `ulen = ...ReparseDataLength - sizeof(...)` | FP — underflows for real, caught at the next line |
 | `smb/client/cifssmb.c:466` `count += len` | FP — known; two short literal protocol names |
 
-One real bug in 1.5 MLOC is not a yield to boast about, but the tree is one
-where every bug the tool was built against is already fixed, and 7 findings is
-an afternoon's reading. The three that remain `high` are the two whose safety
-argument lives outside the function (`ocfs2`, `ksmbd`) plus the real one, which
-is the shape the tool is for.
+A seventh, `ntfs3/inode.c:1742` `t16 = sbi->record_size - t16 -
+SIZEOF_NONRESIDENT`, was a defect of its own and is documented under the
+declared-pointer base above. `t16`'s genuinely dangerous use is as the
+output-buffer size argument to `run_pack()`, which the sink table still has no
+name for; callee parameter roles are the obvious next lever.
 
-The one finding worth a second look regardless of verdict is
-`ntfs3/inode.c:1742`: `t16`'s dangerous use is as the output-buffer size
-argument to `run_pack()`, which the sink table has no name for, so the finding
-cites a nonsense `pointer offset (via 'err')` instead. Callee-parameter roles
-are the obvious next lever and are not implemented.
+One real bug in 1.5 MLOC is not a yield to boast about, but the tree is one
+where every bug the tool was built against is already fixed, and 6 findings is
+an afternoon's reading. The two that remain `high` are the real one and
+`ocfs2`, whose safety argument lives in a validator called on the read path.
+
+Below `medium` the tree yields 117, essentially all `narrow-add` (103). That
+number is the reason the memory-reaching requirement and the unbounded-input
+rule are defaults rather than options: `low` is where narrowing arithmetic that
+nobody has shown to be reachable goes to be ignored, and reading it is a
+different activity from reading the six.
 
 ## P1 — Not yet
 
@@ -277,6 +290,6 @@ are the obvious next lever and are not implemented.
       a table of known length parameters, or a one-pass scan of callee
       signatures in the same file, would
 - [ ] The suite pins per-function behaviour but nothing tree-wide; a change
-      that leaves all twelve cases green and adds forty findings to `fs/` would
-      pass. A recorded whole-`fs/` count, checked against a kernel tree when
-      one is available, would close that
+      that leaves all thirteen cases green and adds forty findings to `fs/`
+      would pass. The counts are recorded above (6 at medium, 117 at low, at
+      `b4ea2789e060`) but nothing checks them

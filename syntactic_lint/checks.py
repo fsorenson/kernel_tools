@@ -223,9 +223,16 @@ def _declared_unsigned_widths(body, source):
 
 
 def _declared_pointers(body, source):
-    """Return the set of locals declared with a pointer declarator."""
+    """
+    Return the set of locals and parameters declared with a pointer declarator.
+    Scans the whole function definition, not just the body: `nacl_base + nsize`
+    is the archetypal buffer offset and `nacl_base` is a parameter.
+    """
+    root = body
+    if root.parent is not None and root.parent.type == 'function_definition':
+        root = root.parent
     names = set()
-    for n in _walk(body):
+    for n in _walk(root):
         if n.type not in ('declaration', 'parameter_declaration'):
             continue
         for d in _walk(n):
@@ -658,11 +665,12 @@ def _walks_a_record_chain(operands, source, ptrs):
     return False
 
 
-def _sink_uses(body, source, scalars):
+def _sink_uses(body, source, pointers):
     """
     Return {var: [(line, role)]} for variables appearing in a position where a
-    wrapped value does damage.  `scalars` names the known integer locals, used
-    to tell `base + off` pointer arithmetic from ordinary integer addition.
+    wrapped value does damage.  `pointers` names the locals and parameters
+    declared as pointers, which is what tells `base + off` pointer arithmetic
+    from ordinary integer addition.
     """
     uses = {}
 
@@ -690,11 +698,13 @@ def _sink_uses(body, source, scalars):
         elif n.type == 'binary_expression' and len(n.children) >= 3:
             if n.children[1].type == '+':
                 left = _unwrap(n.children[0])
-                # Only count this as building a pointer when the base is not
-                # itself integer arithmetic — `sizeof(*buf) + plen` is a size
-                # computation, `nacl_base + nsize` is an offset into a buffer.
+                # This is an offset into a buffer only if the base really is a
+                # declared pointer.  Requiring that, rather than merely "not a
+                # known integer", is what keeps `SIZEOF_NONRESIDENT + ALIGN(err,
+                # 8)` and `sizeof(*buf) + plen` out: both have an identifier on
+                # the left that no declaration in the function claims.
                 if (left is not None and left.type == 'identifier'
-                        and node_text(left, source) not in scalars):
+                        and node_text(left, source) in pointers):
                     record(n.children[2], 'pointer offset')
         elif n.type == 'return_statement':
             for child in n.children:
@@ -852,10 +862,10 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
     widths = {v: b for v, b in declared.items() if b <= max_bits}
     if not widths:
         return findings
-    sinks = _sink_uses(body, source, set(declared))
+    pointers = _declared_pointers(body, source)
+    sinks = _sink_uses(body, source, pointers)
     flow = _value_flow(body, source)
     cursors = _cursor_pointers(body, source)
-    pointers = _declared_pointers(body, source)
 
     compound = ops['compound']
     binary_op = ops['binary']

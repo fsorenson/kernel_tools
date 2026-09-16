@@ -139,6 +139,23 @@ CASES = (
     ),
 
     Case(
+        name='suppress_macro_base_offset',
+        rev='b4ea2789e060',
+        path='fs/ntfs3/inode.c',
+        functions=('ntfs_create_inode',),
+        verdict='clean',
+        note="`t16 = sbi->record_size - t16 - SIZEOF_NONRESIDENT` was reported "
+             "as reaching a `pointer offset (via 'err')`, which is nonsense: "
+             "the cited line is `asize = SIZEOF_NONRESIDENT + ALIGN(err, 8)`, "
+             "and the sink test had only asked that the left operand of a `+` "
+             "not be a known integer local.  A macro constant passes that.  It "
+             "now has to be a declared pointer, so the finding loses its only "
+             "memory-reaching sink and drops.  `t16`'s genuinely dangerous use "
+             "is as the output-buffer size argument to `run_pack()`, which the "
+             "sink table still has no name for.",
+    ),
+
+    Case(
         name='demote_post_hoc_bound',
         rev='b4ea2789e060',
         path='fs/ntfs3/inode.c',

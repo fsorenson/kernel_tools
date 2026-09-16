@@ -127,5 +127,13 @@
       "ocfs2_cp_xattr_block_to_bucket",
       48
     ]
+  ],
+  "suppress_macro_base_offset": [
+    [
+      "narrow-sub",
+      "low",
+      "ntfs_create_inode",
+      379
+    ]
   ]
 }
