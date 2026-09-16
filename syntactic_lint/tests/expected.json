@@ -1,0 +1,131 @@
+{
+  "ptr_advance_smb2_parse_native_symlink": [
+    [
+      "ptr-advance",
+      "high",
+      "smb2_parse_native_symlink",
+      180
+    ],
+    [
+      "scan-loop",
+      "high",
+      "smb2_parse_native_symlink",
+      166
+    ]
+  ],
+  "narrow_sub_create_native_symlink": [
+    [
+      "narrow-add",
+      "low",
+      "create_native_symlink",
+      180
+    ],
+    [
+      "narrow-sub",
+      "high",
+      "create_native_symlink",
+      178
+    ]
+  ],
+  "narrow_add_dacl_accumulators": [
+    [
+      "narrow-add",
+      "high",
+      "populate_new_aces",
+      35
+    ],
+    [
+      "narrow-add",
+      "high",
+      "replace_sids_and_copy_aces",
+      157
+    ],
+    [
+      "narrow-add",
+      "high",
+      "set_chmod_dacl",
+      221
+    ],
+    [
+      "narrow-add",
+      "low",
+      "replace_sids_and_copy_aces",
+      156
+    ],
+    [
+      "narrow-add",
+      "low",
+      "set_chmod_dacl",
+      225
+    ]
+  ],
+  "suppress_constant_floor": [],
+  "suppress_overflow_rollback": [],
+  "suppress_pointer_difference": [
+    [
+      "narrow-add",
+      "low",
+      "ntfs_decompress",
+      126
+    ],
+    [
+      "narrow-add",
+      "low",
+      "ntfs_decompress",
+      283
+    ],
+    [
+      "narrow-sub",
+      "medium",
+      "ntfs_decompress",
+      309
+    ]
+  ],
+  "suppress_single_expression_sum": [
+    [
+      "narrow-add",
+      "low",
+      "wnd_find",
+      171
+    ]
+  ],
+  "suppress_for_loop_update": [],
+  "demote_post_hoc_bound": [
+    [
+      "narrow-sub",
+      "medium",
+      "ntfs_readlink_hlp",
+      125
+    ]
+  ],
+  "fp_negotiate_protocol_names": [
+    [
+      "narrow-add",
+      "high",
+      "CIFSSMBNegotiate",
+      53
+    ]
+  ],
+  "fp_ksmbd_set_mode_dacl": [
+    [
+      "narrow-add",
+      "high",
+      "set_mode_dacl",
+      168
+    ]
+  ],
+  "fp_ocfs2_xattr_block_to_bucket": [
+    [
+      "narrow-add",
+      "low",
+      "ocfs2_cp_xattr_block_to_bucket",
+      47
+    ],
+    [
+      "narrow-sub",
+      "high",
+      "ocfs2_cp_xattr_block_to_bucket",
+      48
+    ]
+  ]
+}

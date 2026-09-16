@@ -162,6 +162,37 @@ sibling branch stays silent — in `smb2_parse_native_symlink()` the
 `abs_path` copy, whose length *was* measured after the advance, is not
 flagged alongside the `smb_target` one.
 
+### Regression suite
+
+    python3 -m syntactic_lint.tests.test_checks     # or: pytest syntactic_lint/tests/
+
+Twelve cases in `tests/`, running in about a fifth of a second. Three are the
+pre-fix bugs above; the rest are functions that the whole-`fs/` run reported
+and a hand triage cleared, so each suppression is pinned against the exact
+code that motivated it rather than against an invented reproduction. Every
+fixture is verbatim kernel source, extracted from a named revision by
+
+    python3 -m syntactic_lint.tests.extract --kernel-source /home/src/linux
+
+Whole functions rather than whole files, which is safe because every check is
+an invariant over one function body, and which keeps the corpus at ~2 kLOC
+instead of 130 KB of GPL source in a repository that is not the kernel.
+`cases.py` carries the provenance and the hand-written verdict for each case;
+`expected.json` carries the finding set and is machine-written by `--update`,
+so an update diff can never quietly rewrite an argument a human made.
+
+Two properties are worth stating because they are what make the suite useful
+rather than decorative. It compares the **whole** finding set per fixture, so a
+new finding fails as loudly as a lost one — the tool's value is its silence,
+and a change that makes it noisier somewhere unrelated is exactly what would
+otherwise go unnoticed. And expectations are recorded at `--min-severity low`,
+so demotions are pinned: `narrow_add_dacl_accumulators` fails if the two `size`
+cursors are ever promoted out of `low`, not only if they vanish.
+
+Three cases have verdict `fp` — findings a human still has to clear
+(`CIFSSMBNegotiate`, `set_mode_dacl`, `ocfs2_cp_xattr_block_to_bucket`). They
+are pinned as-is so that a future precision lever shows up here as a diff.
+
 Whole-subsystem run over `fs/smb/client` (~80 kLOC, 5 s) at `b4ea2789e060`:
 **2 findings**, of which 1 is real —
 
@@ -245,5 +276,7 @@ are the obvious next lever and are not implemented.
       wrapped value as an output-buffer size and the sink table cannot see it;
       a table of known length parameters, or a one-pass scan of callee
       signatures in the same file, would
-- [ ] No test suite — the fixtures live in `/tmp` and the expected lines are
-      recorded in the table above rather than in code
+- [ ] The suite pins per-function behaviour but nothing tree-wide; a change
+      that leaves all twelve cases green and adds forty findings to `fs/` would
+      pass. A recorded whole-`fs/` count, checked against a kernel tree when
+      one is available, would close that
