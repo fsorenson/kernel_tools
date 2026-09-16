@@ -102,6 +102,38 @@ usable rather than a 72-line wall.
       finding in all of `fs/nfs`); a relational guard on the variable against
       its own operands demotes to medium rather than dropping.
 
+- [x] Constant lower bound — against a literal subtrahend an earlier
+      `if (len > 2)` or `if (!len) return` settles the question outright, so it
+      suppresses rather than demotes. `_relational_guard` cannot: it wants an
+      identifier on both sides, and `len -= 2` has none.
+
+- [x] Overflow rollback — `if (check_add_overflow(size, n, &size)) size -= n;`.
+      The helper already stored the wrapped sum, so the `-=` is an undo. The
+      call is in the condition and the subtraction in the body, which is why
+      looking for a `_SAFE_ARITH` call *around* the arithmetic misses it.
+
+- [x] Single-expression sums — `x = a + b` truncates, it does not accumulate,
+      and saying otherwise was simply false. `narrow-add` now demands that the
+      variable appear on both sides (`x += n`, or `x = x + n`) before it will
+      call anything an accumulation; a one-shot narrowing sum is reported at
+      low with a message that says which question it actually raises. Seven of
+      the nine `narrow-add` hits in a whole-`fs/` run were this
+      (`log2_bits = sb->s_blocksize_bits + 3`).
+
+- [x] Pointer differences — `max_non_overlap = dp_addr - dp_back_addr` is a
+      distance between two pointers into one object, not a narrow quantity
+      being spent down. Whoever ordered the two pointers ordered them; there is
+      nothing here for a lower-bound test to say.
+
+- [x] Post-hoc bounds — a comparison on the variable sitting *between* the
+      arithmetic and the sink demotes to medium. `ulen = le16_to_cpu(
+      rp->ReparseDataLength) - sizeof(struct REPARSE_POINT)` in
+      `ntfs_readlink_hlp()` really does underflow, and
+      `if (!ulen || uname + ulen > Add2Ptr(rp, size)) goto out` really does
+      catch it. Demotion, not suppression: the check can still be the wrong
+      one. Verified against the known-real `plen -= 2 * poff`, which has no
+      comparison on `plen` anywhere between line 234 and the `memcpy` at 252.
+
 - [x] Record-chain walks — `size += le16_to_cpu(pntace->size)` where
       `pntace = acl_base + size` is not a size accumulation, it is a cursor
       stepping through length-prefixed records, and the sum is bounded by the
@@ -168,6 +200,36 @@ syntactic check cannot see. The record-chain rule above recovers most of this
 case without leaving the function, but the general problem does not have a
 local answer, and any finding of this shape needs the caller checked by hand.
 
+## Whole-`fs/` run
+
+The real coverage test, run at `b4ea2789e060`: all of `fs/` (~1.5 MLOC) in 32 s.
+The first pass gave **17 findings**, and three of them were checker defects
+rather than kernel bugs — the constant lower bound, the overflow rollback and
+the single-expression sum above. Fixing those and adding the two later
+suppressions gives **7**, of which 3 are `high`:
+
+| Finding | Verdict |
+|---|---|
+| `smb/client/reparse.c:234` `plen -= 2 * poff` | **real**, still unfixed |
+| `ocfs2/xattr.c:4457` `size = blocksize - offset` | FP — `ocfs2_validate_xattr_entries_flat()` rejects `xe_name_offset > region_size` when the block is read, and `region_size` is `blocksize - off_change` |
+| `smb/server/smbacl.c:839` `size += le16_to_cpu(pace->size)` | FP — five ACEs over fixed SIDs; the POSIX-ACL path `goto out`s before these and uses `check_add_overflow()` throughout |
+| `ntfs/compress.c:426` `length -= max_non_overlap` | FP — the `else` arm of `if (length <= max_non_overlap)` |
+| `ntfs3/inode.c:1742` `t16 = sbi->record_size - t16 - SIZEOF_NONRESIDENT` | FP — `t16` is `PtrOffset(rec, attr)`, an offset into the record it is subtracted from |
+| `ntfs3/inode.c:2230` `ulen = ...ReparseDataLength - sizeof(...)` | FP — underflows for real, caught at the next line |
+| `smb/client/cifssmb.c:466` `count += len` | FP — known; two short literal protocol names |
+
+One real bug in 1.5 MLOC is not a yield to boast about, but the tree is one
+where every bug the tool was built against is already fixed, and 7 findings is
+an afternoon's reading. The three that remain `high` are the two whose safety
+argument lives outside the function (`ocfs2`, `ksmbd`) plus the real one, which
+is the shape the tool is for.
+
+The one finding worth a second look regardless of verdict is
+`ntfs3/inode.c:1742`: `t16`'s dangerous use is as the output-buffer size
+argument to `run_pack()`, which the sink table has no name for, so the finding
+cites a nonsense `pointer offset (via 'err')` instead. Callee-parameter roles
+are the obvious next lever and are not implemented.
+
 ## P1 — Not yet
 
 - [ ] `--min-severity` on the JSON path — the filter is applied in the CLI, so
@@ -179,8 +241,9 @@ local answer, and any finding of this shape needs the caller checked by hand.
       `abs_path` family without loosening the literal-only rule
 - [ ] 32-bit wrap tuning — `--max-bits 32` is wired up but unmeasured; the
       unbounded-input rule probably needs to be stricter before it is usable
-- [ ] Coverage beyond `fs/smb/client` and `fs/nfs` — the checks are
-      subsystem-agnostic, but a tree with no findings at all only proves the
-      floor is low, not that the checks generalise
+- [ ] Callee parameter roles — `run_pack(..., buf, t16, ...)` passes a
+      wrapped value as an output-buffer size and the sink table cannot see it;
+      a table of known length parameters, or a one-pass scan of callee
+      signatures in the same file, would
 - [ ] No test suite — the fixtures live in `/tmp` and the expected lines are
       recorded in the table above rather than in code

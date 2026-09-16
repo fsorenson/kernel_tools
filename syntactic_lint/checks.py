@@ -222,6 +222,24 @@ def _declared_unsigned_widths(body, source):
     return widths
 
 
+def _declared_pointers(body, source):
+    """Return the set of locals declared with a pointer declarator."""
+    names = set()
+    for n in _walk(body):
+        if n.type not in ('declaration', 'parameter_declaration'):
+            continue
+        for d in _walk(n):
+            if d.type != 'pointer_declarator':
+                continue
+            inner = d.child_by_field_name('declarator')
+            while inner is not None and inner.type in ('pointer_declarator',
+                                                       'parenthesized_declarator'):
+                inner = inner.child_by_field_name('declarator')
+            if inner is not None and inner.type == 'identifier':
+                names.add(node_text(inner, source))
+    return names
+
+
 # ---------------------------------------------------------------------------
 # ptr-advance: pointer offset applied without the matching length adjustment
 # ---------------------------------------------------------------------------
@@ -729,6 +747,105 @@ def _relational_guard(var, other_ids, body, source, before_line):
     return False
 
 
+def _bounded_after(var, body, source, after_line, sink_line):
+    """
+    True if some comparison mentioning var sits between the arithmetic and the
+    sink.  `ulen = le16_to_cpu(rp->ReparseDataLength) - sizeof(...)` underflows
+    for real, then `if (!ulen || uname + ulen > end) goto out` catches it before
+    the subscript — the author validated after computing rather than before.
+    Unlike _relational_guard this does not require the comparison to mention an
+    operand: by this point the wrapped value is the only thing worth testing.
+    Demotes rather than suppresses, since the check can still be the wrong one.
+    """
+    for n in _walk(body):
+        if n.type != 'binary_expression' or len(n.children) < 3:
+            continue
+        if n.children[1].type not in ('<', '<=', '>', '>=', '==', '!='):
+            continue
+        line = _line(n)
+        if after_line < line <= sink_line and var in _identifiers(n, source):
+            return True
+    return False
+
+
+def _constant_operand(node, source):
+    """Value of an all-literal arithmetic expression, or None."""
+    node = _unwrap(node)
+    if node is None:
+        return None
+    lit = _int_literal(node, source)
+    if lit is not None:
+        return lit
+    if node.type == 'binary_expression' and len(node.children) >= 3:
+        a = _constant_operand(node.children[0], source)
+        b = _constant_operand(node.children[2], source)
+        op = node.children[1].type
+        if a is None or b is None:
+            return None
+        return {'+': a + b, '-': a - b, '*': a * b,
+                '<<': a << b, '>>': a >> b}.get(op)
+    return None
+
+
+def _constant_lower_bound(var, body, source, before_line):
+    """
+    Greatest K for which an earlier condition establishes `var >= K`, or None.
+    Unlike _relational_guard this is decidable rather than suggestive: against
+    a constant subtrahend it settles the question, so it suppresses outright
+    instead of demoting.  `!var` counts — an early `if (!ulen) goto out` is how
+    a decrement-by-one is usually protected.
+    """
+    best = None
+    for n in _walk(body):
+        if _line(n) > before_line:
+            continue
+        bound = None
+        if n.type == 'unary_expression' and len(n.children) == 2 \
+                and n.children[0].type == '!':
+            operand = _unwrap(n.children[1])
+            if operand is not None and operand.type == 'identifier' \
+                    and node_text(operand, source) == var:
+                bound = 1
+        elif n.type == 'binary_expression' and len(n.children) >= 3:
+            op = n.children[1].type
+            left, right = _unwrap(n.children[0]), _unwrap(n.children[2])
+            if left is not None and left.type == 'identifier' \
+                    and node_text(left, source) == var:
+                c = _constant_operand(right, source)
+                if c is not None:
+                    bound = {'>': c + 1, '>=': c, '!=': 1 if c == 0 else None,
+                             '==': c}.get(op)
+            elif right is not None and right.type == 'identifier' \
+                    and node_text(right, source) == var:
+                c = _constant_operand(left, source)
+                if c is not None:
+                    bound = {'<': c + 1, '<=': c, '!=': 1 if c == 0 else None,
+                             '==': c}.get(op)
+        if bound is not None and (best is None or bound > best):
+            best = bound
+    return best
+
+
+def _undoes_overflow_check(node, var, source):
+    """
+    True for the rollback arm of `if (check_add_overflow(a, b, &a)) a -= b;`.
+    The helper has already stored the wrapped sum, so the subtraction restores
+    the pre-add value — it is an undo, not arithmetic on a live quantity.
+    """
+    cur = node.parent
+    while cur is not None:
+        if cur.type == 'if_statement':
+            cond = cur.child_by_field_name('condition')
+            if cond is not None:
+                for c in _walk(cond):
+                    if (c.type == 'call_expression'
+                            and _callee(c, source) in _SAFE_ARITH
+                            and var in _identifiers(c, source)):
+                        return True
+        cur = cur.parent
+    return False
+
+
 def _narrow_arith(fn, body, source, path, check, ops, max_bits):
     findings = []
     declared = _declared_unsigned_widths(body, source)
@@ -738,6 +855,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
     sinks = _sink_uses(body, source, set(declared))
     flow = _value_flow(body, source)
     cursors = _cursor_pointers(body, source)
+    pointers = _declared_pointers(body, source)
 
     compound = ops['compound']
     binary_op = ops['binary']
@@ -770,6 +888,25 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         line = _line(n)
         if _enclosing_call(n, source, _SAFE_ARITH) is not None:
             continue
+        if _undoes_overflow_check(n, var, source):
+            continue
+        # `max_non_overlap = dp_addr - dp_back_addr` is a distance between two
+        # pointers into the same object, not a decrement: whoever ordered them
+        # ordered them, and there is no narrow quantity being spent down.
+        if op == '=' and check == 'narrow-sub' and all(
+                (s := _unwrap(side)) is not None and s.type == 'identifier'
+                and node_text(s, source) in pointers
+                for side in (operands.children[0], operands.children[2])):
+            continue
+        # Against a constant change, a constant lower bound settles it:
+        # `if (len > 2) len -= 2` is safe, and no amount of sink analysis
+        # makes it otherwise.
+        delta = _constant_operand(operands if op == compound
+                                  else operands.children[2], source)
+        if delta is not None and check == 'narrow-sub':
+            floor_ = _constant_lower_bound(var, body, source, line)
+            if floor_ is not None and floor_ >= delta:
+                continue
         # A for-update is bounded by its own condition, or the loop never ends.
         # (Compare ids: the bindings hand back a fresh Node per lookup.)
         parent = n.parent
@@ -808,11 +945,14 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             'line': line,
             'bits': bits,
             'sink': sink,
-            'guarded': _relational_guard(var, rhs_ids, body, source, line),
+            'guarded': (_relational_guard(var, rhs_ids, body, source, line)
+                        or _bounded_after(var, body, source, line, sink[2])),
             'in_loop': loop is not None,
             'external': _externally_sourced(operands),
             'chain': _walks_a_record_chain(operands, source,
                                            cursors.get(var, ())),
+            'accumulates': op == compound or var in _identifiers(operands,
+                                                                 source),
         })
 
     # One accumulator is one bug however many statements feed it; emitting a
@@ -827,12 +967,17 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         in_loop = any(s['in_loop'] for s in sites)
         external = any(s['external'] for s in sites)
         chain = all(s['chain'] for s in sites)
+        accumulates = any(s['accumulates'] for s in sites)
 
         if chain:
             what = (f"{bits}-bit {var!r} walks a chain of length-prefixed "
                     f"records, stepping by each record's own length field; "
                     f"the sum is bounded by the container's size, so whether "
                     f"it can run long depends on who validated the chain")
+        elif check == 'narrow-add' and not accumulates:
+            what = (f"unsigned {bits}-bit {var!r} is computed as a sum in one "
+                    f"expression, so it truncates rather than accumulates; it "
+                    f"is wrong only if that single sum can exceed 2^{bits}")
         elif check == 'narrow-sub':
             what = (f"unsigned {bits}-bit {var!r} is decremented without "
                     f"establishing that it is large enough; on wrap it becomes "
@@ -850,11 +995,15 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
         # A sum can only wrap if something unbounded feeds it.  Addition off
         # locals the function itself computed, outside any loop, is the SMB1
         # request-header idiom (`offset = param_offset + params`) — fourteen
-        # copies of it in cifssmb.c, none reachable.  Subtraction is exempt:
-        # one underflowing decrement is enough, whatever fed it.
+        # copies of it in cifssmb.c, none reachable.  A one-expression sum is
+        # a narrowing computation, which is Cat H's question, not this one:
+        # `log2_bits = sb->s_blocksize_bits + 3` was most of what a whole-fs/
+        # run turned up.  Subtraction is exempt from both — one underflowing
+        # decrement is enough, whatever fed it and however it is written.
         if role not in _MEMORY_SINKS or chain:
             severity = 'low'
-        elif check == 'narrow-add' and not (in_loop or external):
+        elif check == 'narrow-add' and not (accumulates
+                                            and (in_loop or external)):
             severity = 'low'
         else:
             severity = 'medium' if guarded else 'high'
@@ -867,6 +1016,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             var=var, bits=bits, sink_role=role, sink_line=sink_line,
             sink_var=via, in_loop=in_loop, possibly_guarded=guarded,
             external_addend=external, record_chain=chain,
+            accumulates=accumulates,
             sites=[s['line'] for s in sites],
         ))
     return findings
