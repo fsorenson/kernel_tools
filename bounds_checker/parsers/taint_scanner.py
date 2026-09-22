@@ -15,8 +15,12 @@ Categories detected:
 Each finding includes the taint source location, the sink location, and a
 "possibly_guarded" flag indicating whether a conditional on the tainted variable
 appears between the source and sink (line-number heuristic; the LLM stage
-reasons about it more carefully).
+reasons about it more carefully).  When a conditional is present but does not
+answer the question the sink asks, "guard_kind" says which way it falls short —
+see _find_guards_between.
 """
+
+from collections import namedtuple
 
 from kernel_analysis.parsers.c_parser import (
     _walk, node_text, get_source_line,
@@ -444,49 +448,206 @@ _GUARD_TERM_CALLS = frozenset({
     'WARN', 'WARN_ON', 'WARN_ON_ONCE',
 })
 
+# Which end of the variable's range a comparison pins, when the variable is the
+# left operand and the condition is true.  `i > 7` true means i is large, so it
+# is a floor; the early-exit form `if (i > 7) return;` inverts it to a ceiling.
+_BOUND_FOR_LEFT = {'<': 'upper', '<=': 'upper', '>': 'lower', '>=': 'lower'}
+_FLIP = {'upper': 'lower', 'lower': 'upper'}
 
-def _find_guards_between(fn_body, var_names, line_lo, line_hi, source):
+_ARITH_OPS = frozenset({'+', '-', '*', '<<'})
+
+_SIGNED_TYPES = frozenset({
+    's8', '__s8', 's16', '__s16', 's32', '__s32', 's64', '__s64',
+    'int8_t', 'int16_t', 'int32_t', 'int64_t',
+    'short', 'short int', 'int', 'long', 'long int', 'long long',
+    'signed', 'signed char', 'signed short', 'signed int', 'signed long',
+    'ssize_t', 'ptrdiff_t', 'loff_t',
+})
+
+_UNSIGNED_TYPES = frozenset({
+    'u8', '__u8', 'u16', '__u16', 'u32', '__u32', 'u64', '__u64',
+    'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+    'unsigned', 'unsigned char', 'unsigned short', 'unsigned int',
+    'unsigned long', 'unsigned long long', 'size_t',
+    '__le16', '__le32', '__le64', '__be16', '__be32', '__be64',
+})
+
+# Helpers whose return value cannot be negative.  A signed local fed only by
+# these needs no floor, however it was declared — `int len = strnlen(p, n);`
+# is the dominant shape, and without this every `if (len >= n) return;` in the
+# tree reports upper-bound-only-signed.  strscpy() and friends are absent on
+# purpose: they return -E2BIG.
+_NONNEG_CALLS = frozenset({
+    'strlen', 'strnlen', 'ARRAY_SIZE', 'strcspn', 'strspn',
+})
+
+# found=False carries a kind explaining *why* the guard that is present does not
+# count, which is more actionable than the bare "unguarded" it replaces.
+Guard = namedtuple('Guard', 'found kind')
+
+_NO_GUARD = Guard(False, '')
+_GUARDED  = Guard(True, 'bounded')
+
+
+def _build_local_signed(fn_body, source):
     """
-    Return True if a plausible bounds check on a variable in var_names appears
-    between line_lo and line_hi.
+    Integer locals declared with a signed type.  Capping such a variable from
+    above leaves the negative half open, and a subscript or length that consumes
+    it converts to size_t.
 
-    Two requirements beyond the original line-range check:
+    Bare `char` is left out: its signedness is arch-dependent (signed on x86,
+    unsigned on arm64), so neither answer is right tree-wide.  Names declared
+    twice with conflicting signedness are dropped, as in `_build_local_widths`.
+    """
+    seen = {}
+    for n in _walk(fn_body):
+        if n.type != 'declaration':
+            continue
+        type_node = n.child_by_field_name('type')
+        if type_node is None:
+            continue
+        is_signed = node_text(type_node, source).strip() in _SIGNED_TYPES
+        for child in n.children:
+            decl = child.children[0] if (child.type == 'init_declarator'
+                                         and child.children) else child
+            if decl is None or decl.type != 'identifier':
+                continue
+            seen.setdefault(node_text(decl, source), set()).add(is_signed)
+    return {name for name, vals in seen.items()
+            if vals == {True} and not _only_nonneg_sources(fn_body, name, source)}
 
-    1. Condition must contain a relational comparison (< <= > >= == !=) with
-       at least one operand that references a variable in var_names.  This
-       eliminates bare zero-tests (if (X)) and conditions that reference the
-       variable in a non-comparison context.
 
-    2. The check must actually gate the dangerous use, via either:
-       a. Early-exit pattern: consequence or alternative contains a terminal
-          statement (return/goto/break/continue/BUG/panic), OR
-       b. Guarded-use pattern: the sink line (line_hi) falls textually inside
-          the consequence or alternative, meaning the dangerous call only
-          executes when the check passes.
+def _only_nonneg_sources(fn_body, name, source):
+    """
+    True if every value `name` takes in this body comes from _NONNEG_CALLS.
+    A compound assignment or a ++/-- disqualifies it: `len -= hdr` reopens the
+    negative half regardless of where len started.
+    """
+    found_one = False
+    for n in _walk(fn_body):
+        if n.type == 'update_expression':
+            if _names_in(n, source) == {name}:
+                return False
+            continue
+        if n.type == 'init_declarator':
+            decl, rhs = n.child_by_field_name('declarator'), n.child_by_field_name('value')
+        elif n.type == 'assignment_expression':
+            decl, rhs = n.child_by_field_name('left'), n.child_by_field_name('right')
+            if node_text(n.children[1], source) != '=':
+                if decl is not None and node_text(decl, source) == name:
+                    return False
+                continue
+        else:
+            continue
+        if decl is None or rhs is None or node_text(decl, source) != name:
+            continue
+        if rhs.type == 'sizeof_expression':
+            pass
+        elif not (rhs.type == 'call_expression'
+                  and node_text(rhs.child_by_field_name('function'), source)
+                      in _NONNEG_CALLS):
+            return False
+        found_one = True
+    return found_one
+
+
+def _names_in(node, source):
+    return {node_text(n, source) for n in _walk(node) if n.type == 'identifier'}
+
+
+def _in_arithmetic(node, var_names, source):
+    """True if any of var_names appears inside an additive/scaling expression."""
+    if node is None:
+        return False
+    for n in _walk(node):
+        if (n.type == 'binary_expression' and len(n.children) >= 3
+                and n.children[1].type in _ARITH_OPS
+                and (_names_in(n, source) & var_names)):
+            return True
+    return False
+
+
+def _has_unsigned_cast(node, source):
+    for n in _walk(node):
+        if n.type != 'cast_expression':
+            continue
+        t = n.child_by_field_name('type')
+        if t is not None and node_text(t, source).strip() in _UNSIGNED_TYPES:
+            return True
+    return False
+
+
+def _comparisons_on(cond, var_names, source):
+    """
+    Every relational comparison in `cond` that mentions one of var_names, as
+    (op, var_is_left_operand, var_appears_in_arithmetic, cast_to_unsigned).
+    """
+    out = []
+    for n in _walk(cond):
+        if n.type != 'binary_expression' or len(n.children) < 3:
+            continue
+        op = n.children[1].type
+        if op not in _GUARD_CMP_OPS:
+            continue
+        left, right = n.children[0], n.children[2]
+        on_left = bool(_names_in(left, source) & var_names)
+        if not on_left and not (_names_in(right, source) & var_names):
+            continue
+        side = left if on_left else right
+        out.append((op, on_left,
+                    _in_arithmetic(side, var_names, source),
+                    _has_unsigned_cast(n, source)))
+    return out
+
+
+def _has_terminal(subtree, source):
+    for n in _walk(subtree):
+        if n.type in _GUARD_TERM_STMTS:
+            return True
+        if n.type == 'call_expression':
+            fn_id = next((c for c in n.children if c.type == 'identifier'), None)
+            if fn_id and node_text(fn_id, source) in _GUARD_TERM_CALLS:
+                return True
+    return False
+
+
+def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
+                         signed_vars=frozenset(), sink_expr=None):
+    """
+    Whether a bounds check on any of var_names between line_lo and line_hi
+    actually covers the use at line_hi.
+
+    A candidate guard is an `if` in range whose condition relationally compares
+    one of var_names, and which gates the use — either the branch exits
+    (return/goto/break/continue/BUG/panic), or line_hi falls inside it.  Bare
+    zero-tests do not qualify.
+
+    Two ways a candidate can be present and still not answer the question:
+
+    `covers-base-not-offset` — the sink applies arithmetic to the variable and
+    no guard does.  `if (off > total) return;` followed by `data[off + 1]` is
+    off by exactly the adjustment the guard never saw.
+
+    `upper-bound-only-signed` — the variable is declared signed and every guard
+    pins only its ceiling.  `if (i > 7) return;` then `table[i]` admits every
+    negative value, which the subscript converts to size_t.  An unsigned
+    variable needs no floor, so this applies to `signed_vars` alone; a cast to
+    an unsigned type inside the comparison supplies both ends at once, which is
+    the `(unsigned)i >= n` idiom.  `_build_local_signed` also withholds locals
+    that only ever hold a non-negative call result, which is where nearly all of
+    this rule's noise came from.
+
+    Direction is read off the *falling-through* path, so early-exit conditions
+    are inverted before classification: `if (i < 0) return;` establishes a
+    floor, while `if (i < n) { use }` establishes a ceiling.
     """
     if not var_names:
-        return False
+        return _NO_GUARD
 
-    def _cond_has_relational_var(cond_node):
-        for n in _walk(cond_node):
-            if n.type != 'binary_expression':
-                continue
-            if not any(c.type in _GUARD_CMP_OPS for c in n.children):
-                continue
-            for ident in _walk(n):
-                if ident.type == 'identifier' and node_text(ident, source) in var_names:
-                    return True
-        return False
-
-    def _has_terminal(subtree):
-        for n in _walk(subtree):
-            if n.type in _GUARD_TERM_STMTS:
-                return True
-            if n.type == 'call_expression':
-                fn_id = next((c for c in n.children if c.type == 'identifier'), None)
-                if fn_id and node_text(fn_id, source) in _GUARD_TERM_CALLS:
-                    return True
-        return False
+    adjusted = _in_arithmetic(sink_expr, var_names, source)
+    bounds = set()
+    found_any = False
+    guard_saw_adjustment = False
 
     for node in _walk(fn_body):
         if node.type != 'if_statement':
@@ -496,28 +657,48 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source):
             continue
 
         cond = node.child_by_field_name('condition')
-        if cond is None or not _cond_has_relational_var(cond):
+        if cond is None:
+            continue
+        cmps = _comparisons_on(cond, var_names, source)
+        if not cmps:
             continue
 
         consequence = node.child_by_field_name('consequence')
         alternative = node.child_by_field_name('alternative')
 
-        # Early-exit pattern
-        if consequence and _has_terminal(consequence):
-            return True
-        if alternative and _has_terminal(alternative):
-            return True
+        early = ((consequence is not None and _has_terminal(consequence, source))
+                 or (alternative is not None and _has_terminal(alternative, source)))
+        encloses = any(b is not None
+                       and b.start_point[0] + 1 <= line_hi <= b.end_point[0] + 1
+                       for b in (consequence, alternative))
+        if not (early or encloses):
+            continue
 
-        # Guarded-use pattern: dangerous call is inside this branch
-        for branch in (consequence, alternative):
-            if branch is None:
+        found_any = True
+        for op, on_left, in_arith, unsigned_cast in cmps:
+            if in_arith:
+                guard_saw_adjustment = True
+            if unsigned_cast:
+                bounds |= {'upper', 'lower'}
                 continue
-            b_lo = branch.start_point[0] + 1
-            b_hi = branch.end_point[0] + 1
-            if b_lo <= line_hi <= b_hi:
-                return True
+            if op in ('==', '!='):
+                # `if (i == K) { use }` and `if (i != K) return;` both leave one
+                # value; the other pairings leave the range open.
+                if (op == '==') != early:
+                    bounds |= {'upper', 'lower'}
+                continue
+            direction = _BOUND_FOR_LEFT[op]
+            if not on_left:
+                direction = _FLIP[direction]
+            bounds.add(_FLIP[direction] if early else direction)
 
-    return False
+    if not found_any:
+        return _NO_GUARD
+    if adjusted and not guard_saw_adjustment:
+        return Guard(False, 'covers-base-not-offset')
+    if bounds == {'upper'} and (var_names & signed_vars):
+        return Guard(False, 'upper-bound-only-signed')
+    return _GUARDED
 
 
 def _find_string_guard(fn_body, var_name, line_lo, line_hi, source):
@@ -572,6 +753,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
 
     # Pre-build integer width map for Cat H narrowing detection.
     var_widths = _build_local_widths(fn_body, source)
+    signed_vars = _build_local_signed(fn_body, source)
 
     for node in _walk(fn_body):
 
@@ -610,7 +792,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     taint_ln = tainted[ref_h]['line'] if ref_h else line
                     guarded_h = _find_guards_between(
                         fn_body, guard_vars, taint_ln, line, source,
-                    ) if guard_vars and taint_ln < line else False
+                        signed_vars,
+                    ) if guard_vars and taint_ln < line else _NO_GUARD
                     snippet = get_source_line(source, line)
                     findings.append({
                         'function':        fn_name,
@@ -629,7 +812,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         'src_width':       src_width_h,
                         'dest_width':      dest_width,
                         'dest_type':       dest_type,
-                        'possibly_guarded': guarded_h,
+                        'possibly_guarded': guarded_h.found,
+                        'guard_kind':       guarded_h.kind,
                         'reason': (
                             f"{src_width_h}-bit value from {src_fn_h}() silently "
                             f"truncated to {dest_width}-bit {dest_type} in {dest_var!r}; "
@@ -743,7 +927,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         taint_ln_h = tainted[ref]['line']
                         guarded_h = _find_guards_between(
                             fn_body, {ref}, taint_ln_h, line_h, source,
-                        ) if taint_ln_h < line_h else False
+                            signed_vars,
+                        ) if taint_ln_h < line_h else _NO_GUARD
                         findings.append({
                             'function':        fn_name,
                             'file':            str(filepath),
@@ -761,7 +946,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                             'src_width':       src_width_h,
                             'dest_width':      dest_width_h,
                             'dest_type':       f'u{dest_width_h}',
-                            'possibly_guarded': guarded_h,
+                            'possibly_guarded': guarded_h.found,
+                            'guard_kind':       guarded_h.kind,
                             'reason': (
                                 f"{src_width_h}-bit value (via {ref!r}, from "
                                 f"{src_fn_h}()) silently truncated to "
@@ -865,7 +1051,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 if src_fn:
                     guarded = _find_guards_between(
                         fn_body, {tainted_var} if tainted_var else set(),
-                        taint_line, sink_line, source
+                        taint_line, sink_line, source,
+                        signed_vars, sink_expr=arg,
                     )
                     findings.append({
                         'function': fn_name,
@@ -881,7 +1068,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         'sink_snippet': sink_snippet,
                         'sink_arg_index': idx,
                         'sink_arg_role': role,
-                        'possibly_guarded': guarded,
+                        'possibly_guarded': guarded.found,
+                        'guard_kind':       guarded.kind,
                         'reason': (
                             f"server-supplied value from {src_fn}() used as {role} "
                             f"argument {idx} to {sink_fn}() without bounds check"
@@ -897,9 +1085,13 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 if idx >= len(args):
                     continue
                 for hit in _find_overflow_in_size_arg(args[idx], source, tainted):
+                    # No sink_expr: the arithmetic here is the finding, so
+                    # covers-base-not-offset would fire on every one and say
+                    # nothing the overflow flag does not already say.
                     guarded = _find_guards_between(
                         fn_body, {hit['tainted_var']},
                         hit['taint_line'], sink_line, source,
+                        signed_vars,
                     )
                     op_word = 'multiplication' if hit['op'] == '*' else 'addition'
                     findings.append({
@@ -920,7 +1112,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         'sink_snippet':    sink_snippet,
                         'sink_arg_index':  idx,
                         'sink_arg_role':   'size_mul_overflow',
-                        'possibly_guarded': guarded,
+                        'possibly_guarded': guarded.found,
+                        'guard_kind':       guarded.kind,
                         'reason': (
                             f"integer overflow risk: {hit['lhs_text']} {hit['op']} "
                             f"{hit['rhs_text']} passed as size to {sink_fn}(); "
@@ -943,7 +1136,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     continue  # Only flag pointer-tainted values as ptr args
                 taint_line = info['line']
                 guarded = _find_guards_between(
-                    fn_body, {ref}, taint_line, sink_line, source
+                    fn_body, {ref}, taint_line, sink_line, source,
+                    signed_vars, sink_expr=arg,
                 )
                 findings.append({
                     'function': fn_name,
@@ -959,7 +1153,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     'sink_snippet': sink_snippet,
                     'sink_arg_index': idx,
                     'sink_arg_role': 'pointer',
-                    'possibly_guarded': guarded,
+                    'possibly_guarded': guarded.found,
+                    'guard_kind':       guarded.kind,
                     'reason': (
                         f"pointer derived from server-supplied {info['source_fn']}() "
                         f"used as pointer argument {idx} to {sink_fn}() "
@@ -1009,6 +1204,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             guarded = _find_guards_between(
                 fn_body, {ref} if ref else set(),
                 taint_line, sink_line, source,
+                signed_vars, sink_expr=node.child_by_field_name('condition'),
             )
             findings.append({
                 'function':        fn_name,
@@ -1024,7 +1220,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 'sink_snippet':    sink_snippet,
                 'sink_arg_index':  0,
                 'sink_arg_role':   'loop_bound',
-                'possibly_guarded': guarded,
+                'possibly_guarded': guarded.found,
+                'guard_kind':       guarded.kind,
                 'reason': (
                     f"server-supplied value {tainted_var_name!r} "
                     f"(from {src_fn}()) controls loop iteration count "
@@ -1064,6 +1261,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             sink_snippet = get_source_line(source, sink_line)
             guarded = _find_guards_between(
                 fn_body, {ref}, taint_line, sink_line, source,
+                signed_vars, sink_expr=arg,
             )
             findings.append({
                 'function':        fn_name,
@@ -1080,7 +1278,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 'sink_arg_index':  0,
                 'sink_arg_role':   'tainted_ptr_deref',
                 'field_name':      field_name,
-                'possibly_guarded': guarded,
+                'possibly_guarded': guarded.found,
+                'guard_kind':       guarded.kind,
                 'reason': (
                     f"pointer {ref!r} derived from {info['source_fn']}() offset "
                     f"arithmetic used without verifying offset + sizeof(*{ref}) "
@@ -1118,7 +1317,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             sink_snippet = get_source_line(source, sink_line)
             guarded = _find_guards_between(
                 fn_body, {ref} if ref else set(),
-                taint_line, sink_line, source
+                taint_line, sink_line, source,
+                signed_vars, sink_expr=idx_node,
             )
             findings.append({
                 'function': fn_name,
@@ -1134,7 +1334,8 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 'sink_snippet': sink_snippet,
                 'sink_arg_index': 0,
                 'sink_arg_role': 'subscript',
-                'possibly_guarded': guarded,
+                'possibly_guarded': guarded.found,
+                'guard_kind':       guarded.kind,
                 'reason': (
                     f"server-supplied value from {src_fn}() used as array subscript "
                     f"without bounds check"
@@ -1190,6 +1391,8 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
         'sink_arg_index':  int,      # which argument is tainted
         'sink_arg_role':   str,      # 'size', 'pointer', 'subscript', 'count'
         'possibly_guarded': bool,
+        'guard_kind':      str,      # '' | 'bounded' | 'covers-base-not-offset'
+                                     #    | 'upper-bound-only-signed'
         'reason':          str,
       }
     """
@@ -1415,9 +1618,10 @@ def _scan_fn_copy_user(fn_body, fn_name, source, filepath, cats):
                 if size_vars:
                     fn_start = fn_body.start_point[0] + 1
                     guarded  = _find_guards_between(
-                        fn_body, size_vars, fn_start - 1, call_line, source
+                        fn_body, size_vars, fn_start - 1, call_line, source,
+                        _build_local_signed(fn_body, source), sink_expr=size_arg,
                     )
-                    if not guarded:
+                    if not guarded.found:
                         size_text = node_text(size_arg, source)
                         findings.append({
                             'function':        fn_name,

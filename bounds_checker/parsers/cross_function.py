@@ -24,7 +24,7 @@ from kernel_analysis.parsers.c_parser import (
     _walk, node_text, get_source_line, parse_file, find_functions,
 )
 from bounds_checker.parsers.taint_scanner import (
-    _scan_body, _find_guards_between,
+    _scan_body, _find_guards_between, _build_local_signed,
 )
 
 
@@ -247,18 +247,21 @@ def scan_cross_function_calls(c_paths, param_sink_map, verbose=False):
                         continue
 
                     # Check if the caller guards the value before the call
+                    # No sink_expr: the sink is in the callee, so the caller has
+                    # no expression here to compare the guard against.
                     caller_guarded = _find_guards_between(
                         fn['body'],
                         {taint_info['var']},
                         taint_info['line'],
                         ev['line'],
                         source,
+                        _build_local_signed(fn['body'], source),
                     )
 
                     read_only = _is_read_only_callee(callee)
 
                     for sink_desc in callee_params[arg_idx]:
-                        possibly_guarded = (caller_guarded or
+                        possibly_guarded = (caller_guarded.found or
                                             sink_desc['callee_guards'])
                         callee_short = Path(sink_desc['callee_file']).name
 
@@ -286,6 +289,7 @@ def scan_cross_function_calls(c_paths, param_sink_map, verbose=False):
                             'sink_arg_index':    sink_desc['sink_arg_index'],
                             'sink_arg_role':     sink_desc['sink_arg_role'],
                             'possibly_guarded':  possibly_guarded,
+                            'guard_kind':        caller_guarded.kind,
                             'reason': (
                                 f"tainted {taint_info['var']} "
                                 f"(from {taint_info['source_fn']}() "

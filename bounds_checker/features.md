@@ -112,6 +112,23 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       Reduces spurious "possibly guarded" rate from 66 % to 62 % on fs/smb/client;
       remaining flags correspond to genuine relational checks with early exits.
 
+- [x] Guard direction and coverage — a candidate guard that is present can still
+      fail to answer the question the sink asks, and two such cases now clear
+      `possibly_guarded` while recording why in a new `guard_kind` field.
+      `covers-base-not-offset`: the sink applies arithmetic to the variable and
+      no guard does (`if (off > total) return;` then `data[off + 1]`).
+      `upper-bound-only-signed`: the variable is signed and every guard pins only
+      its ceiling, leaving the negative half that the subscript converts to
+      `size_t`; a cast to an unsigned type inside the comparison supplies both
+      ends, and a signed local fed only by `strlen`/`strnlen`/`ARRAY_SIZE`/
+      `sizeof` needs no floor.  Direction is read off the falling-through path,
+      so early-exit conditions are inverted before classification.  On
+      fs/smb/client: 295 findings unchanged, guarded 159 → 156 — `CIFSPOSIXCreate`
+      and `parse_posix_sids` (base-not-offset), `smb2_check_message`
+      (`smb2_rsp_struct_sizes[command]`, signed).  Without the nonneg-source
+      carve-out it is 159 → 144, and all twelve of the difference are
+      `int len = strnlen(...)` under `if (len >= bleft) return;`.
+
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later
       bounds check on the narrowed copy to pass for values that would fail on the
