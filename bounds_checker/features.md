@@ -146,8 +146,39 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       61 guarded findings before the fix, 0 and 0 of 58 after; the redefinition
       hits were symptoms of the operand defect, not of missing
       reaching-definitions.  For structured C, AST ancestry is dominance; only
-      `goto` label resolution and loop back edges would need a real CFG, and
-      neither is measured yet.
+      `goto` label resolution and loop back edges would need a real CFG.
+
+- [x] `goto` label resolution — any `goto_statement` in a guard's branch counted
+      as an early exit without asking where the label lands, so `if (cond) goto
+      found;` was credited even when `found:` sits immediately above the sink.
+      A goto now qualifies only if its label is past the use; an unresolvable
+      label is still credited so a parse gap cannot produce a wave of findings.
+      Zero change on fs/smb/client — the `goto out` idiom always lands below —
+      and 18 findings tree-wide, e.g. `ldm_frag_add()` (block/partitions/ldm.c),
+      where `goto found` skips the `kmalloc` and lands one line above the
+      `memcpy(f->data + VBLK_SIZE_HEAD + rec * size, ...)`.
+
+## Whole-tree guard measurement
+
+At 65,645 files (~3.5 min on 30 cores), intra-procedural only: 11,070 findings,
+1,851 possibly_guarded.  The two coverage rules fire 216 times
+(`upper-bound-only-signed` 126, `covers-base-not-offset` 90).
+
+Of the 1,160 guarded findings whose sink node and candidate guard can be
+re-located from the finding record, the shapes whose suppression does not hold
+up — measured with detectors carried on positive *and* negative controls:
+
+| shape | count | needs |
+|---|---|---|
+| guard reaches the variable only as a field base (`if (rsp->ByteCount < n)` crediting `rsp`) | 259 | operand test, same mechanism as the call-argument fix |
+| variable redefined between guard and sink | 128 | reaching definitions over a line range |
+| guard does not dominate the sink | 51 | AST ancestor chain |
+
+Union 369; pairwise overlaps are 23–32, so they are largely distinct
+populations.  Counts are a lower bound — 691 guarded findings could not be
+re-located and were not examined.  Field-base is both the largest and the
+cheapest, and unlike the other two it does occur in cifs (7 in `cifssmb.c`);
+`fs/ntfs3/fslog.c` (29) and `fs/smb/server/smbacl.c` (18) lead the tree.
 
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later

@@ -622,8 +622,35 @@ def _comparisons_on(cond, var_names, source):
     return out
 
 
-def _has_terminal(subtree, source):
+def _label_lines(fn_body, source):
+    lines = {}
+    for n in _walk(fn_body):
+        if n.type == 'labeled_statement':
+            lab = n.child_by_field_name('label')
+            if lab is not None:
+                lines.setdefault(node_text(lab, source), n.start_point[0] + 1)
+    return lines
+
+
+def _has_terminal(subtree, source, label_lines=None, line_hi=None):
+    """
+    Whether the branch leaves before reaching the use at line_hi.
+
+    `goto` only qualifies if its label sits past the use.  cifs error handling
+    is built on `goto out`, and the label is almost always below, but the
+    backward-jump and fall-through-to-the-sink forms otherwise read as clean
+    exits.  An unresolvable label is credited, keeping a parse gap from turning
+    into a wave of findings.
+    """
     for n in _walk(subtree):
+        if n.type == 'goto_statement':
+            if label_lines is None or line_hi is None:
+                return True
+            lab = n.child_by_field_name('label')
+            target = label_lines.get(node_text(lab, source)) if lab is not None else None
+            if target is None or target > line_hi:
+                return True
+            continue
         if n.type in _GUARD_TERM_STMTS:
             return True
         if n.type == 'call_expression':
@@ -670,6 +697,7 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
     bounds = set()
     found_any = False
     guard_saw_adjustment = False
+    labels = None          # built on first candidate; most calls never need it
 
     for node in _walk(fn_body):
         if node.type != 'if_statement':
@@ -688,8 +716,12 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
         consequence = node.child_by_field_name('consequence')
         alternative = node.child_by_field_name('alternative')
 
-        early = ((consequence is not None and _has_terminal(consequence, source))
-                 or (alternative is not None and _has_terminal(alternative, source)))
+        if labels is None:
+            labels = _label_lines(fn_body, source)
+        early = ((consequence is not None
+                  and _has_terminal(consequence, source, labels, line_hi))
+                 or (alternative is not None
+                     and _has_terminal(alternative, source, labels, line_hi)))
         encloses = any(b is not None
                        and b.start_point[0] + 1 <= line_hi <= b.end_point[0] + 1
                        for b in (consequence, alternative))
