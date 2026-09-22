@@ -129,6 +129,26 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       carve-out it is 159 → 144, and all twelve of the difference are
       `int len = strnlen(...)` under `if (len >= bleft) return;`.
 
+- [x] Guard operand vs. name mention — `_comparisons_on()` tested whether the
+      variable appeared anywhere in the compared subtree, so a variable passed
+      to a function counted as the thing being compared.  `if (memcmp(ea_name,
+      temp_ptr, name_len) == 0)` in `CIFSSMBQAllEAs` and `if (compare_sids(
+      &pntace->sid, pownersid) == 0)` in `set_chmod_dacl` were both credited as
+      bounds checks on the pointer; each tests its call's *result*.  Operand
+      matching now walks the side expression without descending into an
+      `argument_list`, which leaves `unlikely()`/`WARN_ON()` wrappers working
+      since the comparison itself is found by the enclosing walk.  fs/smb/client
+      guarded 156 → 147, all nine in those two call chains.
+
+      This also emptied the two control-flow gaps worth measuring here.  A
+      standalone detector — guard whose conditional ancestors do not all enclose
+      the sink, and variable redefined between guard and sink — found 0 and 2 of
+      61 guarded findings before the fix, 0 and 0 of 58 after; the redefinition
+      hits were symptoms of the operand defect, not of missing
+      reaching-definitions.  For structured C, AST ancestry is dominance; only
+      `goto` label resolution and loop back edges would need a real CFG, and
+      neither is measured yet.
+
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later
       bounds check on the narrowed copy to pass for values that would fail on the

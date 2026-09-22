@@ -555,6 +555,28 @@ def _names_in(node, source):
     return {node_text(n, source) for n in _walk(node) if n.type == 'identifier'}
 
 
+def _walk_operand(node):
+    """
+    _walk without descending into call arguments.  A variable handed to a
+    function is not what the enclosing comparison compares: `memcmp(a, p, n)
+    == 0` tests memcmp's result, so crediting it as a bounds check on `p` is
+    what `if (memcmp(ea_name, temp_ptr, name_len) == 0)` did in CIFSSMBQAllEAs.
+    Conditions wrapped in `unlikely()`/`WARN_ON()` are unaffected — the
+    comparison is found by the caller's full walk, and only its operands come
+    through here.
+    """
+    yield node
+    for child in node.children:
+        if child.type == 'argument_list':
+            continue
+        yield from _walk_operand(child)
+
+
+def _names_in_operand(node, source):
+    return {node_text(n, source)
+            for n in _walk_operand(node) if n.type == 'identifier'}
+
+
 def _in_arithmetic(node, var_names, source):
     """True if any of var_names appears inside an additive/scaling expression."""
     if node is None:
@@ -562,7 +584,7 @@ def _in_arithmetic(node, var_names, source):
     for n in _walk(node):
         if (n.type == 'binary_expression' and len(n.children) >= 3
                 and n.children[1].type in _ARITH_OPS
-                and (_names_in(n, source) & var_names)):
+                and (_names_in_operand(n, source) & var_names)):
             return True
     return False
 
@@ -590,8 +612,8 @@ def _comparisons_on(cond, var_names, source):
         if op not in _GUARD_CMP_OPS:
             continue
         left, right = n.children[0], n.children[2]
-        on_left = bool(_names_in(left, source) & var_names)
-        if not on_left and not (_names_in(right, source) & var_names):
+        on_left = bool(_names_in_operand(left, source) & var_names)
+        if not on_left and not (_names_in_operand(right, source) & var_names):
             continue
         side = left if on_left else right
         out.append((op, on_left,
