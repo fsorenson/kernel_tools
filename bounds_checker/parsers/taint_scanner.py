@@ -577,6 +577,28 @@ def _names_in_operand(node, source):
             for n in _walk_operand(node) if n.type == 'identifier'}
 
 
+def _names_compared(node, source):
+    """
+    The names an operand actually constrains.  A variable reached only as the
+    base of a field access is not one: `if (rsp->ByteCount < 8)` bounds the
+    field, not the pointer a sink then offsets from — `ldm_frag_add()` gates
+    `memcpy(f->data + VBLK_SIZE_HEAD + rec * size, ...)` on `rec >= f->num`,
+    which says nothing about `f`.  Kept separate from _names_in_operand so
+    _in_arithmetic still sees `f->data + n` as an adjustment of `f`.
+    """
+    out = set()
+    for n in _walk_operand(node):
+        if n.type != 'identifier':
+            continue
+        p = n.parent
+        if p is not None and p.type == 'field_expression':
+            base = p.child_by_field_name('argument')
+            if base is not None and base.id == n.id:
+                continue
+        out.add(node_text(n, source))
+    return out
+
+
 def _in_arithmetic(node, var_names, source):
     """True if any of var_names appears inside an additive/scaling expression."""
     if node is None:
@@ -612,8 +634,8 @@ def _comparisons_on(cond, var_names, source):
         if op not in _GUARD_CMP_OPS:
             continue
         left, right = n.children[0], n.children[2]
-        on_left = bool(_names_in_operand(left, source) & var_names)
-        if not on_left and not (_names_in_operand(right, source) & var_names):
+        on_left = bool(_names_compared(left, source) & var_names)
+        if not on_left and not (_names_compared(right, source) & var_names):
             continue
         side = left if on_left else right
         out.append((op, on_left,

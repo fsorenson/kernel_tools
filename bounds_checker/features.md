@@ -158,27 +158,46 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       where `goto found` skips the `kmalloc` and lands one line above the
       `memcpy(f->data + VBLK_SIZE_HEAD + rec * size, ...)`.
 
+- [x] Guard reached only as a field base — `if (rsp->ByteCount < 8)` was credited
+      as a bounds check on `rsp`, and `if (pctx->ContextType == SMB2_PREAUTH_
+      INTEGRITY_CAPABILITIES)` in `smb311_decode_neg_context()` as one on `pctx`.
+      A type discriminator is not a bound.  `_names_compared()` drops an
+      identifier that appears only as the `argument` of a `field_expression`;
+      it is kept separate from `_names_in_operand` so `_in_arithmetic` still
+      reads `f->data + n` as an adjustment of `f`.  fs/smb/client guarded
+      147 → 123, all 24 Category E; tree-wide 1,851 → 1,322.
+
+      Worth being precise about what this buys: the real bound in
+      `smb311_decode_neg_context()` is `if (clen > len_of_ctxts) break;`, on a
+      derived length the scanner does not tie back to `pctx`, so these findings
+      are not new bugs.  `possibly_guarded` is not a filter — it contributes +20
+      to the ranking score and is handed to Stage 2 as context — so the gain is
+      that Stage 2 is no longer told a guard exists when it does not.
+
 ## Whole-tree guard measurement
 
-At 65,645 files (~3.5 min on 30 cores), intra-procedural only: 11,070 findings,
-1,851 possibly_guarded.  The two coverage rules fire 216 times
-(`upper-bound-only-signed` 126, `covers-base-not-offset` 90).
+65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both
+before and after the guard work (nothing here filters); `upper-bound-only-signed`
+fires 126 times and `covers-base-not-offset` 87.
 
-Of the 1,160 guarded findings whose sink node and candidate guard can be
-re-located from the finding record, the shapes whose suppression does not hold
-up — measured with detectors carried on positive *and* negative controls:
+Suppression shapes that do not hold up, measured with detectors carried on
+positive *and* negative controls, over the guarded findings whose sink node and
+candidate guard can be re-located from the finding record:
 
-| shape | count | needs |
-|---|---|---|
-| guard reaches the variable only as a field base (`if (rsp->ByteCount < n)` crediting `rsp`) | 259 | operand test, same mechanism as the call-argument fix |
-| variable redefined between guard and sink | 128 | reaching definitions over a line range |
-| guard does not dominate the sink | 51 | AST ancestor chain |
+| shape | before | after | needs |
+|---|---|---|---|
+| variable reached only as a field base | 259 | **0** | operand test (done) |
+| variable redefined between guard and sink | 128 | 104 | reaching definitions over a line range |
+| guard does not dominate the sink | 51 | 21 | AST ancestor chain |
+| `goto` label does not clear the sink | 18 | 17 | label map (done; detector counts verdict changes, not defects) |
+| guarded findings | 1,851 | 1,322 | |
+| of which examined | 1,160 | 868 | |
 
-Union 369; pairwise overlaps are 23–32, so they are largely distinct
-populations.  Counts are a lower bound — 691 guarded findings could not be
-re-located and were not examined.  Field-base is both the largest and the
-cheapest, and unlike the other two it does occur in cifs (7 in `cifssmb.c`);
-`fs/ntfs3/fslog.c` (29) and `fs/smb/server/smbacl.c` (18) lead the tree.
+The field-base fix removed 529 suppressions tree-wide against a detector
+estimate of 259, because the detector only examines findings it can re-locate —
+treat every count here as a lower bound of roughly half.  It also halved gap1
+and dented gap2, since those populations overlapped it.  Reaching definitions is
+now the largest remaining shape; dominance at 21 does not justify CFG machinery.
 
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later
