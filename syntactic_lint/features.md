@@ -172,6 +172,38 @@ usable rather than a 72-line wall.
       `nsize += cifs_copy_ace(pnntace, ...)`, which accumulates bytes written
       — is exactly the shape this check exists for, and stays at `high`.
 
+- [x] Loop trip-count bounding — `narrow-add` reports an in-loop accumulation
+      because the number of additions might be attacker-driven. When it plainly
+      is not, the finding demotes to `low`. Two arms, and a finding needs only
+      one of them, but every loop-resident statement feeding the accumulator
+      has to qualify — one the loop does not cap is enough to run the total up.
+
+      *Self-bounded accumulator*: the loop condition caps the running value, so
+      every trip re-tests it — `offset += 3` under `while (offset < length)`.
+      The cursor is pinned to `length + 2` and whether that is safe is a
+      question about `length`, which is why this demotes rather than
+      suppresses. `!=` does not qualify: `while (sqcc != sq->pc)` says nothing
+      about magnitude, and the two mlx5 `en_tx.c` findings correctly stay at
+      `high`. The constant step is load-bearing — under that same condition,
+      `offset += rec_length` off the wire clears 2^16 in a single add and the
+      re-test never happens.
+
+      *Constant trip count*: the condition caps an induction variable against
+      something fixed at build time and the update steps by one — literals,
+      `sizeof`, `ARRAY_SIZE()`, or any identifier the function does not declare,
+      which in kernel C means a macro or an enumerator. The count is never
+      evaluated; `CIFS_NUM_PROT` is a macro this parser will not resolve, and
+      being build-time fixed is the whole claim. Every loop between the
+      statement and the function body must qualify, since an innermost loop
+      with a fixed count says nothing if an outer one runs as many times as the
+      wire asks.
+
+      The discriminator is the loop's bound, not the addend, and the two
+      `cifs` cases are the argument for that: `count += len` under
+      `for (i = 0; i < CIFS_NUM_PROT; i++)` clears, while `nsize +=
+      cifs_copy_ace(...)` under `for (i = 0; i < src_num_aces; i++)` — same
+      shape, bound off the wire — stays at `high`.
+
 ## Validation
 
 Each check was developed against a known upstream bug, using the parent commit
@@ -193,7 +225,7 @@ flagged alongside the `smb_target` one.
 
     python3 -m syntactic_lint.tests.test_checks     # or: pytest syntactic_lint/tests/
 
-Fifteen cases in `tests/`, running in about a fifth of a second. Three are the
+Sixteen cases in `tests/`, running in about a fifth of a second. Three are the
 pre-fix bugs above; the rest are functions that a whole-tree run reported and a
 hand triage cleared, so each suppression is pinned against the exact code that
 motivated it rather than against an invented reproduction. Every
@@ -315,7 +347,29 @@ are worth more than callee parameter roles now. The discriminator has to be
 the loop bound and not the addend: `nsize += cifs_copy_ace(...)` sits in a loop
 whose trip count comes off the wire, and must stay.
 
-A smaller one, 8 of the 94: `len += scnprintf(buf + len, SIZE - len, ...)`,
+Measured after the loop-bound rule, at `9201636e709b` (the tree had moved, so
+the counterfactual is computed from the structured fields of the same run
+rather than against the 176 above): **155 findings, 108 `high`**. The rule
+demotes 19, seventeen of them from `high`; without it the same tree reports
+174 / 125. Twelve of the nineteen are in `drivers/net`, which is the
+concentration the lever was chosen for.
+
+What survives is the question the check exists to ask. Of the 77 remaining
+`high` `narrow-add`, 56 are in a loop, and sampling them the bound is a runtime
+value every time — `for (group_id = 0; group_id < grp_num / 8; ...)` with
+`grp_num` read from the hardware, `for (i = 0; i < noa_num; i++)` with
+`noa_num` off the air. The addend is wire-derived in the rest:
+`sqcc += wi->num_wqebbs`, `offset += rec_length`,
+`travel_len += tlv_len + MWIFIEX_IE_HDR_SIZE`.
+
+One systematic FP class remains visible, and it is the loop's *body* rather
+than its header: `i40e_add_ieee_app_pri_tlv()` runs `offset += 3` under
+`while (i < dcbcfg->numapps)` with `if (i >= I40E_DCBX_MAX_APPS) break;` at the
+bottom of the body. The cap is real and constant; the rule only reads loop
+conditions.
+
+A smaller one, still 8 of the remaining `high`: `len += scnprintf(buf + len,
+SIZE - len, ...)`,
 where the accumulator is both the offset and part of the size argument of the
 same call. `scnprintf` returns at most `size - 1`, so the idiom is
 self-bounding and recognisable without leaving the statement.
@@ -340,11 +394,23 @@ says `strlen()`.
       `abs_path` family without loosening the literal-only rule
 - [ ] 32-bit wrap tuning — `--max-bits 32` is wired up but unmeasured; the
       unbounded-input rule probably needs to be stricter before it is usable
+- [ ] `scnprintf` self-bounding — `len += scnprintf(buf + len, SIZE - len,
+      ...)` returns at most `size - 1`, so the accumulator is capped by its own
+      size argument. Recognisable without leaving the statement, and 8 of the
+      77 surviving `high` `narrow-add`
+- [ ] Break-bounded loops — a `if (i >= CONST) break;` in the body is the same
+      claim as a constant loop condition, and `i40e_add_ieee_app_pri_tlv()` is
+      the case that wants it
+- [ ] A loop-bound sink role — `length` in `i40e_parse_ieee_app_tlv()` reaches
+      nothing but `while (offset < length)`, and the sink table has no name for
+      "bounds a loop whose induction variable subscripts a buffer". That miss
+      is a real underflow: `length -= (sizeof(tlv->ouisubtype) + 1)` above the
+      loop wraps for a TLV shorter than 5 bytes
 - [ ] Callee parameter roles — `run_pack(..., buf, t16, ...)` passes a
       wrapped value as an output-buffer size and the sink table cannot see it;
       a table of known length parameters, or a one-pass scan of callee
       signatures in the same file, would
 - [ ] The suite pins per-function behaviour but nothing tree-wide; a change
-      that leaves all thirteen cases green and adds forty findings to `fs/`
+      that leaves all sixteen cases green and adds forty findings to `fs/`
       would pass. The counts are recorded above (6 at medium, 117 at low, at
       `b4ea2789e060`) but nothing checks them

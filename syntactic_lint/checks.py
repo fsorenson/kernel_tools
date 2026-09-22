@@ -84,6 +84,10 @@ _LOOP_NODES = frozenset({
 })
 _BRANCH_NODES = _LOOP_NODES | {'if_statement', 'switch_statement',
                                'conditional_expression'}
+_DECLARATOR_WRAPPERS = frozenset({
+    'pointer_declarator', 'parenthesized_declarator', 'array_declarator',
+    'init_declarator', 'function_declarator',
+})
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,153 @@ def _declared_pointers(body, source):
             if inner is not None and inner.type == 'identifier':
                 names.add(node_text(inner, source))
     return names
+
+
+def _declared_names(body, source):
+    """
+    Every name the function declares, parameters included, whatever its type.
+    Used to tell a compile-time constant in a loop bound from a runtime value:
+    `i < CIFS_NUM_PROT` against `i < src_num_aces`.
+    """
+    root = body
+    if root.parent is not None and root.parent.type == 'function_definition':
+        root = root.parent
+    names = set()
+    for n in _walk(root):
+        if n.type not in ('declaration', 'parameter_declaration'):
+            continue
+        # Only the declarator subtrees: walking the whole declaration would
+        # swallow the initializer's identifiers too, and `int n = limit;`
+        # would then claim `limit` as a declared name.
+        for d in n.children_by_field_name('declarator'):
+            while d is not None and d.type in _DECLARATOR_WRAPPERS:
+                d = d.child_by_field_name('declarator')
+            if d is not None and d.type == 'identifier':
+                names.add(node_text(d, source))
+    return names
+
+
+def _loop_condition(loop):
+    cond = loop.child_by_field_name('condition')
+    if cond is None:
+        return None
+    # A for_statement's condition field is the bare expression; while/do wrap
+    # theirs in a parenthesized_expression.
+    return _unwrap(cond)
+
+
+_UPPER_BOUND_OPS = {'<': 'left', '<=': 'left', '>': 'right', '>=': 'right'}
+
+
+def _loop_bounds_var(var, loop, source, addend, declared):
+    """
+    True when the enclosing loop's condition caps `var` from above, so every
+    trip re-tests the running value: `offset += 3` under `while (offset <
+    length)`, or `i += 2` under `while ((i + 2) <= length)`.
+
+    Whether the cap is itself safe is a question about the cap, not about the
+    accumulation, which is why this demotes rather than suppresses.  `!=` does
+    not qualify — `while (sqcc != sq->pc)` says nothing about magnitude.
+
+    The step has to be a build-time constant, or the cap buys nothing: under
+    `while (offset < length)`, `offset += rec_length` with `rec_length` off the
+    wire clears 2^bits in a single add and the re-test never happens.
+    """
+    if not _compile_time_constant(addend, source, declared):
+        return False
+    cond = _loop_condition(loop)
+    if cond is None:
+        return False
+    for n in _walk(cond):
+        if n.type != 'binary_expression' or len(n.children) < 3:
+            continue
+        side = _UPPER_BOUND_OPS.get(n.children[1].type)
+        if side is None:
+            continue
+        capped = n.children[0] if side == 'left' else n.children[2]
+        other = n.children[2] if side == 'left' else n.children[0]
+        if (var in _identifiers(capped, source)
+                and var not in _identifiers(other, source)):
+            return True
+    return False
+
+
+_CONST_CALLS = frozenset({'ARRAY_SIZE', 'sizeof'})
+
+_CONST_LEAVES = frozenset({'number_literal', 'char_literal',
+                           'sizeof_expression'})
+
+_CONST_NODES = frozenset({'binary_expression', 'unary_expression',
+                          'parenthesized_expression', 'conditional_expression'})
+
+
+def _compile_time_constant(node, source, declared):
+    """
+    True if `node` evaluates to something fixed at build time: literals, sizeof,
+    ARRAY_SIZE(), and identifiers the function does not declare — which in
+    kernel C means a macro or an enumerator.  A field read or a local is not,
+    however constant it happens to be at runtime.
+    """
+    node = _unwrap(node)
+    if node is None:
+        return False
+    if node.type in _CONST_LEAVES:
+        return True
+    if node.type == 'identifier':
+        return node_text(node, source) not in declared
+    if node.type == 'call_expression':
+        return _callee(node, source) in _CONST_CALLS
+    if node.type not in _CONST_NODES:
+        return False
+    kids = [c for c in node.children if c.is_named]
+    return bool(kids) and all(_compile_time_constant(c, source, declared)
+                              for c in kids)
+
+
+def _constant_trip_count(loop, source, declared):
+    """
+    True when the loop runs a number of times fixed at compile time — the
+    condition caps its induction variable against a constant and the update
+    steps by one.  `for (i = 0; i < CIFS_NUM_PROT; i++)` qualifies;
+    `for (i = 0; i < src_num_aces; i++)`, whose bound came off the wire, does
+    not, and that difference is the whole point of the test.
+
+    The trip count is not evaluated — `CIFS_NUM_PROT` is a macro this parser
+    will never resolve.  Being build-time fixed is the claim, and it is enough:
+    the reason narrow-add reports an in-loop accumulation at all is that the
+    number of additions might be attacker-driven.
+    """
+    cond = _loop_condition(loop)
+    if cond is None or cond.type != 'binary_expression' or len(cond.children) < 3:
+        return False
+    side = _UPPER_BOUND_OPS.get(cond.children[1].type)
+    if side is None:
+        return False
+    induction = cond.children[0] if side == 'left' else cond.children[2]
+    limit = cond.children[2] if side == 'left' else cond.children[0]
+    induction = _unwrap(induction)
+    if induction is None or induction.type != 'identifier':
+        return False
+    if not _compile_time_constant(limit, source, declared):
+        return False
+    return _increments(loop, node_text(induction, source), source)
+
+
+def _loop_nest_is_bounded(node, body, source, declared):
+    """
+    True when every loop between `node` and the function body has a build-time
+    trip count.  All of them, because the innermost being fixed says nothing if
+    an outer one runs as many times as the wire asks.
+    """
+    seen = False
+    cur = node.parent
+    while cur is not None and cur is not body:
+        if cur.type in _LOOP_NODES:
+            if not _constant_trip_count(cur, source, declared):
+                return False
+            seen = True
+        cur = cur.parent
+    return seen
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +1038,7 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
     if not widths:
         return findings
     pointers = _declared_pointers(body, source)
+    declared = _declared_names(body, source)
     sinks = _sink_uses(body, source, pointers)
     flow = _value_flow(body, source)
     cursors = _cursor_pointers(body, source)
@@ -988,6 +1140,11 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             'guarded': (_relational_guard(var, rhs_ids, body, source, line)
                         or _bounded_after(var, body, source, line, sink[2])),
             'in_loop': loop is not None,
+            'loop_bounded': loop is not None and (
+                _loop_bounds_var(var, loop, source,
+                                 operands if op == compound
+                                 else operands.children[2], declared)
+                or _loop_nest_is_bounded(n, body, source, declared)),
             'external': _externally_sourced(operands),
             'chain': _walks_a_record_chain(operands, source,
                                            cursors.get(var, ())),
@@ -1004,6 +1161,10 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             key=lambda r: (r[0] != var, _SINK_RANK.index(r[1]), r[2]))
         guarded = all(s['guarded'] for s in sites)
         in_loop = any(s['in_loop'] for s in sites)
+        # Every loop-resident site has to be bounded: one statement the loop
+        # does not cap is enough to run the total up.
+        loop_bounded = in_loop and all(s['loop_bounded'] for s in sites
+                                       if s['in_loop'])
         external = any(s['external'] for s in sites)
         chain = all(s['chain'] for s in sites)
         accumulates = any(s['accumulates'] for s in sites)
@@ -1025,6 +1186,11 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             what = (f"unsigned {bits}-bit {var!r} is decremented without "
                     f"establishing that it is large enough; on wrap it becomes "
                     f"nearly 2^{bits}")
+        elif loop_bounded:
+            what = (f"unsigned {bits}-bit {var!r} accumulates inside a loop "
+                    f"whose trip count is fixed at build time, or which "
+                    f"re-tests {var!r} itself every pass, so the total is not "
+                    f"something the input can drive past 2^{bits}")
         else:
             what = (f"unsigned {bits}-bit {var!r} accumulates"
                     f"{' inside a loop' if in_loop else ''} with no bound on "
@@ -1057,7 +1223,8 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             severity = 'low'
         elif not accumulates:
             severity = 'low'
-        elif check == 'narrow-add' and not (in_loop or external):
+        elif check == 'narrow-add' and not (
+                (in_loop and not loop_bounded) or external):
             severity = 'low'
         else:
             severity = 'medium' if guarded else 'high'
@@ -1068,7 +1235,8 @@ def _narrow_arith(fn, body, source, path, check, ops, max_bits):
             f"{'an' if role[0] in 'aeiou' else 'a'} {role} at line {sink_line}"
             f"{through}{more}",
             var=var, bits=bits, sink_role=role, sink_line=sink_line,
-            sink_var=via, in_loop=in_loop, possibly_guarded=guarded,
+            sink_var=via, in_loop=in_loop, loop_bounded=loop_bounded,
+            possibly_guarded=guarded,
             external_addend=external, record_chain=chain,
             accumulates=accumulates,
             sites=[s['line'] for s in sites],

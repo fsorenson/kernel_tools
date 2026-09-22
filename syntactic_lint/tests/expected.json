@@ -114,6 +114,14 @@
       24
     ]
   ],
+  "suppress_self_bounded_cursor": [
+    [
+      "narrow-add",
+      "low",
+      "i40e_parse_ieee_app_tlv",
+      51
+    ]
+  ],
   "demote_post_hoc_bound": [
     [
       "narrow-sub",
@@ -122,10 +130,10 @@
       125
     ]
   ],
-  "fp_negotiate_protocol_names": [
+  "suppress_constant_trip_count": [
     [
       "narrow-add",
-      "high",
+      "low",
       "CIFSSMBNegotiate",
       53
     ]

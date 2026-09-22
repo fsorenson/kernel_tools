@@ -189,6 +189,25 @@ CASES = (
     ),
 
     Case(
+        name='suppress_self_bounded_cursor',
+        rev='b4ea2789e060',
+        path='drivers/net/ethernet/intel/i40e/i40e_dcb.c',
+        functions=('i40e_parse_ieee_app_tlv',),
+        verdict='clean',
+        note="`offset += 3` under `while (offset < length)`, subscripting "
+             "`buf[offset]`.  The loop re-tests the running value every pass, "
+             "so the cursor is pinned to `length + 2` and whether that is safe "
+             "is a question about `length`.  The constant step is load-bearing "
+             "and this case pins it: under the same condition, "
+             "`offset += rec_length` off the wire clears 2^16 in one add and "
+             "the re-test never happens.\n\n"
+             "             Not reported, and it should be: `length -= "
+             "(sizeof(tlv->ouisubtype) + 1)` above the loop underflows for a "
+             "TLV shorter than 5 bytes, and `length` only ever reaches a loop "
+             "condition, which the sink table has no role for.",
+    ),
+
+    Case(
         name='demote_post_hoc_bound',
         rev='b4ea2789e060',
         path='fs/ntfs3/inode.c',
@@ -207,15 +226,19 @@ CASES = (
     # -- False positives the tool cannot yet clear -------------------------
 
     Case(
-        name='fp_negotiate_protocol_names',
+        name='suppress_constant_trip_count',
         rev='b4ea2789e060',
         path='fs/smb/client/cifssmb.c',
         functions=('CIFSSMBNegotiate',),
-        verdict='fp',
-        note="`count += len` over `CIFS_NUM_PROT` (2) short literal protocol "
-             "names.  The bound is the length of a file-scope const array, "
-             "which is outside the function body.  Pinned as-is so that a "
-             "future const-array lever shows up here as a diff.",
+        verdict='clean',
+        note="`count += len` under `for (i = 0; i < CIFS_NUM_PROT; i++)`.  "
+             "Carried as a known false positive from the first subsystem run "
+             "until the loop-bound rule cleared it: `CIFS_NUM_PROT` is a "
+             "macro, so no input decides how many times the sum is taken.  "
+             "Together with `narrow_add_dacl_accumulators`, whose "
+             "`for (i = 0; i < src_num_aces; i++)` has its bound off the "
+             "wire, this pins the discriminator the rule turns on — the two "
+             "loops are the same shape and only one of them is a question.",
     ),
 
     Case(
