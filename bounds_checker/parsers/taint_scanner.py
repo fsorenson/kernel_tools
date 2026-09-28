@@ -651,7 +651,11 @@ def _names_in(node, source):
     return {node_text(n, source) for n in _walk(node) if n.type == 'identifier'}
 
 
-def _walk_operand(node):
+_OPERAND_SKIP  = frozenset({'argument_list'})
+_COMPARED_SKIP = frozenset({'argument_list', 'sizeof_expression'})
+
+
+def _walk_operand(node, skip=_OPERAND_SKIP):
     """
     _walk without descending into call arguments.  A variable handed to a
     function is not what the enclosing comparison compares: `memcmp(a, p, n)
@@ -661,11 +665,11 @@ def _walk_operand(node):
     comparison is found by the caller's full walk, and only its operands come
     through here.
     """
+    if node.type in skip:
+        return
     yield node
     for child in node.children:
-        if child.type == 'argument_list':
-            continue
-        yield from _walk_operand(child)
+        yield from _walk_operand(child, skip)
 
 
 def _names_in_operand(node, source):
@@ -675,15 +679,26 @@ def _names_in_operand(node, source):
 
 def _names_compared(node, source):
     """
-    The names an operand actually constrains.  A variable reached only as the
-    base of a field access is not one: `if (rsp->ByteCount < 8)` bounds the
-    field, not the pointer a sink then offsets from — `ldm_frag_add()` gates
-    `memcpy(f->data + VBLK_SIZE_HEAD + rec * size, ...)` on `rec >= f->num`,
-    which says nothing about `f`.  Kept separate from _names_in_operand so
-    _in_arithmetic still sees `f->data + n` as an adjustment of `f`.
+    The names an operand actually constrains, which is narrower than the names
+    it mentions in two ways.
+
+    A variable reached only as the base of a field access is not constrained:
+    `if (rsp->ByteCount < 8)` bounds the field, not the pointer a sink then
+    offsets from — `ldm_frag_add()` gates `memcpy(f->data + VBLK_SIZE_HEAD +
+    rec * size, ...)` on `rec >= f->num`, which says nothing about `f`.
+
+    Neither is one reached only through `sizeof`, whose operand is evaluated
+    for its type: `if (partoffset + sizeof(*part) > datasize)` in
+    `mac_partition()` bounds `partoffset`, and `if (start >= end || (size_t)
+    (end - start) < sizeof(*buf))` in `cifs_query_reparse_point()` bounds
+    neither `start` nor `buf`.  `_g2_size_identifiers` drops these for the same
+    reason.
+
+    Kept separate from _names_in_operand so _in_arithmetic still sees
+    `f->data + n` as an adjustment of `f`.
     """
     out = set()
-    for n in _walk_operand(node):
+    for n in _walk_operand(node, _COMPARED_SKIP):
         if n.type != 'identifier':
             continue
         p = n.parent

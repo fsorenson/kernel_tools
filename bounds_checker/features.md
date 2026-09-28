@@ -229,6 +229,23 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       `+=` instances tree-wide.  `cfg_killed_def` in the probe corpus
       (`if (len > 64) return; len += 8; memcpy(...)`) still reads `bounded`.
 
+- [x] Guard reached only through `sizeof` — found while reading the 170
+      redefinition candidates above, a third of which the detector had scored as
+      redefinitions when the guard never constrained the variable to begin with.
+      A `sizeof` operand is evaluated for its type, so `if (partoffset +
+      sizeof(*part) > datasize)` in `mac_partition()` bounds `partoffset` and
+      `if (start >= end || (size_t)(end - start) < sizeof(*buf))` in
+      `cifs_query_reparse_point()` bounds neither `start` nor `buf`.
+      `_names_compared()` no longer descends into `sizeof_expression`, matching
+      what `_g2_size_identifiers()` already did on the size-argument path;
+      `_names_in_operand` keeps descending, so `covers-base-not-offset` is
+      untouched at 80 tree-wide, which is the check that the change stayed
+      inside the guard path.  Tree-wide guarded 1,240 → 1,151 on an unchanged
+      11,074 findings, and `stale-redefinition` 129 → 94 as 35 of those guards
+      stopped being candidates at all.  fs/smb/client 127 → 120, including the
+      three `cifs_query_reparse_point` findings above — the right answer, since
+      the only guard naming `buf` named it via `sizeof(*buf)`.
+
 ## Whole-tree guard measurement
 
 65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both
@@ -257,15 +274,7 @@ now the largest remaining shape; dominance at 21 does not justify CFG machinery.
 
 Reaching definitions has since been implemented.  Dropping the detector's
 requirement that the sink node be re-locatable put the real population at 170,
-not 104, and reading all of them turned up a further defect the detector had
-been scoring as a redefinition: an identifier that appears in a guard only as a
-`sizeof` operand is credited as compared.  `if (partoffset + sizeof(*part) >
-datasize)` in `mac_partition()` bounds `partoffset`; `if (start >= end ||
-(size_t)(end - start) < sizeof(*buf))` in `cifs_query_reparse_point()` bounds
-neither `start` nor `buf`.  37 of the 170 reach the variable this way and no
-other.  `_g2_size_identifiers()` already skips `sizeof` subexpressions; the
-guard path does not.  Same family as the field-base and call-argument fixes,
-not yet done.
+not 104 — the earlier reading that gap2 was mostly symptomatic was wrong.
 
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later
