@@ -198,6 +198,37 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       width.  The None bucket is mixed — `be32_to_cpu(x) - 1` really does reach -1,
       a driver mask hidden behind a macro really does not.
 
+- [x] Reaching definitions — a guard was credited no matter what happened to the
+      variable afterwards, so `old = READ_ONCE(server->fastest_cmd[smb_cmd]);`
+      in `__release_mid()` kept the `if (prev == old)` from the iteration before
+      it.  Staleness is now tested per candidate, since a write that discards an
+      early guard may be covered by a later one, and three shapes do not count:
+
+        - a write that reads the variable (`len -= sizeof(*rp)`, `++`/`--`,
+          `min_t(u16, sense_len, SCSI_SENSE_BUFFERSIZE)`) is a transform the
+          guard still describes.  `if (len < sizeof(*rp)) goto reject;` then
+          `len -= sizeof(*rp)` is how every length-counted protocol loop in the
+          tree is written, and the guard is what makes the subtraction safe;
+        - a write in a branch that leaves (`w0 = ffdc_sz; break;` inside the
+          guard's own arm, `__sbefifo_dump_ffdc`) never reaches the use;
+        - a write gated on a comparison of the same variable, in a branch the
+          use is not in, re-establishes the bound rather than discarding it —
+          `if (w_length > USB_COMP_EP0_BUFSIZ) w_length = USB_COMP_EP0_BUFSIZ;`
+          is how clamps are written.
+
+      Tree-wide guarded 1,356 → 1,240 on an unchanged 11,074 findings; 129
+      `stale-redefinition`, 13 of them reclassified from the two earlier kinds
+      (`covers-base-not-offset` 87 → 80, `upper-bound-only-signed` 98 → 92).
+      fs/smb/client 131 → 127: `__release_mid` above, and three in
+      `cifs_query_reparse_point` where `buf = (struct reparse_data_buffer *)
+      start;` post-dates the only guard naming `buf`.
+
+      Known miss: `+=` after a ceiling guard does break it, while `-=` after a
+      floor guard is what the guard protects — separating those needs the
+      bound-direction machinery applied to intervening writes, and there are 10
+      `+=` instances tree-wide.  `cfg_killed_def` in the probe corpus
+      (`if (len > 64) return; len += 8; memcpy(...)`) still reads `bounded`.
+
 ## Whole-tree guard measurement
 
 65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both
@@ -223,6 +254,18 @@ estimate of 259, because the detector only examines findings it can re-locate �
 treat every count here as a lower bound of roughly half.  It also halved gap1
 and dented gap2, since those populations overlapped it.  Reaching definitions is
 now the largest remaining shape; dominance at 21 does not justify CFG machinery.
+
+Reaching definitions has since been implemented.  Dropping the detector's
+requirement that the sink node be re-locatable put the real population at 170,
+not 104, and reading all of them turned up a further defect the detector had
+been scoring as a redefinition: an identifier that appears in a guard only as a
+`sizeof` operand is credited as compared.  `if (partoffset + sizeof(*part) >
+datasize)` in `mac_partition()` bounds `partoffset`; `if (start >= end ||
+(size_t)(end - start) < sizeof(*buf))` in `cifs_query_reparse_point()` bounds
+neither `start` nor `buf`.  37 of the 170 reach the variable this way and no
+other.  `_g2_size_identifiers()` already skips `sizeof` subexpressions; the
+guard path does not.  Same family as the field-base and call-argument fixes,
+not yet done.
 
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later

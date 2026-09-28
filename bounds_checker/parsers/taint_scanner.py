@@ -778,6 +778,63 @@ def _has_terminal(subtree, source, label_lines=None, line_hi=None):
     return False
 
 
+def _fresh_writes(fn_body, var_names, source):
+    """
+    [(line, node)] for writes that replace one of var_names with a value not
+    derived from it.  A write that reads the variable is a transform the guard
+    still describes: `len -= sizeof(*rp)` after `if (len < sizeof(*rp)) goto
+    reject;` is the shape every length-counted protocol loop in the tree is
+    built from, and the guard is exactly what makes the subtraction safe.
+    `++`/`--` are transforms for the same reason.
+    """
+    out = []
+    for n in _walk(fn_body):
+        if n.type == 'assignment_expression':
+            lhs = n.child_by_field_name('left')
+            if lhs is None or node_text(lhs, source) not in var_names:
+                continue
+            if node_text(n.children[1], source) != '=':
+                continue
+            rhs = n.child_by_field_name('right')
+        elif n.type == 'init_declarator':
+            lhs = n.child_by_field_name('declarator')
+            if lhs is None or node_text(lhs, source) not in var_names:
+                continue
+            rhs = n.child_by_field_name('value')
+        else:
+            continue
+        if rhs is None or not (_names_in(rhs, source) & var_names):
+            out.append((n.start_point[0] + 1, n))
+    return out
+
+
+def _write_reaches(node, fn_body, line_hi, var_names, source, labels):
+    """
+    Whether a write at `node` is still live at line_hi.
+
+    A write in a branch the use is not in reaches it only by falling out of
+    that branch, so a branch that leaves does not count.  Neither does one
+    gated on a comparison of the same variable — `if (w_length >
+    USB_COMP_EP0_BUFSIZ) w_length = USB_COMP_EP0_BUFSIZ;` re-establishes the
+    bound instead of discarding it, which is how clamps are written.
+    """
+    n = node
+    while n is not None and n.id != fn_body.id:
+        p = n.parent
+        if p is not None and p.type == 'if_statement' and any(
+                b is not None and b.id == n.id
+                for b in (p.child_by_field_name('consequence'),
+                          p.child_by_field_name('alternative'))):
+            if not (n.start_point[0] + 1 <= line_hi <= n.end_point[0] + 1):
+                if _has_terminal(n, source, labels, line_hi):
+                    return False
+                cond = p.child_by_field_name('condition')
+                if cond is not None and _comparisons_on(cond, var_names, source):
+                    return False
+        n = p
+    return True
+
+
 def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
                          signed_vars=frozenset(), sink_expr=None):
     """
@@ -789,7 +846,11 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
     (return/goto/break/continue/BUG/panic), or line_hi falls inside it.  Bare
     zero-tests do not qualify.
 
-    Two ways a candidate can be present and still not answer the question:
+    Three ways a candidate can be present and still not answer the question:
+
+    `stale-redefinition` — the variable is given a fresh value between the
+    guard and the use, so the guard describes a value that is gone.  See
+    _fresh_writes and _write_reaches for what does not count.
 
     `covers-base-not-offset` — the sink applies arithmetic to the variable and
     no guard does.  `if (off > total) return;` followed by `data[off + 1]` is
@@ -814,8 +875,10 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
     adjusted = _in_arithmetic(sink_expr, var_names, source)
     bounds = set()
     found_any = False
+    saw_stale = False
     guard_saw_adjustment = False
     labels = None          # built on first candidate; most calls never need it
+    writes = None
 
     for node in _walk(fn_body):
         if node.type != 'if_statement':
@@ -846,6 +909,16 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
         if not (early or encloses):
             continue
 
+        # Staleness is per candidate: an earlier guard can be discarded by a
+        # write a later one still covers.
+        if writes is None:
+            writes = _fresh_writes(fn_body, var_names, source)
+        if any(stmt_line < wline < line_hi
+               and _write_reaches(w, fn_body, line_hi, var_names, source, labels)
+               for wline, w in writes):
+            saw_stale = True
+            continue
+
         found_any = True
         for op, on_left, in_arith, unsigned_cast in cmps:
             if in_arith:
@@ -865,7 +938,7 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
             bounds.add(_FLIP[direction] if early else direction)
 
     if not found_any:
-        return _NO_GUARD
+        return Guard(False, 'stale-redefinition') if saw_stale else _NO_GUARD
     if adjusted and not guard_saw_adjustment:
         return Guard(False, 'covers-base-not-offset')
     if bounds == {'upper'} and (var_names & signed_vars):
