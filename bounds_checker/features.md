@@ -246,6 +246,34 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       three `cifs_query_reparse_point` findings above — the right answer, since
       the only guard naming `buf` named it via `sizeof(*buf)`.
 
+- [x] Guard does not dominate the sink — a credited guard was taken at face
+      value however deeply it was nested, so a check reached on one path was
+      credited for a use reachable on others.  `_dominates()` walks the guard's
+      ancestors and requires every `if`/`switch`/`for`/`while` branch it sits
+      inside to also contain the sink line; a `do` body is not a branch, since
+      it always runs.  This is the last guard gap that structured-C ancestry
+      answers — what remains (loop back edges) needs a real CFG.
+
+      Tree-wide guarded 1,151 → 1,103 on an unchanged 11,074 findings, with 119
+      `does-not-dominate`, 71 of them reclassified from the other kinds
+      (`stale-redefinition` 94 → 38, `upper-bound-only-signed` 92 → 79,
+      `covers-base-not-offset` 80 → 78).  fs/smb/client 120 → 118:
+      `__release_mid` and `CIFSSMBQAllEAs`.
+
+      119 is 7× what the standalone detector predicted, so it was checked
+      rather than taken: the detector examined only the 756 findings whose sink
+      node it could re-locate, compared ancestor sets by identity instead of
+      line span, and ignored loops, which are half the population.  Of the 103
+      that could be traced back to a construct, 52 were `if`/`switch` and 51 a
+      loop.  Reading them turned up a real unchecked use:
+      `kv_parse_power_table()` gates `clock_array_index` inside the
+      `ucNumDPMLevels` loop, then reassigns it from `vce_states[i].clk_idx` in
+      a second loop and indexes `clockInfo[clock_array_index *
+      ucEntrySize]` with no check at all — `si_dpm.c` (amd and radeon) and
+      `trinity_dpm.c` carry the same code.  In `altera_execute()` the guard
+      sits under `if (version > 0)`, so the `version == 0` path reaches
+      `charptr_tmp[long_idx >> 3L]` untested.
+
 ## Whole-tree guard measurement
 
 65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both
@@ -272,9 +300,15 @@ treat every count here as a lower bound of roughly half.  It also halved gap1
 and dented gap2, since those populations overlapped it.  Reaching definitions is
 now the largest remaining shape; dominance at 21 does not justify CFG machinery.
 
-Reaching definitions has since been implemented.  Dropping the detector's
-requirement that the sink node be re-locatable put the real population at 170,
-not 104 — the earlier reading that gap2 was mostly symptomatic was wrong.
+Both remaining shapes in that table have since been implemented, and the
+detector undercounted both.  Dropping the requirement that the sink node be
+re-locatable put reaching definitions at 170, not 104 — the earlier reading
+that gap2 was mostly symptomatic was wrong.  Dominance came in at 119, not 21,
+for the same reason plus two more: ancestor sets were compared by identity
+rather than line span, and loops were not counted at all.  "Dominance does not
+justify the machinery" was wrong on the number, though right that no CFG is
+needed — AST ancestry suffices.  Treat these detector counts as lower bounds of
+between a half and a seventh.
 
 - [x] Type width narrowing (Category H) — server-supplied `u32` stored in `u16` or
       narrower intermediate; the narrowing silently caps the value, allowing a later

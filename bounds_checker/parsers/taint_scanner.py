@@ -850,6 +850,32 @@ def _write_reaches(node, fn_body, line_hi, var_names, source, labels):
     return True
 
 
+_BRANCHING = frozenset({'if_statement', 'switch_statement',
+                        'for_statement', 'while_statement'})
+
+
+def _dominates(guard, fn_body, line_hi):
+    """
+    Whether every branch the guard sits inside also contains line_hi.
+
+    For structured C this is dominance, and it is the one place AST ancestry
+    and dominance come apart for a guard that is otherwise credited: the guard
+    runs on some path to the use but not on all of them.
+    `nvme_auth_process_dhchap_challenge()` credits `} else if (dhvlen != 0) {
+    return -EPROTO; }`, which runs only for the NULL DH group, against a
+    `kmalloc(dhvlen)` below `skip_kpp:` that the other path reaches untested.
+    A `do` body is not a branch — it always runs.
+    """
+    n = guard
+    while n is not None and n.id != fn_body.id:
+        p = n.parent
+        if p is not None and p.type in _BRANCHING and not (
+                n.start_point[0] + 1 <= line_hi <= n.end_point[0] + 1):
+            return False
+        n = p
+    return True
+
+
 def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
                          signed_vars=frozenset(), sink_expr=None):
     """
@@ -861,7 +887,10 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
     (return/goto/break/continue/BUG/panic), or line_hi falls inside it.  Bare
     zero-tests do not qualify.
 
-    Three ways a candidate can be present and still not answer the question:
+    Four ways a candidate can be present and still not answer the question:
+
+    `does-not-dominate` — the guard sits inside a branch the use is not in, so
+    some path reaches the use without running it.  See _dominates.
 
     `stale-redefinition` — the variable is given a fresh value between the
     guard and the use, so the guard describes a value that is gone.  See
@@ -891,6 +920,7 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
     bounds = set()
     found_any = False
     saw_stale = False
+    saw_nondominating = False
     guard_saw_adjustment = False
     labels = None          # built on first candidate; most calls never need it
     writes = None
@@ -924,6 +954,10 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
         if not (early or encloses):
             continue
 
+        if not _dominates(node, fn_body, line_hi):
+            saw_nondominating = True
+            continue
+
         # Staleness is per candidate: an earlier guard can be discarded by a
         # write a later one still covers.
         if writes is None:
@@ -953,7 +987,11 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
             bounds.add(_FLIP[direction] if early else direction)
 
     if not found_any:
-        return Guard(False, 'stale-redefinition') if saw_stale else _NO_GUARD
+        if saw_nondominating:
+            return Guard(False, 'does-not-dominate')
+        if saw_stale:
+            return Guard(False, 'stale-redefinition')
+        return _NO_GUARD
     if adjusted and not guard_saw_adjustment:
         return Guard(False, 'covers-base-not-offset')
     if bounds == {'upper'} and (var_names & signed_vars):
