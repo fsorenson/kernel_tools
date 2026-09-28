@@ -125,7 +125,8 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       so early-exit conditions are inverted before classification.  On
       fs/smb/client: 295 findings unchanged, guarded 159 → 156 — `CIFSPOSIXCreate`
       and `parse_posix_sids` (base-not-offset), `smb2_check_message`
-      (`smb2_rsp_struct_sizes[command]`, signed).  Without the nonneg-source
+      (`smb2_rsp_struct_sizes[command]`, signed — later reclassified, see the
+      range rule below).  Without the nonneg-source
       carve-out it is 159 → 144, and all twelve of the difference are
       `int len = strnlen(...)` under `if (len >= bleft) return;`.
 
@@ -174,11 +175,35 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       to the ranking score and is handed to Stage 2 as context — so the gain is
       that Stage 2 is no longer told a guard exists when it does not.
 
+- [x] Signed guard: non-negativity by range — a ceiling-only guard is a real gap
+      only when the variable can reach the negative half, and the enumerated
+      `strlen`/`strnlen`/`ARRAY_SIZE`/`sizeof` carve-out was too narrow to say so.
+      `_max_bits()` bounds an initializer's width from the shapes parsers actually
+      write — an unsigned local or cast (`_build_local_unsigned()` maps the
+      declared width), a `le16_to_cpu`-class taint source, a mask, a right shift,
+      `sizeof` — and a variable whose every assignment fits in width−1 bits keeps
+      its guard.  Compound assignment and `++`/`--` still disqualify outright:
+      `len -= hdr` reopens the negative half wherever len started.  `int command =
+      le16_to_cpu(shdr->Command)` in `smb2_check_message()` was the only
+      fs/smb/client hit and is one of these — 16 bits into 32 — so that earlier
+      example was a false positive.  Tree-wide 126 → 98 against an unchanged
+      11,074 findings and an unchanged 87 `covers-base-not-offset`; fs/smb/client
+      guarded 130 → 131.  (fs/smb/client totals moved 295 → 300 across this work
+      from kernel-tree drift, not from the rule; both counts above are from
+      `/home/src/linux` at `e2f9a0adaae4`.)
+
+      The surviving 98 are conservative by construction: 25 have a range that is
+      known and genuinely too wide (`int fw_bin_count = le32_to_cpu(...)`), 70 have
+      at least one assignment `_max_bits` returns None for, and 3 have no declared
+      width.  The None bucket is mixed — `be32_to_cpu(x) - 1` really does reach -1,
+      a driver mask hidden behind a macro really does not.
+
 ## Whole-tree guard measurement
 
 65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both
 before and after the guard work (nothing here filters); `upper-bound-only-signed`
-fires 126 times and `covers-base-not-offset` 87.
+fires 126 times and `covers-base-not-offset` 87.  (The range rule later took the
+signed count to 98; the table below predates it.)
 
 Suppression shapes that do not hold up, measured with detectors carried on
 positive *and* negative controls, over the guarded findings whose sink node and

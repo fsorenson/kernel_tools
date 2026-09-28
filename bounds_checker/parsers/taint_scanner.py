@@ -513,16 +513,108 @@ def _build_local_signed(fn_body, source):
             if decl is None or decl.type != 'identifier':
                 continue
             seen.setdefault(node_text(decl, source), set()).add(is_signed)
+    widths = _build_local_widths(fn_body, source)
+    unsigned = _build_local_unsigned(fn_body, source)
     return {name for name, vals in seen.items()
-            if vals == {True} and not _only_nonneg_sources(fn_body, name, source)}
+            if vals == {True}
+            and not _only_nonneg_sources(fn_body, name, source,
+                                         widths.get(name), unsigned)}
 
 
-def _only_nonneg_sources(fn_body, name, source):
+def _build_local_unsigned(fn_body, source):
+    """{name: bit width} for integer locals declared with an unsigned type."""
+    out, conflict = {}, set()
+    for n in _walk(fn_body):
+        if n.type != 'declaration':
+            continue
+        type_node = n.child_by_field_name('type')
+        if type_node is None:
+            continue
+        t = node_text(type_node, source).strip()
+        if t not in _UNSIGNED_TYPES:
+            continue
+        w = _get_type_width(t)
+        if w is None:
+            continue
+        for child in n.children:
+            decl = child.children[0] if (child.type == 'init_declarator'
+                                         and child.children) else child
+            if decl is None or decl.type != 'identifier':
+                continue
+            nm = node_text(decl, source)
+            if out.get(nm, w) != w:
+                conflict.add(nm)
+            out[nm] = w
+    for nm in conflict:
+        out.pop(nm, None)
+    return out
+
+
+def _max_bits(node, source, unsigned, budget):
     """
-    True if every value `name` takes in this body comes from _NONNEG_CALLS.
+    Upper bound on how many bits the expression's value can occupy, or None
+    when nothing local settles it.  Only the shapes that actually produce
+    provably non-negative values in parsers are modelled — a 16-bit field
+    widened into an int, a mask, a right shift of an unsigned.
+    """
+    if node is None:
+        return None
+    t = node.type
+    if t == 'parenthesized_expression':
+        inner = [c for c in node.children if c.is_named]
+        return _max_bits(inner[0], source, unsigned, budget) if inner else None
+    if t == 'sizeof_expression':
+        return 16
+    if t == 'number_literal':
+        try:
+            return int(node_text(node, source).rstrip('uUlL'), 0).bit_length()
+        except ValueError:
+            return None
+    if t == 'identifier':
+        return unsigned.get(node_text(node, source))
+    if t == 'cast_expression':
+        ct = node.child_by_field_name('type')
+        cw = _get_type_width(node_text(ct, source)) if ct is not None else None
+        if ct is not None and node_text(ct, source).strip() in _UNSIGNED_TYPES:
+            return cw
+        return None
+    if t == 'call_expression':
+        fname = node_text(node.child_by_field_name('function'), source)
+        if fname in _NONNEG_CALLS:
+            return budget           # accepted by fiat, as before
+        return TAINT_SOURCE_WIDTHS.get(fname)
+    if t == 'binary_expression' and len(node.children) >= 3:
+        op = node_text(node.children[1], source)
+        lhs = _max_bits(node.children[0], source, unsigned, budget)
+        rhs = _max_bits(node.children[2], source, unsigned, budget)
+        if op == '&':
+            vals = [v for v in (lhs, rhs) if v is not None]
+            return min(vals) if vals else None
+        if op == '>>':
+            try:
+                shift = int(node_text(node.children[2], source).rstrip('uUlL'), 0)
+            except ValueError:
+                return None
+            return max(0, lhs - shift) if lhs is not None else None
+        if op in ('|', '^'):
+            return max(lhs, rhs) if (lhs is not None and rhs is not None) else None
+    return None
+
+
+def _only_nonneg_sources(fn_body, name, source, width=None, unsigned=None):
+    """
+    True if every value `name` takes in this body provably clears the sign bit.
     A compound assignment or a ++/-- disqualifies it: `len -= hdr` reopens the
     negative half regardless of where len started.
+
+    With the declared width known, an expression qualifies when its range fits
+    in width-1 bits, which is what makes `int pin = le16_to_cpu(...)` and
+    `int length = type_len >> 8` (u32) safe.  Just under half of this rule's
+    tree-wide hits were one of those two.  Without a width only the
+    _NONNEG_CALLS/sizeof forms qualify.
     """
+    budget = None if width is None else width - 1
+    unsigned = unsigned or {}
     found_one = False
     for n in _walk(fn_body):
         if n.type == 'update_expression':
@@ -541,12 +633,16 @@ def _only_nonneg_sources(fn_body, name, source):
             continue
         if decl is None or rhs is None or node_text(decl, source) != name:
             continue
-        if rhs.type == 'sizeof_expression':
-            pass
-        elif not (rhs.type == 'call_expression'
-                  and node_text(rhs.child_by_field_name('function'), source)
-                      in _NONNEG_CALLS):
-            return False
+        if budget is None:
+            if not (rhs.type == 'sizeof_expression'
+                    or (rhs.type == 'call_expression'
+                        and node_text(rhs.child_by_field_name('function'), source)
+                            in _NONNEG_CALLS)):
+                return False
+        else:
+            bits = _max_bits(rhs, source, unsigned, budget)
+            if bits is None or bits > budget:
+                return False
         found_one = True
     return found_one
 
