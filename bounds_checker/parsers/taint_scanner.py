@@ -114,6 +114,27 @@ DANGEROUS_SINKS = {
     'devm_kcalloc':      {'size_args': [1, 2], 'alloc': True, 'is_counted': True},
 }
 
+_ALLOC_FNS = frozenset(k for k, v in DANGEROUS_SINKS.items() if v.get('alloc'))
+
+
+def _rhs_is_alloc(rhs, source):
+    """
+    Whether `rhs` is exactly an allocator call, casts and parens aside.
+
+    Requiring it to be the whole expression matters: `kmalloc(n, GFP) + off`
+    is not an allocation result, it is an offset into one.
+    """
+    n = rhs
+    while n is not None and n.type in ('cast_expression', 'parenthesized_expression'):
+        n = n.child_by_field_name('value') or (
+            n.children[1] if n.type == 'parenthesized_expression'
+            and len(n.children) > 1 else None)
+    if n is None or n.type != 'call_expression':
+        return False
+    fn_id = next((c for c in n.children if c.type == 'identifier'), None)
+    return fn_id is not None and node_text(fn_id, source) in _ALLOC_FNS
+
+
 # For Category C: these operators produce a subscript expression
 _SUBSCRIPT_NODE = 'subscript_expression'
 
@@ -876,6 +897,24 @@ def _dominates(guard, fn_body, line_hi):
     return True
 
 
+def _enclosing_stmt(node, fn_body):
+    """
+    Nearest ancestor that is a statement in a block, as a dedup key.
+
+    One bounds check placed before a statement covers every dereference in
+    it, so `if (((compare_sids(&pntace->sid, &sid_unix_NFS_mode) == 0) ||
+    (compare_sids(&pntace->sid, pownersid) == 0) || ...)))` in
+    `set_chmod_dacl()` is one check site, not five.  A controlling statement's
+    own body is separate, since it stops at the inner compound_statement.
+    """
+    n = node
+    while n.parent is not None and n.parent.id != fn_body.id:
+        if n.parent.type == 'compound_statement':
+            break
+        n = n.parent
+    return n.id
+
+
 def _kill_extent(node, fn_body):
     """
     Last line through which a redefinition at `node` replaces the old value.
@@ -1068,6 +1107,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
     """
     tainted = dict(initial_taint) if initial_taint else {}
     killed = {}          # var -> (last line the kill covers, the taint it replaced)
+    deref_seen = {}      # (tainted var, statement) -> the finding already emitted
     findings = []
     call_events = []
 
@@ -1165,6 +1205,17 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 continue
 
             prev = tainted.get(lhs_var) if is_merge else None
+
+            # An allocator hands back exactly as many valid bytes as it was
+            # asked for, so however the size was chosen the pointer is in
+            # bounds.  A server-chosen size is already Cat B at the call; left
+            # to propagate, it makes every write into the fresh buffer look
+            # like a server-controlled dereference.
+            if not is_merge and _rhs_is_alloc(rhs, source):
+                if lhs_var in tainted:
+                    killed[lhs_var] = (_kill_extent(node, fn_body),
+                                       tainted.pop(lhs_var))
+                continue
 
             src_fn = _node_has_taint_source_call(rhs, source)
             if src_fn:
@@ -1597,6 +1648,12 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             if taint_line >= sink_line:
                 continue
 
+            stmt_key = (ref, _enclosing_stmt(node, fn_body))
+            if stmt_key in deref_seen:
+                first = deref_seen[stmt_key]
+                first['deref_sites'] += 1
+                continue
+
             fld_node = node.child_by_field_name('field')
             field_name = node_text(fld_node, source) if fld_node else '?'
             sink_snippet = get_source_line(source, sink_line)
@@ -1619,6 +1676,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 'sink_arg_index':  0,
                 'sink_arg_role':   'tainted_ptr_deref',
                 'field_name':      field_name,
+                'deref_sites':     1,
                 'possibly_guarded': guarded.found,
                 'guard_kind':       guarded.kind,
                 'reason': (
@@ -1627,6 +1685,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     f"<= packet_end; {ref}->{field_name} may read beyond packet bounds"
                 ),
             })
+            deref_seen[stmt_key] = findings[-1]
 
         # ── Category C: array subscript with tainted index ──
         elif node.type == _SUBSCRIPT_NODE:
@@ -1705,7 +1764,28 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             seen.add(key)
             unique.append(f)
 
-    return unique, call_events
+    # One value reaching many sinks that ask the same question of it is one
+    # thing to check, not many: `smb_cmd` in __release_mid() indexes twelve
+    # per-command stats arrays and `nlen` in check_wsl_eas() is the length
+    # argument to eight strncmp()s.  Whoever answers "is it bounded here?"
+    # answers it for all of them at once.  The guard verdict is part of the key
+    # so a use the guard reaches and one it does not stay separate, and so does
+    # the role, so a size argument never merges with a subscript.
+    repeats = {}
+    collapsed = []
+    for f in unique:
+        key = (f['tainted_var'], f['taint_line'], f['category'],
+               f['sink_fn'], f.get('sink_arg_role', ''),
+               f['possibly_guarded'], f.get('guard_kind', ''))
+        first = repeats.get(key)
+        if first is None:
+            f['sink_lines'] = [f['sink_line']]
+            repeats[key] = f
+            collapsed.append(f)
+        else:
+            first['sink_lines'].append(f['sink_line'])
+
+    return collapsed, call_events
 
 
 # ---------------------------------------------------------------------------

@@ -315,6 +315,99 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       depends on whether `data->wsl.eas` holds server bytes on entry, which is
       a caller fact Stage 1 does not have.
 
+- [x] An allocator's return value inherited the taint of its size argument —
+      so every store into a freshly allocated buffer read as a
+      server-controlled dereference.  `id_mode_to_cifs_acl()` produced 15
+      findings, nearly all of them writes into the `kzalloc(nsize, GFP_KERNEL)`
+      result.  The size being server-chosen is already reported as Cat B at the
+      allocation itself; propagating it past the call adds nothing and buries
+      that one finding under the rest.  `_rhs_is_alloc()` now kills the taint on
+      a plain assignment whose entire rhs, casts and parens aside, is a call to
+      a `DANGEROUS_SINKS` entry marked `alloc`.  Requiring the whole expression
+      matters — `kmalloc(n, GFP) + off` is an offset into an allocation, not
+      one.  The kill uses the same `_kill_extent()` scoping, so an allocation in
+      one arm of an `if` does not clear the taint below it.
+
+      `id_mode_to_cifs_acl` 15 → 6.
+
+- [x] Cat E emitted one finding per dereference rather than per statement.  A
+      bounds check goes in front of a statement and covers every dereference
+      in it, so the five `compare_sids()` calls in one `if` in
+      `set_chmod_dacl()` are one check site, not five; `build_sec_desc()` was
+      reporting 18 findings for roughly half that many places to look.
+      `_enclosing_stmt()` walks to the nearest ancestor whose parent is a
+      `compound_statement` and uses its node id, keyed with the tainted
+      variable, as a dedup key; the surviving finding carries `deref_sites` so
+      the count is not lost.  A controlling statement's own body stays separate,
+      since the walk stops at the inner `compound_statement`.
+
+      `build_sec_desc` 18 → 12.
+
+      Both fixes together: fs/smb/client 277 → 241, and 306 → 241 against the
+      run that prompted the review.  Tree-wide 10,864 → 10,129 findings, guarded
+      1,080 → 1,038; no guard kind moves except in proportion
+      (`does-not-dominate` 92 → 91, `covers-base-not-offset` 77 → 76).
+
+- [x] One value reaching many sinks that ask the same question of it was
+      reported once per sink.  `smb_cmd` in `__release_mid()` indexes twelve
+      per-command stats arrays and produced twelve findings; `nlen` in
+      `check_wsl_eas()` is the length argument to eight `strncmp()`s and
+      produced eight.  Whoever answers "is it bounded here?" answers it for all
+      of them at once, so Stage 2 was adjudicating the same question repeatedly
+      and paying for the function's full source each time.  `_scan_body()` now
+      ends with a collapse on `(tainted_var, taint_line, category, sink_fn,
+      sink_arg_role, possibly_guarded, guard_kind)`, keeping the first and
+      recording the rest in `sink_lines`.
+
+      The key is what makes this safe.  The guard verdict is in it, so a use
+      the guard reaches and a use it does not stay separate — `gap3_bare_too`
+      in the probe corpus still reports both its unguarded 100 and its guarded
+      102.  The role is in it, so a size argument never merges with a
+      subscript.  Verified lossless on fs/smb/client: 94 distinct
+      `(function, category, var, taint_line, sink_fn, role, guarded, kind)`
+      tuples before and after, none lost, none gained.
+
+      Phase 2 has the same shape one level up: the finding is anchored in the
+      caller, and the caller has one place to put a check no matter how many
+      sinks the argument reaches inside the callee.  Passing `offs` to
+      `smb2_parse_native_symlink()` reached four and became four adjudications
+      of one question.  Phase 2 now emits one finding per
+      `(caller, var, callee, arg)` carrying a `callee_sinks` list, with the
+      most severe sink as the headline and `possibly_guarded` requiring *all*
+      callee sinks to be guarded — one unguarded use downstream still obliges
+      the caller.  Phase 1's own collapse feeds this, so a callee sink list
+      carries `sink_lines` too; verified that no callee sink disappears.
+
+      Both lists are rendered into the Stage 2 prompt, so the adjudicator sees
+      every site it would have seen before, in one place instead of scattered
+      across a dozen findings.
+
+      fs/smb/client 241 → 123 (306 → 123 against the run that prompted the
+      review, 60 %); `check_wsl_eas` 16 → 3, `__release_mid` 12 → 3,
+      `cifs_query_path_info` 14 → 4, cross-function 74 → 29.  Tree-wide
+      10,129 → 5,518, guarded 1,038 → 751 — nearly half of every finding the
+      tool has ever produced was a restatement.
+
+- [x] A truncated Stage 2 response became a permanent `error` verdict for the
+      function.  `CIFSFindFirst` failed this way with a reported 656 output
+      tokens against a 16,384 cap, which looks impossible until you account for
+      Gemini's dynamic thinking: `candidates_token_count` excludes
+      `thoughts_token_count`, and the ~15,700 reasoning tokens are charged
+      against `max_output_tokens` just the same.  Three parts, all needed to
+      make the failure legible and survivable:
+
+      `LLMResponse.output_tokens` now includes reasoning, with
+      `thinking_tokens` broken out; `output_limit` reports the cap the backend
+      actually applied, since `_gemini_generate()` scales our request by
+      `max(n*3, 16384)` and the old message quoted our number rather than the
+      real one.  And `_call_llm()` treats `stop_reason == 'max_tokens'` as a
+      retry with a doubled budget instead of a hard raise — the loop already
+      retried invalid JSON, and a truncation says even less about the code than
+      malformed JSON does.  Three attempts, so an 8-finding function goes
+      5,120 → 10,240 → 20,480 (Gemini sees 16,384 → 30,720 → 61,440); the retry
+      note is only prepended for a JSON failure, not a truncation, since the
+      model did nothing wrong in that case.
+
 ## Whole-tree guard measurement
 
 65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both

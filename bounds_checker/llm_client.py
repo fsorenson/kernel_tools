@@ -22,7 +22,11 @@ class LLMResponse:
     text: str = ''
     thinking: str = ''
     input_tokens: int = 0
+    # Everything the model emitted, reasoning included — that is what the
+    # provider charges against the output cap.
     output_tokens: int = 0
+    thinking_tokens: int = 0    # of output_tokens; 0 when the provider does not split it out
+    output_limit: int = 0       # cap the backend actually applied, for truncation diagnostics
     stop_reason: str = ''
 
 
@@ -128,6 +132,7 @@ def _anthropic_generate(client, model, system, prompt, max_tokens,
     resp.stop_reason = msg.stop_reason or ''
     resp.input_tokens = msg.usage.input_tokens
     resp.output_tokens = msg.usage.output_tokens
+    resp.output_limit = kwargs['max_tokens']
     return resp
 
 
@@ -176,5 +181,10 @@ def _gemini_generate(client, model, system, prompt, max_tokens,
     usage = resp_msg.usage_metadata
     if usage:
         resp.input_tokens = usage.prompt_token_count or 0
-        resp.output_tokens = usage.candidates_token_count or 0
+        # candidates_token_count counts only the visible answer, but dynamic
+        # thinking is billed against max_output_tokens too — a MAX_TOKENS stop
+        # with 656 "output" tokens is really ~15,700 thinking plus the answer.
+        resp.thinking_tokens = getattr(usage, 'thoughts_token_count', 0) or 0
+        resp.output_tokens = (usage.candidates_token_count or 0) + resp.thinking_tokens
+    resp.output_limit = output_tokens
     return resp

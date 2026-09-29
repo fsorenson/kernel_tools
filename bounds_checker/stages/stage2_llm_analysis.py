@@ -971,6 +971,26 @@ def _format_findings(findings):
                 f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
                 f"    Sink snippet:   {f['sink_snippet']}\n"
             )
+            others = [s for s in f.get('callee_sinks', ())
+                      if s['sink_line'] != f['sink_line']]
+            if others:
+                entry += (
+                    f"    The same argument reaches {len(others)} further "
+                    f"sink(s) in {f['callee_fn']}(); one check in the caller "
+                    f"covers all of them:\n"
+                )
+                for s in others:
+                    also = [n for n in s.get('sink_lines', ())
+                            if n != s['sink_line']]
+                    entry += (
+                        f"      line {s['sink_line']}"
+                        f"{' (also ' + ', '.join(map(str, also)) + ')' if also else ''}"
+                        f"  Cat {s['category']}  "
+                        f"{s['sink_fn']}() arg {s['sink_arg_index']}, "
+                        f"role={s['sink_arg_role']}"
+                        f"{'  [guarded in callee]' if s['callee_guards'] else ''}"
+                        f"\n        {s['sink_snippet'].strip()}\n"
+                    )
             if read_only_callee:
                 entry += (
                     f"    Note: {f['callee_fn']}() is a READ-ONLY function "
@@ -1111,6 +1131,13 @@ def _format_findings(findings):
                 f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
                 f"    Sink snippet:   {f['sink_snippet']}\n"
             )
+        repeats = [n for n in f.get('sink_lines', ()) if n != f['sink_line']]
+        if repeats:
+            entry += (
+                f"    Also at line(s) {', '.join(str(n) for n in repeats)} — "
+                f"the same value used the same way, with the same guard verdict, "
+                f"so one answer covers all of them.\n"
+            )
         entry += (
             f"    Possibly guarded: {guard_tag}\n"
             f"    Scanner reason: {f['reason']}"
@@ -1206,6 +1233,13 @@ def _call_llm(client, model, prompt, verbose,
     _MAX   = 8192
     json_tokens = min(_MAX, max(_MIN, _BASE + n_findings * _PER))
 
+    # A truncation is not a verdict about the code, so it must not be allowed to
+    # become one: the budget is grown and the call repeated.  Gemini's dynamic
+    # thinking is what drives this — it spends against the same cap as the answer
+    # and can consume nearly all of it before the JSON starts.
+    _ATTEMPTS = 3
+    _GROWTH   = 2
+
     _RETRY_NOTE = (
         "IMPORTANT: your previous response was not valid JSON.  "
         "Output ONLY the JSON object — nothing before the opening brace, "
@@ -1226,8 +1260,9 @@ def _call_llm(client, model, prompt, verbose,
                 debug_fh.flush()
 
     last_exc = None
-    for attempt in range(2):
-        msg_prompt = (_RETRY_NOTE + prompt) if attempt else prompt
+    need_note = False       # previous attempt returned something that was not JSON
+    for attempt in range(_ATTEMPTS):
+        msg_prompt = (_RETRY_NOTE + prompt) if need_note else prompt
 
         _dbg(f"{'PROMPT (retry)' if attempt else 'PROMPT'} — {fn_label}", msg_prompt)
 
@@ -1240,18 +1275,32 @@ def _call_llm(client, model, prompt, verbose,
         )
 
         response_text = msg.text
+        # The backend may apply a larger cap than we asked for (Gemini scales
+        # ours up to leave room for thinking), so report what it actually used.
+        limit = msg.output_limit or json_tokens
 
         if msg.thinking:
             _dbg(f'THINKING — {fn_label}', msg.thinking)
         _dbg(f'RESPONSE — {fn_label}', response_text,
-             footer=(f"stop={msg.stop_reason}  "
-                     f"in={msg.input_tokens}  out={msg.output_tokens}"))
+             footer=(f"stop={msg.stop_reason}  in={msg.input_tokens}  "
+                     f"out={msg.output_tokens}/{limit}"
+                     + (f" (thinking {msg.thinking_tokens})"
+                        if msg.thinking_tokens else '')))
 
         if msg.stop_reason == 'max_tokens':
-            raise ValueError(
-                f"output truncated at {json_tokens} tokens ({len(response_text)} chars) — "
-                f"response cut mid-JSON; consider using --thinking or reducing findings per function"
+            thought = (f", {msg.thinking_tokens} of them reasoning"
+                       if msg.thinking_tokens else '')
+            last_exc = ValueError(
+                f"output truncated at {limit} tokens "
+                f"({msg.output_tokens} used{thought}, {len(response_text)} chars of JSON)"
             )
+            need_note = False
+            if attempt + 1 < _ATTEMPTS:
+                json_tokens *= _GROWTH
+                _dbg_raw(f"\n[truncated at {limit} on attempt {attempt}, "
+                         f"retrying with budget {json_tokens}]\n")
+                continue
+            break
 
         if verbose:
             suffix = ' (retry)' if attempt else ''
@@ -1268,6 +1317,7 @@ def _call_llm(client, model, prompt, verbose,
         start = m.start() if m else text.find('{')
         if start == -1:
             last_exc = ValueError(f"No JSON object in response: {text[:200]!r}")
+            need_note = True
             continue
         decoder = json.JSONDecoder()
         try:
@@ -1275,8 +1325,9 @@ def _call_llm(client, model, prompt, verbose,
             return obj
         except json.JSONDecodeError as e:
             last_exc = ValueError(f"JSON parse error: {e}\n{text[start:start+300]}")
+            need_note = True
             _dbg_raw(f"\n[JSON parse failed on attempt {attempt}, "
-                     f"{'retrying' if attempt == 0 else 'giving up'}]: {e}\n")
+                     f"{'retrying' if attempt + 1 < _ATTEMPTS else 'giving up'}]: {e}\n")
 
     raise last_exc
 

@@ -190,6 +190,7 @@ def build_param_sink_map(c_paths, verbose=False):
                         'sink_snippet':   f['sink_snippet'],
                         'sink_arg_index': f['sink_arg_index'],
                         'sink_arg_role':  f['sink_arg_role'],
+                        'sink_lines':     f.get('sink_lines', [f['sink_line']]),
                         'callee_guards':  f['possibly_guarded'],
                         'callee_file':    str(path),
                     })
@@ -273,47 +274,72 @@ def scan_cross_function_calls(c_paths, param_sink_map, verbose=False):
 
                     read_only = _is_read_only_callee(callee)
 
-                    for sink_desc in callee_params[arg_idx]:
-                        possibly_guarded = (caller_guarded.found or
-                                            sink_desc['callee_guards'])
-                        callee_short = Path(sink_desc['callee_file']).name
+                    # The finding is anchored in the caller, and the caller has
+                    # exactly one place to put a check regardless of how many
+                    # sinks the argument reaches inside the callee.  Passing
+                    # `offs` to smb2_parse_native_symlink() reached four, which
+                    # became four adjudications of one question.  The callee's
+                    # guards only excuse the caller if every one of those sinks
+                    # is guarded, so they are combined with `all`.
+                    sinks = callee_params[arg_idx]
+                    lead = min(sinks, key=lambda s: (s['severity'] != 'high',
+                                                     s['sink_line']))
+                    sink_desc = lead
+                    possibly_guarded = (
+                        caller_guarded.found or
+                        all(s['callee_guards'] for s in sinks))
+                    callee_short = Path(sink_desc['callee_file']).name
 
-                        findings.append({
-                            'function':          caller_name,
-                            'file':              str(path),
-                            'propagation':       'cross_function',
-                            'callee_fn':         callee,
-                            'callee_file':       sink_desc['callee_file'],
-                            'callee_is_read_only': read_only,
-                            'category':          sink_desc['category'],
-                            'severity':          sink_desc['severity'],
-                            # Taint origin (in caller)
-                            'taint_source_fn':   taint_info['source_fn'],
-                            'tainted_var':       taint_info['var'],
-                            'taint_line':        taint_info['line'],
-                            'taint_snippet':     get_source_line(source, taint_info['line']),
-                            # Call site (in caller)
-                            'call_site_line':    ev['line'],
-                            'call_site_snippet': ev['call_snippet'],
-                            # Sink (in callee)
-                            'sink_fn':           sink_desc['sink_fn'],
-                            'sink_line':         sink_desc['sink_line'],
-                            'sink_snippet':      sink_desc['sink_snippet'],
-                            'sink_arg_index':    sink_desc['sink_arg_index'],
-                            'sink_arg_role':     sink_desc['sink_arg_role'],
-                            'possibly_guarded':  possibly_guarded,
-                            'guard_kind':        caller_guarded.kind,
-                            'reason': (
-                                f"tainted {taint_info['var']} "
-                                f"(from {taint_info['source_fn']}() "
-                                f"line {taint_info['line']}) "
-                                f"passed to {callee}() arg {arg_idx} "
-                                f"(line {ev['line']}), which uses it as "
-                                f"{sink_desc['sink_arg_role']} in "
-                                f"{sink_desc['sink_fn']}() "
-                                f"({callee_short}:{sink_desc['sink_line']})"
-                            ),
-                        })
+                    findings.append({
+                        'function':          caller_name,
+                        'file':              str(path),
+                        'propagation':       'cross_function',
+                        'callee_fn':         callee,
+                        'callee_file':       sink_desc['callee_file'],
+                        'callee_is_read_only': read_only,
+                        'category':          sink_desc['category'],
+                        'severity':          sink_desc['severity'],
+                        'callee_sinks':      [
+                            {'sink_fn':   s['sink_fn'],
+                             'sink_line': s['sink_line'],
+                             'sink_lines':     s['sink_lines'],
+                             'sink_snippet':   s['sink_snippet'],
+                             'sink_arg_role':  s['sink_arg_role'],
+                             'sink_arg_index': s['sink_arg_index'],
+                             'category':       s['category'],
+                             'callee_guards':  s['callee_guards']}
+                            for s in sorted(sinks, key=lambda s: s['sink_line'])
+                        ],
+                        # Taint origin (in caller)
+                        'taint_source_fn':   taint_info['source_fn'],
+                        'tainted_var':       taint_info['var'],
+                        'taint_line':        taint_info['line'],
+                        'taint_snippet':     get_source_line(source, taint_info['line']),
+                        # Call site (in caller)
+                        'call_site_line':    ev['line'],
+                        'call_site_snippet': ev['call_snippet'],
+                        # Sink (in callee)
+                        'sink_fn':           sink_desc['sink_fn'],
+                        'sink_line':         sink_desc['sink_line'],
+                        'sink_lines':        sink_desc['sink_lines'],
+                        'sink_snippet':      sink_desc['sink_snippet'],
+                        'sink_arg_index':    sink_desc['sink_arg_index'],
+                        'sink_arg_role':     sink_desc['sink_arg_role'],
+                        'possibly_guarded':  possibly_guarded,
+                        'guard_kind':        caller_guarded.kind,
+                        'reason': (
+                            f"tainted {taint_info['var']} "
+                            f"(from {taint_info['source_fn']}() "
+                            f"line {taint_info['line']}) "
+                            f"passed to {callee}() arg {arg_idx} "
+                            f"(line {ev['line']}), which uses it as "
+                            f"{sink_desc['sink_arg_role']} in "
+                            f"{sink_desc['sink_fn']}() "
+                            f"({callee_short}:{sink_desc['sink_line']})"
+                            + (f" and {len(sinks) - 1} other sink(s) in the "
+                               f"same callee" if len(sinks) > 1 else '')
+                        ),
+                    })
 
     # Deduplicate by (caller, callee, tainted_var, sink_fn, sink_line)
     seen = set()
