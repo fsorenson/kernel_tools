@@ -161,6 +161,19 @@ def build_param_sink_map(c_paths, verbose=False):
                 if not findings:
                     continue
 
+                # The simulated walk reports the callee's own server-tainted
+                # values too, and attributing those to the parameter turns
+                # every call into the callee into a finding about a sink the
+                # argument never reached: passing an output buffer to
+                # CIFSSMBQAllEAs() was credited with `le32_to_cpu(
+                # ea_response_data->list_len)`, which is read from the
+                # response, not from the argument.
+                param_tag = f'<param:{param_idx}>'
+                findings = [f for f in findings
+                            if f['taint_source_fn'] == param_tag]
+                if not findings:
+                    continue
+
                 sink_descs = []
                 seen = set()
                 for f in findings:

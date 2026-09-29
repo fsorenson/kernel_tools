@@ -274,6 +274,47 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       sits under `if (version > 0)`, so the `version == 0` path reaches
       `charptr_tmp[long_idx >> 3L]` untested.
 
+- [x] Reaching definitions on the taint map — the guard-level rule above was
+      only half the story: `tainted` was append-only, so a plain assignment
+      from a value derived from neither a source nor the old value left the
+      taint in place.  `cifs_query_path_info()` has two WSL-EA blocks that each
+      open `ea = (struct smb2_file_full_ea_info *)data->wsl.eas;`, and every
+      dereference in the second block was attributed to the `le32_to_cpu()` in
+      the first.  A kill is scoped by `_kill_extent()` to the branch arm the
+      write sits in, since the other path still reaches the sink carrying the
+      taint, and a retaint inside that arm supersedes the pending kill rather
+      than being undone when the arm ends.  Compound assignment keeps what it
+      accumulates onto, and `p->field = ...` yields no LHS variable, so neither
+      kills.
+
+      This does not subsume the guard-level rule: a fresh value taken from
+      *another tainted variable* retaints rather than killing, which is the 34
+      `stale-redefinition` that remain.  Tree-wide 11,074 → 10,864 findings
+      (the first count in this section that moves), guarded 1,103 → 1,080,
+      `does-not-dominate` 119 → 92, `stale-redefinition` 38 → 34.
+
+- [x] Phase 1 attributed the callee's own taint to the parameter — the
+      parameter simulation seeds one parameter and then recorded *every*
+      finding the walk produced, including ones rooted in the callee's own
+      `le32_to_cpu()`.  Passing an output buffer to `CIFSSMBQAllEAs()` was
+      therefore credited with `list_len = le32_to_cpu(ea_response_data->
+      list_len)`, read from the response and not reachable from the argument at
+      all.  Phase 1 now keeps only findings whose `taint_source_fn` is the
+      `<param:N>` tag it seeded.  A finding where the parameter is the
+      destination and an unrelated callee value is the tainted size is
+      correctly dropped too — it is a fact about the callee, not about the call
+      site.
+
+      fs/smb/client 300 → 277 findings with both fixes, cross-function 118 →
+      94.  `cifs_query_path_info` alone goes 27 → 14, which is what prompted
+      this: an adjudication returned all 27 as false positives.  Its own
+      headline claim — that `data->wsl.eas` is a zero-length flexible array and
+      any write into it overflows the stack — was wrong; the member is
+      `__u8 eas[SMB2_WSL_MAX_QUERY_EA_RESP_SIZE]`, sized for all four WSL EAs.
+      The 14 that remain are correctly anchored, and whether they are live
+      depends on whether `data->wsl.eas` holds server bytes on entry, which is
+      a caller fact Stage 1 does not have.
+
 ## Whole-tree guard measurement
 
 65,645 files, ~3.5 min on 30 cores, intra-procedural only.  11,070 findings both

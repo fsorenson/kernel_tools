@@ -876,6 +876,27 @@ def _dominates(guard, fn_body, line_hi):
     return True
 
 
+def _kill_extent(node, fn_body):
+    """
+    Last line through which a redefinition at `node` replaces the old value.
+
+    Outside the branch it sits in, the other path still reaches the sink
+    carrying the taint, so `if (rare) len = 0;` must not clear `len` for code
+    below the `if`.  A conditional expression always evaluates, so a write
+    there is not branch-local.  Switch arms are not separated — a kill in one
+    case is scoped to the whole switch body.
+    """
+    n = node
+    while n is not None and n.id != fn_body.id:
+        p = n.parent
+        if p is not None and p.type in _BRANCHING:
+            cond = p.child_by_field_name('condition')
+            if cond is None or cond.id != n.id:
+                return n.end_point[0] + 1
+        n = p
+    return fn_body.end_point[0] + 1
+
+
 def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
                          signed_vars=frozenset(), sink_expr=None):
     """
@@ -1046,6 +1067,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             Used by cross-function Phase 2 to identify dangerous call sites.
     """
     tainted = dict(initial_taint) if initial_taint else {}
+    killed = {}          # var -> (last line the kill covers, the taint it replaced)
     findings = []
     call_events = []
 
@@ -1054,6 +1076,13 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
     signed_vars = _build_local_signed(fn_body, source)
 
     for node in _walk(fn_body):
+
+        # _walk is pre-order, so start lines are non-decreasing and a kill that
+        # has gone out of scope can be retired here.
+        if killed:
+            line_now = node.start_point[0] + 1
+            for var in [v for v, (end, _) in killed.items() if line_now > end]:
+                tainted[var] = killed.pop(var)[1]
 
         # ── Category H: type-width narrowing in declarations ──
         # Handled here (on declaration, not init_declarator) so we have the
@@ -1155,6 +1184,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     'kind': kind,
                     'width': width,
                 }
+                killed.pop(lhs_var, None)
                 # Cat H: assignment_expression narrowing (not init_declarator —
                 # that case is handled in the declaration branch above).  A
                 # compound assignment is an accumulation, not a truncating
@@ -1195,6 +1225,16 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 continue
 
             ref = _node_references_tainted_var(rhs, source, tainted)
+
+            # Reaching definitions: a plain assignment from a value derived
+            # from neither a source nor the old value describes something else
+            # entirely, so the taint it replaces must not follow it.  A
+            # compound assignment keeps the old value, and `p->field = ...`
+            # yields no lhs_var, so neither reaches here.
+            if not ref and not is_merge and lhs_var in tainted:
+                killed[lhs_var] = (_kill_extent(node, fn_body),
+                                   tainted.pop(lhs_var))
+
             if ref:
                 ref_kind = tainted[ref]['kind']
                 width = tainted[ref].get('width')   # propagate source width
@@ -1212,6 +1252,9 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                     'kind': kind,
                     'width': width,
                 }
+                # A retaint supersedes a pending kill; otherwise the restore at
+                # the end of the branch would put the older taint back.
+                killed.pop(lhs_var, None)
                 # Cat H: narrowing via tainted variable (assignment_expression only;
                 # see the note above for why compound assignments are excluded)
                 if (node.type == 'assignment_expression' and not is_merge
