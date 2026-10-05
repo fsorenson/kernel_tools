@@ -7,7 +7,9 @@ from datetime import datetime
 from pathlib import Path
 
 from bounds_checker.config import build_arg_parser, load_config, KNOWN_MODELS
-from bounds_checker.stages import stage1_taint_scan, stage2_llm_analysis
+from bounds_checker.stages import (
+    stage1_taint_scan, stage1_7_smt, stage2_llm_analysis,
+)
 
 
 def _main_merge(argv):
@@ -83,9 +85,17 @@ def main():
     if cats & _TAINT_CATS:
         active = ', '.join(sorted(cats & _TAINT_CATS))
         print(f"\n--- Stage 1: Taint Scanner (Cat {active}) ---")
-        s1 = stage1_taint_scan.run(cfg, run_dir, verbose=args.verbose)
+        s1 = stage1_taint_scan.run(cfg, run_dir, verbose=args.verbose,
+                                   write_report=not cfg['smt']['enabled'])
     else:
         s1 = None
+
+    # Stage 1.7: SMT refinement — retires what a solver can prove safe and
+    # attaches a counterexample to the rest.
+    if s1 and cfg['smt']['enabled']:
+        print("\n--- Stage 1.7: SMT Refinement ---")
+        stage1_7_smt.run(cfg, run_dir, s1, verbose=args.verbose,
+                         n_workers=cfg['smt'].get('workers', 8))
 
     # Stage 2: LLM analysis
     if args.llm:

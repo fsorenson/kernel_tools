@@ -215,6 +215,16 @@ def run(run_dirs, output_dir=None, verbose=False):
         s2.get('model', '') for _, _, s2 in runs if s2.get('model')
     ))
 
+    # Deduplicated the same way, so a finding Stage 1.7 retired in one run and
+    # never reached in another is counted once and stays retired.
+    merged_suppressed, seen_sup = [], set()
+    for _, s1, _ in runs:
+        for f in s1.get('findings_suppressed', []):
+            sk = _s1_key(f)
+            if sk not in seen_sup and sk not in seen_keys:
+                seen_sup.add(sk)
+                merged_suppressed.append(f)
+
     merged_s1 = {
         'stage':          'taint_scan',
         'source_dirs':    all_source_dirs,
@@ -223,6 +233,7 @@ def run(run_dirs, output_dir=None, verbose=False):
         'kernel_git':     kernel_git,
         'findings_count': len(merged_findings),
         'findings':       merged_findings,
+        'findings_suppressed': merged_suppressed,
     }
     merged_s2 = {
         'stage':              'llm_analysis',
@@ -243,6 +254,8 @@ def run(run_dirs, output_dir=None, verbose=False):
 
     dupe_str = f" ({n_dupes} duplicate(s) removed)" if n_dupes else ''
     print(f"\n  Total findings: {total_raw} → {len(merged_findings)} unique{dupe_str}")
+    if merged_suppressed:
+        print(f"  SMT-retired:    {len(merged_suppressed)}")
     print(f"  LLM analyses:   {len(merged_analyses)} function(s)")
     print(f"  Output:         {output_dir}\n")
 

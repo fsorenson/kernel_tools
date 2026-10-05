@@ -89,7 +89,7 @@ def _progress_wrap(paths, label, verbose=False):
     print(f'\r{label} 100%')
 
 
-def run(cfg, run_dir, verbose=False):
+def run(cfg, run_dir, verbose=False, write_report=True):
     """
     Scan all .c files in cfg['target']['source_dirs'] for taint flows.
     Writes stage1_taint_scan.json to run_dir and returns the output dict.
@@ -178,7 +178,9 @@ def run(cfg, run_dir, verbose=False):
     print(f"\nStage 1 output: {out_path}")
 
     # Write static-analysis-only report (superseded if Stage 2 runs)
-    write_reports(run_dir, output, {'analyses': [], 'model': '—', 'functions_analyzed': 0})
+    if write_report:
+        write_reports(run_dir, output,
+                      {'analyses': [], 'model': '—', 'functions_analyzed': 0})
     return output
 
 

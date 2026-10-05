@@ -846,6 +846,22 @@ sources to dangerous sinks.  A "possibly guarded" flag means the scanner \
 detected a conditional referencing the tainted variable between the source \
 and sink — but it does NOT verify that the check is sufficient.
 
+Some findings additionally carry an SMT result.  A later stage re-posed the \
+arithmetic question the scanner answers with AST rules to a solver, over \
+bitvectors with C's exact widths and conversions, leaving every term it \
+could not resolve unconstrained.  The two directions are not symmetric.  A \
+PROVED result is sound — it holds for every value of everything the encoder \
+could not model — and you may rely on it; but it settles only the single \
+property it names, never the finding as a whole, and a finding you are \
+shown is one the proof did not retire.  A COUNTEREXAMPLE is not a bug \
+claim: it is one concrete assignment of server-supplied values that breaks \
+the stated property on that path, produced with no knowledge of which \
+callers are reachable or how large the real buffers are.  In a witness, a \
+`*_val` key is a value read off the wire, a `*_ret` key an unmodelled \
+callee return, and `value`/`result`/`at sink` the sink expression evaluated \
+under that assignment.  Walk it through the code as a test case — but do \
+not set real_bug on the strength of the witness alone.
+
 {findings_text}
 
 ## Analysis task
@@ -1138,6 +1154,23 @@ def _format_findings(findings):
                 f"the same value used the same way, with the same guard verdict, "
                 f"so one answer covers all of them.\n"
             )
+        # 'unknown' is a timed-out or model-dependent query; it says nothing
+        # about the code, so rendering it would only add weight to the prompt.
+        # The preamble states what the two verdicts mean and what each is worth;
+        # repeating it per finding would cost more prompt than it buys.
+        smt = f.get('smt') or {}
+        if smt.get('verdict') == 'safe':
+            entry += f"    SMT: PROVED — {smt['property']}: {smt['detail']}\n"
+        elif smt.get('verdict') == 'witness':
+            entry += (
+                f"    SMT: COUNTEREXAMPLE — {smt['property']}: {smt['detail']}\n"
+            )
+            if smt['witness']:
+                entry += (
+                    "    Witness: "
+                    + '  '.join(f'{k}={v}' for k, v in smt['witness'].items())
+                    + "\n"
+                )
         entry += (
             f"    Possibly guarded: {guard_tag}\n"
             f"    Scanner reason: {f['reason']}"

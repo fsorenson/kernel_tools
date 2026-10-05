@@ -67,6 +67,53 @@ _ASSESSMENT_LABEL = {
 }
 
 
+# Stage 1.7 proves a property for every value it could not resolve, so a
+# clean answer is sound but local to that one property; a counterexample is
+# only an assignment, with no claim that a caller reaches it.
+_SMT_PROVED_NOTE  = 'proof covers every unresolved value; it answers only this property'
+_SMT_WITNESS_NOTE = 'a scenario, not a claim that a caller produces it'
+
+
+def _smt_view(r):
+    """
+    Renderable pieces of a Stage 1.7 verdict, or None.  'unknown' is a timeout
+    or an unmodelled term, so it is dropped rather than shown as a third kind
+    of answer.
+    """
+    smt = r.get('smt') or {}
+    if smt.get('verdict') not in ('safe', 'witness'):
+        return None
+    return {
+        'verdict':  smt['verdict'],
+        'property': smt.get('property', '—'),
+        'detail':   smt.get('detail', ''),
+        'witness':  ', '.join(f'{k}={v}'
+                              for k, v in (smt.get('witness') or {}).items()),
+    }
+
+
+def _smt_retired(s1):
+    """
+    Findings Stage 1.7 proved away, or None when it did not run — a zero and
+    an absent stage read differently to someone diffing against an old run.
+    """
+    if 'findings_suppressed' in s1:
+        return len(s1['findings_suppressed'])
+    if any(f.get('smt') for f in s1.get('findings', [])):
+        return 0
+    return None
+
+
+def _cat_parts(by_cat, sup_by_cat):
+    """One 'Cat X: n' per category, carrying its Stage 1.7 retirements."""
+    parts = []
+    for c in sorted(set(by_cat) | set(sup_by_cat)):
+        n = sup_by_cat.get(c, 0)
+        parts.append(f"Cat {c}: {by_cat.get(c, 0)}"
+                     + (f" (+{n} retired)" if n else ''))
+    return parts
+
+
 def _rel_path(filepath, kernel_root):
     """Convert absolute filepath to repo-relative path (e.g. fs/smb/client/cifssmb.c)."""
     if not filepath:
@@ -164,6 +211,7 @@ def _build_context(run_dir, s1, s2):
                 'field_name':      s1f.get('field_name', ''),
                 'possibly_guarded': s1f['possibly_guarded'],
                 'reason':          s1f['reason'],
+                'smt':             s1f.get('smt'),
                 # LLM fields (may be missing if no LLM run)
                 'real_bug':        llm.get('real_bug'),
                 'taint_server':    llm.get('taint_is_server_supplied'),
@@ -203,6 +251,15 @@ def _build_context(run_dir, s1, s2):
         s1_by_cat.setdefault(f['category'], 0)
         s1_by_cat[f['category']] += 1
 
+    # Category counts stay on the surviving set, so they add up to what the
+    # sections below actually contain; the retired ones are carried next to
+    # them per category so a drop against an earlier run reads as a Stage 1.7
+    # proof rather than as findings that went missing.
+    s1_retired    = _smt_retired(s1)
+    s1_sup_by_cat = {}
+    for f in s1.get('findings_suppressed', []):
+        s1_sup_by_cat[f['category']] = s1_sup_by_cat.get(f['category'], 0) + 1
+
     # Precompute per-directory stats for TOC and summary grouping
     dir_stats = {}
     for s in sections:
@@ -227,6 +284,8 @@ def _build_context(run_dir, s1, s2):
         'kernel_git':  s1.get('kernel_git', {}),
         's1_total':    s1.get('findings_count', 0),
         's1_by_cat':   s1_by_cat,
+        's1_retired':  s1_retired,
+        's1_sup_by_cat': s1_sup_by_cat,
         'fn_analyzed': s2.get('functions_analyzed', len(sections)),
         'total_real':  total_real,
         'total_fp':    total_fp,
@@ -278,8 +337,12 @@ def _render_md(ctx):
         W(line)
     W("")
 
-    cat_parts = ', '.join(f"Cat {c}: {n}" for c, n in sorted(ctx['s1_by_cat'].items()))
+    cat_parts = ', '.join(_cat_parts(ctx['s1_by_cat'], ctx['s1_sup_by_cat']))
     W(f"**Stage 1 findings:** {ctx['s1_total']} ({cat_parts})  ")
+    if ctx['s1_retired'] is not None:
+        W(f"**Stage 1.7 SMT:** {ctx['s1_retired']} finding(s) retired by proof — "
+          f"excluded from the counts above and from the sections below; "
+          f"see `stage1_7_smt.json`  ")
     if ctx['has_llm']:
         W(f"**Stage 2 LLM:**  "
           f"{ctx['total_real']} real bug(s)  |  "
@@ -431,6 +494,16 @@ def _md_finding(buf, r, has_llm):
         W(f"| Sink | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={role}) |")
     W(f"| Sink snippet | `{r['sink_snippet']}` |")
     W(f"| Possibly guarded | {'yes (heuristic)' if r['possibly_guarded'] else 'no'} |")
+    sv = _smt_view(r)
+    if sv:
+        if sv['verdict'] == 'safe':
+            W(f"| SMT | **proved** `{sv['property']}`: {sv['detail']} "
+              f"*({_SMT_PROVED_NOTE})* |")
+        else:
+            W(f"| SMT | **witness**: `{sv['property']}` fails here — {sv['detail']} "
+              f"*({_SMT_WITNESS_NOTE})* |")
+            if sv['witness']:
+                W(f"| SMT witness | `{sv['witness']}` |")
 
     if has_llm and r['real_bug'] is True:
         W(f"| Server-supplied | {'yes' if r['taint_server'] else 'no'} |")
@@ -611,6 +684,15 @@ def _fn_copy_text(s, has_llm):
             parts.append(f"  Sink: {r['sink_fn']}() line {r['sink_line']}")
         parts.append(f"  Sink snippet:  {r['sink_snippet']}")
         parts.append(f"  Possibly guarded: {'yes (heuristic)' if r['possibly_guarded'] else 'no'}")
+        sv = _smt_view(r)
+        if sv and sv['verdict'] == 'safe':
+            parts.append(f"  SMT: proved {sv['property']} — {sv['detail']}"
+                         f" ({_SMT_PROVED_NOTE})")
+        elif sv:
+            parts.append(f"  SMT: witness — {sv['property']} fails here: {sv['detail']}"
+                         f" ({_SMT_WITNESS_NOTE})")
+            if sv['witness']:
+                parts.append(f"  SMT witness:   {sv['witness']}")
         if has_llm and real is True:
             if r.get('symptom'):
                 parts.append(f"  Symptom: {r['symptom']}")
@@ -664,13 +746,18 @@ def _render_html(ctx):
     # Meta bar
     W('<div class="meta">')
     cat_parts = ' &nbsp;|&nbsp; '.join(
-        f"Cat {c}: {n}" for c, n in sorted(ctx['s1_by_cat'].items())
+        _e(p) for p in _cat_parts(ctx['s1_by_cat'], ctx['s1_sup_by_cat'])
     )
     W(f'<span><span class="key">Date:</span> {_e(ctx["now_str"])}</span>')
     W(f'<span><span class="key">Model:</span> {_e(ctx["model"])}</span>')
     W(f'<span><span class="key">Source:</span> {_e(", ".join(ctx["source_dirs"]))}</span>')
     W(f'<span><span class="key">Files:</span> {ctx["files_scanned"]}</span>')
     W(f'<span><span class="key">Stage 1:</span> {ctx["s1_total"]} findings ({cat_parts})</span>')
+    if ctx['s1_retired'] is not None:
+        W(f'<span><span class="key">Stage 1.7 SMT:</span> '
+          f'{ctx["s1_retired"]} retired by proof '
+          f'<span style="color:#555">(excluded from the counts above and from '
+          f'the sections below; see <code>stage1_7_smt.json</code>)</span></span>')
     if ctx['has_llm']:
         W(f'<span><span class="key">Stage 2:</span> '
           f'<b style="color:var(--bug)">{ctx["total_real"]} real</b> &nbsp;|&nbsp; '
@@ -876,6 +963,21 @@ def _html_finding(lines, r, has_llm):
     W(f'<tr><th>Sink snippet</th><td><code>{_e(r["sink_snippet"])}</code></td></tr>')
     guarded = 'yes (heuristic)' if r['possibly_guarded'] else 'no'
     W(f'<tr><th>Possibly guarded</th><td>{guarded}</td></tr>')
+    sv = _smt_view(r)
+    if sv:
+        if sv['verdict'] == 'safe':
+            head = (f'<b style="color:var(--fp)">proved</b> '
+                    f'<code>{_e(sv["property"])}</code>')
+            note = _SMT_PROVED_NOTE
+        else:
+            head = (f'<b style="color:var(--mixed)">witness</b>: '
+                    f'<code>{_e(sv["property"])}</code> fails here')
+            note = _SMT_WITNESS_NOTE
+        W(f'<tr><th>SMT</th><td>{head} &mdash; {_e(sv["detail"])} '
+          f'<span style="color:#555">({_e(note)})</span></td></tr>')
+        if sv['verdict'] == 'witness' and sv['witness']:
+            W(f'<tr><th>SMT witness</th>'
+              f'<td><code>{_e(sv["witness"])}</code></td></tr>')
     if has_llm and real is True:
         W(f'<tr><th>Server-supplied</th>'
           f'<td>{"yes" if r["taint_server"] else "no"}</td></tr>')
@@ -1020,19 +1122,22 @@ def write_summary(run_dir, stage1_output, stage2_output, formats=('md', 'html'))
     run_name = run_dir.name
     source_dirs = stage1_output.get('source_dirs', [])
     git_info    = stage1_output.get('kernel_git', {})
+    retired     = _smt_retired(stage1_output)
 
     written = []
     if 'md' in formats:
         path = run_dir / 'summary.md'
         path.write_text(
-            _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info),
+            _render_summary_md(rows, has_llm, run_name, now_str, source_dirs,
+                               git_info, retired),
             encoding='utf-8',
         )
         written.append(path)
     if 'html' in formats:
         path = run_dir / 'summary.html'
         path.write_text(
-            _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info),
+            _render_summary_html(rows, has_llm, run_name, now_str, source_dirs,
+                                 git_info, retired),
             encoding='utf-8',
         )
         written.append(path)
@@ -1068,14 +1173,19 @@ def _file_counts(rows):
 
 # -- Markdown renderer -------------------------------------------------------
 
-def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info=None):
+def _render_summary_md(rows, has_llm, run_name, now_str, source_dirs, git_info=None,
+                       retired=None):
     buf = []
     W = buf.append
 
     W(f"# Priority Summary — {run_name}\n")
     W(f"**Date:** {now_str}  ")
     W(f"**Source:** {', '.join(source_dirs)}  ")
-    W(f"**Total findings:** {len(rows)}\n")
+    if retired is None:
+        W(f"**Total findings:** {len(rows)}\n")
+    else:
+        W(f"**Total findings:** {len(rows)}  ")
+        W(f"**Retired by Stage 1.7 proof:** {retired} (not ranked below)\n")
 
     for line in _git_md_block(git_info or {}):
         W(line)
@@ -1229,7 +1339,8 @@ def _summary_row_html(W, rank, score, s1f, llm, rel_path, has_llm, max_score):
       f'</tr>')
 
 
-def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info=None):
+def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info=None,
+                         retired=None):
     lines = []
     W = lines.append
 
@@ -1246,6 +1357,9 @@ def _render_summary_html(rows, has_llm, run_name, now_str, source_dirs, git_info
     W(f'<span><span class="key">Date:</span> {_e(now_str)}</span>')
     W(f'<span><span class="key">Source:</span> {_e(", ".join(source_dirs))}</span>')
     W(f'<span><span class="key">Total:</span> {len(rows)} findings</span>')
+    if retired is not None:
+        W(f'<span><span class="key">Retired by Stage 1.7 proof:</span> '
+          f'{retired} <span style="color:#555">(not ranked below)</span></span>')
     for tier, _ in [('Critical', None), ('High', None), ('Medium', None), ('Low', None)]:
         n = tier_cts.get(tier, 0)
         if n:

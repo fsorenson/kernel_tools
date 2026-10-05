@@ -26,6 +26,177 @@ Shares generic parsing infrastructure from `kernel_analysis/parsers/`.
       - [x] **Category C**: server-supplied value → array subscript without bounds check
             (e.g., `arr[le16_to_cpu(hdr->Index)]` without `if (idx >= ARRAY_SIZE(arr))`)
 
+- [x] Stage 1.7: SMT refinement — `bounds_checker/smt/`, driven by
+      `bounds_checker/stages/stage1_7_smt.py`.  Stage 1 decides whether a guard
+      is sufficient with hand-written rules over the AST, but the question those
+      rules are really answering is about machine arithmetic: can this value be
+      negative, can this product wrap, does a bound established for `off` still
+      hold for `off + 1`.  Each rule is therefore an approximation.  This stage
+      re-asks the same question of Z3 over bitvectors with C's widths and
+      conversions, which is the only model in which wraparound and truncation
+      mean what they mean in the kernel.
+
+      - **Direction.**  Everything the encoder cannot resolve — a call return,
+        a global, a field whose type it could not read — becomes an
+        unconstrained bitvector, so UNSAT is the only sound verdict: if the
+        property holds with those free, it holds for every value they could
+        take.  SAT is therefore only a witness, never a bug claim.  `unknown`,
+        a solver timeout, and an exception in the worker all keep the finding
+        exactly where it was — the layer fails open, and the only thing it can
+        do to the finding set is remove entries it has proved unnecessary.
+
+      - **Verdict and suppression are different things.**  `verdict` answers
+        the properties that could be posed; `suppresses` (rendered as `retires`
+        in the JSON) says whether those were the ones Stage 1's verdict
+        actually rested on.  The two come apart constantly: a size that
+        provably cannot be negative is still a size nobody bounded against the
+        destination buffer.  `_BASIS_BY_KIND` maps `upper-bound-only-signed` →
+        `negative` and `covers-base-not-offset` / `stale-redefinition` →
+        `guard-transfer`; `_BASIS_BY_ROLE` maps `size_mul_overflow` →
+        `overflow` and `narrowing_assignment` / `narrowed_value` →
+        `truncation`.  A finding with no entry in either rests on something
+        these properties do not express, so a clean answer is recorded and the
+        finding survives.
+
+      - **Encoder** (`smt/encoder.py`) — a C expression AST walks to a `Value
+        (bv, width, signed, guessed)`, so the usual arithmetic conversions are
+        applied at each operator rather than guessed once; the equal-width
+        unsigned-wins rule is what turns `i < len` into an unsigned compare
+        when `len` is `size_t` and lets a negative `i` through.  Shifts promote
+        the left operand alone and keep its type.  `le32_to_cpu()`-class
+        accessors yield the defining unknown — width fixed by the accessor,
+        value entirely the far side's choice.  `likely`/`unlikely`/`WARN_ON`/
+        `READ_ONCE` and friends are transparent, so
+        `if (WARN_ON_ONCE(i >= size)) return;` contributes to the path
+        condition instead of nothing.  `_LIMIT_CONSTS` supplies `U8_MAX`,
+        `INT_MAX`, `SIZE_MAX` and the rest, without which `if (len > U8_MAX)`
+        constrains `len` against a free variable and so constrains nothing;
+        anything architecture- or config-dependent is deliberately left out,
+        since a wrong constant is worse than an unknown one because it reaches
+        the UNSAT direction.  An unevaluable `sizeof` is bounded to 1..0xFFFF
+        rather than left free, which would make every product look like it can
+        wrap.  Everything else — a subscript, a deref, an unrecognised shape —
+        is a fresh constant.
+
+      - **Path condition** (`smt/pathcond.py`) — nothing here searches for
+        paths; the taint walk already chose one, and this reconstructs the
+        facts that hold along it.  A structured walk descends into the arm the
+        sink is in, inverts conditions whose other arm has an early-exit
+        terminal, and `_merge()`s both arms when control rejoins below
+        (pre-branch binding as the default, drop what neither arm resolves).
+        Each guard is kept with a snapshot of the environment, because a bound
+        constrains the term the variable held *then*, not the name.
+        `_short_circuit()` picks up conjuncts that must have held for
+        evaluation to reach the sink, as in `len > 0 && !strncmp(a, b, len)`.
+        A loop is modelled as one arbitrary iteration: `_clobber()` unbinds
+        everything the body writes, then the controlling test and the guards
+        above the sink apply normally, and `_loop_floor()` restores the one
+        fact a single iteration loses — `for (i = 0; ...; i++)` with no other
+        write to `i` has `i` at or above its start, without which the counter
+        runs negative and no amount of guarding inside the body can rule it
+        out.  A `labeled_statement` clears the environment entirely, since a
+        `goto` can land there from anywhere.  Every unmodelled write unbinds
+        rather than guesses, including field accesses reached through the
+        clobbered name, which costs precision but never soundness.
+
+      - **Properties** (`smt/properties.py`) — four, each the negation of an
+        obligation the finding implicitly claims is unmet.  `prop_negative`
+        (`upper-bound-only-signed` decided rather than asserted — it absorbs
+        the three shapes `_max_bits()` hand-models, since a widened 16-bit
+        read, a mask and an unsigned right shift are each unsatisfiable here
+        without a rule saying so), `prop_overflow` (`BVMulNoOverflow` /
+        `BVAddNoOverflow`, plus the underflow side when signed),
+        `prop_truncation`, and `prop_guard_transfer`, which substitutes what
+        the sink computes for what the guard constrained and asks whether the
+        ceiling survived — without needing to know what it meant.  Transfer
+        declines to answer when the guard already applies arithmetic to the
+        variable (pricing the adjustment in twice) or when the sink is not a
+        constant shift of the guarded term (`num` bounded to 1..4, then
+        `size * num` allocated — a ceiling on one is not a ceiling on the other).
+
+      - **Counterexamples are tested for robustness.**  `_decide()` takes UNSAT
+        as the clean answer, and on SAT asks a second question: the assignment
+        may exist only because a term standing for a gap in the model was free
+        to take whatever value it needed.  `ForAll(free, Implies(assumptions,
+        claim))` over exactly those terms demands the counterexample hold for
+        *every* value of them — the mirror of the UNSAT bargain.  Anything
+        else, including a timeout on the quantified query, yields `unknown`.
+
+      - **Two independent axes**, easy to conflate.  `opaque` says the *value*
+        is a gap in the model — an unmodelled callee return, a macro the
+        encoder could not expand, a name the walk lost — and it is these terms
+        the ∀ test quantifies over.  `Value.guessed` says the *width and
+        signedness* came from a default rather than from the source.  They are
+        orthogonal: reasoning about the type (does this fit, can this be
+        negative) cannot rest on a guessed type, so `prop_negative` and
+        `prop_truncation` return `not-modelled` for one, while reasoning about
+        the value still can, since the term is free either way.  An enum is the
+        common case — nothing names its underlying type at the use site, and a
+        guess of signed int would turn every wire value with the top bit set
+        into a counterexample C would never produce.
+
+      - **Struct field types are dynamic** (`smt/fields.py`) — nothing about
+        any particular struct is recorded.  The index is built by parsing the
+        definitions reachable through the file's `#include`s (two hops;
+        `fs/smb/client/smb2misc.c` reaches `struct smb2_lease_break` via
+        `smb2pdu.h`), cached per header since headers are shared heavily, so a
+        field that gains a bit, changes width or moves to another header
+        changes what the checker concludes with nothing here touched.  A tag
+        two reachable headers define differently is dropped rather than decided
+        by parse order — `struct node` is not a unique name in this tree and
+        the wrong widths reach the UNSAT direction.  Bitfield widths become
+        range facts.  The endianness annotation is worth as much as the width:
+        a `__le32`/`__be16` field is wire or on-disk data *by declaration*,
+        the same provenance `le32_to_cpu()` carries, so it is a genuine unknown
+        rather than a gap — free in value, but not quantified over in the ∀
+        test.  Only scalars take their declared type; `char *name` and
+        `u8 buf[64]` both read as addresses.
+
+      - **Wiring** — on by default between Stage 1 and Stage 2, one worker
+        process per source file (`smt.workers`, default 8; `--smt-workers`),
+        `smt.timeout_ms` per query (default 200; `--smt-timeout`), `--no-smt`
+        to skip.  Retired findings move to `findings_suppressed` in the Stage 1
+        output so the decision is auditable, and `stage1_7_smt.json` records
+        the verdict histogram and a digest of each retirement.  Stage 1 defers
+        its findings file and static-only report to this stage rather than
+        writing a set that is about to change, so every exit from here —
+        including no z3 and nothing to refine — emits them.  The reports carry
+        the retirements per category (`Cat H: 5 (+5 retired)`) so a drop
+        against an earlier run reads as a proof rather than as findings gone
+        missing.  Surviving findings carry their `smt` block
+        into the Stage 2 prompt as one line — a proof, or a counterexample with
+        its `*_val` (wire) and `*_ret` (unmodelled return) assignments.  What
+        the two verdicts are worth, and the asymmetry between them, is stated
+        once in the preamble rather than per finding; `unknown` is not rendered
+        at all, since it says nothing about the code and would only add weight
+        to the prompt.
+
+      - **Measured**, `/home/src/linux`, 37,372 `.c` files, 5,495 Stage 1
+        findings, 85 s at 30 workers: 1,546 safe, 3,491 not-modelled, ~314
+        unknown, ~144 witness.  The last two trade places by a couple across
+        runs, since a query that lands near the 200 ms budget is decided by how
+        loaded the box is.  374 findings retired by proof — i.e. of the 1,546
+        proofs, 374 closed the property Stage 1's own verdict rested on; the
+        remaining 1,172 answered a real question about a finding that rests on
+        something else.  12 of the witnesses are findings Stage 1 had called
+        `bounded`, which is the interesting direction: a counterexample against
+        a guard the AST rules credited.  On the 57-file `fs/smb/client` subset,
+        121 findings (92 refined, 29 cross-function skipped), 5 retired, 0
+        counterexamples — the subsystem the rules were written against is where
+        they are already right.  `fs/ntfs3` is the contrast: 305 findings, 11
+        retired, 5 counterexamples.
+
+      - **Known limitations.**  Buffer-size properties are out of scope
+        entirely: how big is the destination of this `memcpy`, how many entries
+        does this table have.  They need declaration data the scanner does not
+        collect, and guessing would convert a sound suppressor into an unsound
+        one.  Cross-function findings are skipped — the sink is in the callee
+        and the guard in the caller, and neither body answers the question on
+        its own.  A loop is one arbitrary iteration, so nothing that depends on
+        the trip count is modelled.  And a guard whose comparison semantics
+        rest on a guessed type is still asserted into the path condition: the
+        `_grounded` test gates the properties, not the assumptions.
+
 - [x] Stage 2: LLM deep analysis — feed taint findings to Claude API for
       false-positive filtering, severity assessment, and fix suggestions;
       analogous to race finder Stage 6

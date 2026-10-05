@@ -26,6 +26,13 @@ DEFAULT_CONFIG = {
     'output': {
         'dir': 'bc_runs/',
     },
+    'smt': {
+        'enabled': True,
+        # Per-query budget.  A proof that needs longer than this is rare enough
+        # that waiting for it costs more than the finding it would retire.
+        'timeout_ms': 200,
+        'workers': 8,
+    },
     'llm': {
         'enabled': False,
         'model': None,          # auto-detected from provider; override with --model
@@ -65,6 +72,12 @@ def load_config(config_path=None, cli_args=None):
             cfg['output']['dir'] = cli_args.output_dir
         if getattr(cli_args, 'categories', None):
             cfg['categories'] = cli_args.categories
+        if getattr(cli_args, 'no_smt', False):
+            cfg['smt']['enabled'] = False
+        if getattr(cli_args, 'smt_timeout', None) is not None:
+            cfg['smt']['timeout_ms'] = cli_args.smt_timeout
+        if getattr(cli_args, 'smt_workers', None) is not None:
+            cfg['smt']['workers'] = cli_args.smt_workers
         if getattr(cli_args, 'model', None):
             cfg['llm']['model'] = cli_args.model
         if getattr(cli_args, 'llm_workers', None) is not None:
@@ -103,6 +116,13 @@ Examples:
                    help='Categories to scan (default: A B C D E F G1 G2 H)')
     p.add_argument('--output-dir', metavar='DIR',
                    help='Output directory for run artifacts')
+    p.add_argument('--no-smt', action='store_true',
+                   help='Skip Stage 1.7 SMT refinement (keeps findings a solver '
+                        'can prove safe)')
+    p.add_argument('--smt-timeout', metavar='MS', type=int, default=None,
+                   help='Per-query solver budget in ms (default: 200)')
+    p.add_argument('--smt-workers', metavar='N', type=int, default=None,
+                   help='Parallel SMT worker processes (default: 8; use 1 for serial)')
     p.add_argument('--llm', action='store_true',
                    help='Enable Stage 2 LLM deep analysis (requires API credentials)')
     p.add_argument('--model', metavar='MODEL',

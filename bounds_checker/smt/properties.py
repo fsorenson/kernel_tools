@@ -117,28 +117,45 @@ def node_text_raw(node):
 # Witness extraction
 # ---------------------------------------------------------------------------
 
-def _witness(model, path, extra=None):
+def _witness(model, path, extra=None, claim=None):
     """
     Values the far side would have to send.  Only the unknowns that stand for
     received data are reported — the rest are the solver's bookkeeping and
     mean nothing to a reader.
+
+    A model assigns every constant the solver ever saw, including the dozens a
+    long function contributes to the path condition without the claim ever
+    depending on them.  Restricting to what the claim is built from is what
+    keeps the witness readable as a scenario.
     """
     out = {}
+    wanted = _consts(claim, set()) if claim is not None else None
     for d in model.decls():
         name = d.name()
         if '_val!' not in name and '_ret!' not in name:
             continue
-        try:
-            val = model[d]
-            out[name.split('!')[0]] = f'0x{val.as_long():x}'
-        except (AttributeError, z3.Z3Exception):
+        if wanted is not None and name not in wanted:
             continue
+        v = _hex(model[d])
+        if v is not None:
+            out[name.split('!')[0]] = v
     for label, term in (extra or {}).items():
-        try:
-            out[label] = f'0x{model.eval(term, True).as_long():x}'
-        except (AttributeError, z3.Z3Exception):
-            pass
+        v = _hex(model.eval(term, True))
+        if v is not None:
+            out[label] = v
     return out
+
+
+def _hex(ref):
+    """
+    The bit pattern, which is the only reading that survives the question the
+    witness is about — z3 hands back a negative integer whenever it picked a
+    literal below zero, for a term C would have read as unsigned at the sink.
+    """
+    try:
+        return f'0x{ref.as_long() & ((1 << ref.sort().size()) - 1):x}'
+    except (AttributeError, z3.Z3Exception):
+        return None
 
 
 def _consts(expr, out):
@@ -167,15 +184,22 @@ def _opaque_terms(exprs, enc):
     return found
 
 
-def _decide(path, claim, prop, detail, extra=None, timeout_ms=200):
-    """Check the negation of an obligation; UNSAT is the only clean answer."""
+def _decide(path, claim, prop, detail, proved, extra=None, timeout_ms=200):
+    """
+    Check the negation of an obligation; UNSAT is the only clean answer.
+
+    `detail` describes what the claim asserts and so reads correctly only
+    where the claim holds; `proved` is the same fact in the direction UNSAT
+    establishes, and a verdict carrying the wrong one of the two states the
+    opposite of what the solver found.
+    """
     s = path.solver(timeout_ms)
     s.add(claim)
     r = s.check()
     if r == z3.unsat:
-        return SmtResult('safe', prop, {}, detail)
+        return SmtResult('safe', prop, {}, proved)
     if r != z3.sat:
-        return SmtResult('unknown', prop, {}, f'{detail} (solver: {r})')
+        return SmtResult('unknown', prop, {}, f'undecided: {detail} (solver: {r})')
 
     # The assignment may exist only because a term the encoder could not model
     # — a struct field, a macro, a callee's return — was free to take whatever
@@ -201,7 +225,8 @@ def _decide(path, claim, prop, detail, extra=None, timeout_ms=200):
         s.add(robust)
         if s.check() != z3.sat:
             return SmtResult('unknown', prop, {}, detail)
-    return SmtResult('witness', prop, _witness(s.model(), path, extra), detail)
+    return SmtResult('witness', prop, _witness(s.model(), path, extra, claim),
+                     detail)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +266,7 @@ def prop_negative(path, expr_node):
                          'value is unsigned at the sink')
     return _decide(path, val.bv < 0, 'negative',
                    'index/size can be negative and converts to size_t',
+                   'signed value cannot be negative where it reaches the sink',
                    {'value': val.bv})
 
 
@@ -261,8 +287,10 @@ def prop_overflow(path, expr_node):
     if signed:
         ok = z3.And(ok, (z3.BVMulNoUnderflow if op == '*'
                          else z3.BVAddNoUnderflow)(l.bv, r.bv))
+    what = 'product' if op == '*' else 'sum'
     return _decide(path, z3.Not(ok), 'overflow',
-                   f'{width}-bit {"product" if op == "*" else "sum"} can wrap',
+                   f'{width}-bit {what} can wrap',
+                   f'{width}-bit {what} cannot wrap',
                    {'result': term})
 
 
@@ -279,6 +307,7 @@ def prop_truncation(path, expr_node, dest_width, dest_signed=False):
         val.width - dest_width, narrowed)
     return _decide(path, back != val.bv, 'truncation',
                    f'{val.width}-bit value does not survive {dest_width} bits',
+                   f'{val.width}-bit value survives {dest_width} bits intact',
                    {'value': val.bv})
 
 
@@ -347,6 +376,7 @@ def prop_guard_transfer(path, var_name, expr_node, source):
         return UNMODELLED
     return _decide(path, z3.Not(z3.And(claims)), 'guard-transfer',
                    'the value reaching the sink is not the one the bound covers',
+                   'the bound still covers the value reaching the sink',
                    {'at sink': sink.bv})
 
 
