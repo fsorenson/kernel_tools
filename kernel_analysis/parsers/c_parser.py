@@ -314,27 +314,22 @@ def collect_type_definitions(tree, source):
         if name:
             types[name] = _extract_field_list(fdl_node)
 
-    # Pass 2: named (tagged) structs/unions defined at file scope without typedef.
-    for node in tree.root_node.children:
-        specs = []
-        if node.type in ('struct_specifier', 'union_specifier'):
-            specs.append(node)
-        elif node.type == 'declaration':
-            specs.extend(
-                c for c in node.children
-                if c.type in ('struct_specifier', 'union_specifier')
-            )
-        for spec in specs:
-            type_id = next(
-                (c for c in spec.children if c.type == 'type_identifier'), None
-            )
-            fdl_node = next(
-                (c for c in spec.children if c.type == 'field_declaration_list'), None
-            )
-            if type_id and fdl_node:
-                name = node_text(type_id, source)
-                if name not in types:
-                    types[name] = _extract_field_list(fdl_node)
+    # Pass 2: named (tagged) structs/unions, wherever they are written.  A
+    # header keeps its entire contents inside the include guard, so scanning
+    # only file scope finds nothing in one.
+    for spec in _walk(tree.root_node):
+        if spec.type not in ('struct_specifier', 'union_specifier'):
+            continue
+        type_id = next(
+            (c for c in spec.children if c.type == 'type_identifier'), None
+        )
+        fdl_node = next(
+            (c for c in spec.children if c.type == 'field_declaration_list'), None
+        )
+        if type_id and fdl_node:
+            name = node_text(type_id, source)
+            if name not in types:
+                types[name] = _extract_field_list(fdl_node)
 
     return types
 
