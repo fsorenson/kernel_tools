@@ -10,6 +10,7 @@ the best-known width, which keeps the UNSAT direction sound.
 import z3
 
 from kernel_analysis.parsers.c_parser import _walk, node_text
+from bounds_checker.smt.fields import SCALAR, base_type, type_key
 
 
 # Reads of server/user data.  The encoder knows only their width: the value
@@ -33,6 +34,14 @@ _TRANSPARENT = frozenset({
     'likely', 'unlikely', 'likely_notrace', 'unlikely_notrace',
     '__builtin_expect', 'WARN_ON', 'WARN_ON_ONCE', 'WARN_ONCE',
     'BUG_ON', 'READ_ONCE', 'WRITE_ONCE', 'ACCESS_ONCE',
+})
+
+# A field declared with one of these is on the wire or on disk by definition,
+# which is the same provenance le32_to_cpu() carries: the value is whatever the
+# far side chose to put there, and that is a genuine unknown rather than a gap
+# in the model.
+_WIRE_TYPES = frozenset({
+    '__le16', '__be16', '__le32', '__be32', '__le64', '__be64',
 })
 
 # Returns that cannot be negative, matching _NONNEG_CALLS in the taint scanner.
@@ -167,9 +176,13 @@ class Encoder:
     bound it — a parameter, or a write it chose not to model.
     """
 
-    def __init__(self, source, decl_types=None):
+    def __init__(self, source, decl_types=None, fields=None, var_types=None):
         self.source = source
         self.decl = decl_types or {}
+        # {type name: {field: (type string, bitfield width)}} and
+        # {variable: type name}; absent means field accesses stay unresolved.
+        self.fields = fields or {}
+        self.var_types = var_types or {}
         self.env = {}
         self.facts = []          # constraints on fresh constants (sizeof > 0, …)
         # Constants standing for C the encoder failed to model, as opposed to
@@ -283,6 +296,7 @@ class Encoder:
         text = self._text(type_node).strip()
         if '*' in text:
             return Value(_resize(inner, PTR_BITS), PTR_BITS, False)
+        text = base_type(text)
         width = _TYPE_WIDTHS.get(text)
         if width is None:
             return inner
@@ -394,8 +408,65 @@ class Encoder:
             self.facts.append(val.bv >= 0)
         return val
 
+    def _tag_of(self, node):
+        """The type name an expression designates, for resolving `a->b`."""
+        t = node.type
+        if t == 'identifier':
+            return self.var_types.get(self._text(node))
+        if t == 'parenthesized_expression':
+            inner = [c for c in node.children if c.is_named]
+            return self._tag_of(inner[0]) if inner else None
+        if t in ('pointer_expression', 'subscript_expression'):
+            arg = node.child_by_field_name('argument')
+            return self._tag_of(arg) if arg is not None else None
+        if t == 'cast_expression':
+            type_node = node.child_by_field_name('type')
+            return type_key(self._text(type_node)) if type_node is not None else None
+        if t == 'field_expression':
+            decl = self._field_decl(node)
+            return type_key(decl[0]) if decl else None
+        return None
+
+    def _field_decl(self, node):
+        """(type, bitfield width, kind) for `a->b` or `a.b`, if resolvable."""
+        field = node.child_by_field_name('field')
+        arg = node.child_by_field_name('argument')
+        if field is None or arg is None:
+            return None
+        tag = self._tag_of(arg)
+        if tag is None:
+            return None
+        return self.fields.get(tag, {}).get(self._text(field))
+
+    def field_key(self, node):
+        """The name a resolved field access is cached under."""
+        return ' '.join(self._text(node).split())
+
     def _e_field_expression(self, node):
-        return self.fresh('field', INT_BITS, False, opaque=True)
+        decl = self._field_decl(node)
+        base = base_type(decl[0]) if decl and decl[2] == SCALAR else None
+        width = _TYPE_WIDTHS.get(base) if base else None
+        if width is None:
+            return self.fresh('field', INT_BITS, False, opaque=True)
+
+        key = self.field_key(node)
+        if key in self.env:
+            return self.env[key]
+        wire = base in _WIRE_TYPES
+        signed = base in _SIGNED_TYPE_NAMES
+        # A non-wire field is still a gap: nothing in the slice wrote it and the
+        # encoder cannot say who did.  Knowing its type is what makes the gap
+        # narrow enough to be worth asserting over.
+        val = self.fresh(f'{key}_val' if wire else key, width, signed,
+                         opaque=not wire, guessed=False)
+        bits = decl[1]
+        if bits and bits < width:
+            lim = 1 << (bits - 1 if signed else bits)
+            self.facts.append(
+                z3.And(val.bv >= -lim, val.bv < lim) if signed
+                else z3.ULT(val.bv, z3.BitVecVal(lim, width)))
+        self.env[key] = val
+        return val
 
     def _e_subscript_expression(self, node):
         return self.fresh('elem', INT_BITS, False, opaque=True)
@@ -428,7 +499,7 @@ def build_decl_types(fn_body, source):
     out, conflict = {}, set()
 
     def record(name, text):
-        text = text.strip()
+        text = base_type(text)
         width = _TYPE_WIDTHS.get(text)
         if width is None:
             return

@@ -23,6 +23,7 @@ from bounds_checker.parsers.taint_scanner import _comparisons_on
 from bounds_checker.smt.encoder import (
     Encoder, Value, build_decl_types, promote, usual_conversions,
 )
+from bounds_checker.smt.fields import field_types, var_types
 from bounds_checker.smt.pathcond import build_path
 
 
@@ -378,7 +379,8 @@ _BASIS_BY_ROLE = {
 }
 
 
-def check_finding(finding, fn_body, source, timeout_ms=200, decl_types=None):
+def check_finding(finding, fn_body, source, timeout_ms=200, decl_types=None,
+                  c_path=None):
     """
     Refine one Stage 1 finding.
 
@@ -387,12 +389,23 @@ def check_finding(finding, fn_body, source, timeout_ms=200, decl_types=None):
     come apart often: a memcpy length that provably cannot be negative is still
     a memcpy length nobody bounded, and the solver has no way to see the
     destination.
+
+    `c_path` buys struct field types, which is most of what separates a term
+    the solver can reason about from a blank.  Resolving them means parsing the
+    headers the file reaches, so it is done only for a function that has a
+    finding to refine.
     """
     expr = _sink_expr(finding, fn_body, source)
     if expr is None:
         return UNMODELLED
 
-    path = build_path(fn_body, source, finding['sink_line'], decl_types)
+    types = var_map = None
+    if c_path:
+        types = field_types(c_path)
+        var_map = var_types(fn_body.parent or fn_body, fn_body, source)
+
+    path = build_path(fn_body, source, finding['sink_line'], decl_types,
+                      types, var_map)
     cat  = finding['category']
     role = finding.get('sink_arg_role', '')
     kind = finding.get('guard_kind', '')

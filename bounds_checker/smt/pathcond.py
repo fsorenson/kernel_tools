@@ -10,6 +10,7 @@ Where the walk cannot model a write it unbinds the variable rather than
 guessing, which costs precision but never soundness in the UNSAT direction.
 """
 
+import re
 from collections import namedtuple
 
 import z3
@@ -77,31 +78,58 @@ def _assign_op(node, source):
     return '='
 
 
-def _assigned_names(node, source):
-    """Every name the subtree writes, for the cases the walk will not model."""
-    out = set()
+def _written(node, source):
+    """
+    (names, field names) the subtree writes, for the cases the walk will not
+    model.  A write through `a->b` is attributed to `b` alone: which object it
+    landed on is exactly what the encoder cannot tell, so every cached field of
+    that name has to go.
+    """
+    names, fields = set(), set()
+
+    def note(target):
+        if target is None:
+            return
+        if target.type == 'identifier':
+            names.add(node_text(target, source))
+        elif target.type == 'field_expression':
+            f = target.child_by_field_name('field')
+            if f is not None:
+                fields.add(node_text(f, source))
+
     for n in _walk(node):
         if n.type == 'assignment_expression':
-            lhs = n.child_by_field_name('left')
-            if lhs is not None and lhs.type == 'identifier':
-                out.add(node_text(lhs, source))
+            note(n.child_by_field_name('left'))
         elif n.type == 'update_expression':
-            arg = n.child_by_field_name('argument')
-            if arg is not None and arg.type == 'identifier':
-                out.add(node_text(arg, source))
+            note(n.child_by_field_name('argument'))
         elif n.type == 'init_declarator':
-            d = n.child_by_field_name('declarator')
-            if d is not None and d.type == 'identifier':
-                out.add(node_text(d, source))
-    return out
+            note(n.child_by_field_name('declarator'))
+    return names, fields
+
+
+def _assigned_names(node, source):
+    return _written(node, source)[0]
+
+
+_FIELD_SEP = ('->', '.')
+
+
+def _depends_on(key, names):
+    """Whether a cached field access reads through any of these variables."""
+    return bool(names & set(re.findall(r'[A-Za-z_]\w*', key)))
+
+
+def _last_field(key):
+    return key.rsplit('.', 1)[-1].rsplit('->', 1)[-1]
 
 
 class _Walker:
-    def __init__(self, fn_body, source, sink_line, decl_types):
+    def __init__(self, fn_body, source, sink_line, decl_types,
+                 fields=None, var_types=None):
         self.fn_body = fn_body
         self.source = source
         self.sink = sink_line
-        self.enc = Encoder(source, decl_types)
+        self.enc = Encoder(source, decl_types, fields, var_types)
         self.conditions = []
         self.guards = []
         self.labels = _label_lines(fn_body, source)
@@ -112,9 +140,15 @@ class _Walker:
         return node_text(node, self.source)
 
     def _clobber(self, node):
-        for name in _assigned_names(node, self.source):
+        names, fields = _written(node, self.source)
+        for name in names:
             self.enc.env.pop(name, None)
             self.enc.lost.add(name)
+        for key in list(self.enc.env):
+            if not any(sep in key for sep in _FIELD_SEP):
+                continue
+            if _depends_on(key, names) or _last_field(key) in fields:
+                self.enc.env.pop(key, None)
 
     def _bind(self, name, value_node, op):
         rhs = self.enc.encode(value_node)
@@ -272,7 +306,12 @@ class _Walker:
             if a.bv.eq(b.bv):
                 self.enc.env[name] = a
                 continue
-            width, signed = self.enc.declared(name)
+            if name in self.enc.decl:
+                width, signed = self.enc.declared(name)
+            else:
+                # A field access, keyed by its text: both arms wrote the same
+                # storage, so the type either of them carries is that storage's.
+                width, signed = max(a.width, b.width), a.signed and b.signed
             from bounds_checker.smt.encoder import _resize
             self.enc.env[name] = Value(
                 z3.If(cond, _resize(a, width), _resize(b, width)),
@@ -425,8 +464,10 @@ class _Walker:
         return False
 
 
-def build_path(fn_body, source, sink_line, decl_types=None):
+def build_path(fn_body, source, sink_line, decl_types=None,
+               fields=None, var_types=None):
     w = _Walker(fn_body, source, sink_line,
-                decl_types or build_decl_types(fn_body, source))
+                decl_types or build_decl_types(fn_body, source),
+                fields, var_types)
     w.block(fn_body)
     return Path(w.enc, w.conditions, w.guards)
