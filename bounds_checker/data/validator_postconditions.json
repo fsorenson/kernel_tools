@@ -1304,6 +1304,14 @@
       "is_self_validator": true,
       "postcondition": "On return value 1 (success), the peer_init parameters have all been walked and validated (each via sctp_process_param), the source address matches at least one advertised peer address, stream counts are bounded by peer's advertised in/outbound stream counts (sinit_num_ostreams <= peer num_inbound_streams and sinit_max_instreams <= peer num_outbound_streams), the TSN map is initialized, and stream structures are allocated \u2014 so all subsequent accesses to asoc->stream, asoc->peer.tsn_map, and transport structures are safe within those validated bounds.",
       "confidence": "medium"
+    },
+    "CIFSSMBQAllEAs": {
+      "checksum": "a7859b5a2fc19430",
+      "file_hint": "fs/smb/client/cifssmb.c",
+      "is_validator": true,
+      "is_self_validator": true,
+      "postcondition": "On successful return (non-negative value), the function guarantees that the parsed TRANSACTION2 response structure, including the fealist header and all individual fea entries (name and value lengths), fits entirely within the bounds of the received SMB packet. If data was copied into the provided `EAData` buffer, it is guaranteed not to exceed the `buf_size` specified by the caller.",
+      "confidence": "high"
     }
   }
 }
