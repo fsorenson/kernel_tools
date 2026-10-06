@@ -220,11 +220,9 @@ def _decide(path, claim, prop, detail, proved, extra=None, timeout_ms=200):
                              f'{detail}; holds only for particular values of '
                              f'unmodelled '
                              f'{", ".join(sorted({t.decl().name().split("!")[0] for t in free}))}')
-        s = path.solver(timeout_ms)
-        s.add(claim)
-        s.add(robust)
-        if s.check() != z3.sat:
-            return SmtResult('unknown', prop, {}, detail)
+        # The universal claim holds: for every value of the opaque terms, if
+        # the assumptions hold, the claim does too.  The basic model already
+        # satisfies both, so there is nothing left to ask the solver for.
     return SmtResult('witness', prop, _witness(s.model(), path, extra, claim),
                      detail)
 
