@@ -222,11 +222,13 @@ class Encoder:
             width, signed = self.declared(name)
             # An all-caps undeclared name is a macro or an enumerator, so the
             # constant stands for something fixed the encoder could not expand
-            # rather than for a value the path leaves open.
+            # rather than for a value the path leaves open.  C's rule is that
+            # an undecorated integer constant is `int`, which is what the
+            # default produces — not a guess.
             val = self.fresh(name, width, signed,
                              opaque=(name in self.lost
                                      or (undeclared and name.isupper())),
-                             guessed=undeclared)
+                             guessed=undeclared and not name.isupper())
         self.env[name] = val
         return val
 
@@ -511,19 +513,33 @@ def build_decl_types(fn_body, source):
             conflict.add(name)
         out[name] = entry
 
-    for n in _walk(fn_body):
-        if n.type not in ('declaration', 'parameter_declaration'):
-            continue
-        type_node = n.child_by_field_name('type')
-        if type_node is None:
-            continue
-        text = node_text(type_node, source)
-        for child in n.children:
-            decl = (child.children[0]
-                    if child.type == 'init_declarator' and child.children
-                    else child)
-            if decl is not None and decl.type == 'identifier':
-                record(node_text(decl, source), text)
+    def scan(nodes):
+        for n in nodes:
+            if n.type not in ('declaration', 'parameter_declaration'):
+                continue
+            type_node = n.child_by_field_name('type')
+            if type_node is None:
+                continue
+            text = node_text(type_node, source)
+            for child in n.children:
+                decl = (child.children[0]
+                        if child.type == 'init_declarator' and child.children
+                        else child)
+                if decl is not None and decl.type == 'identifier':
+                    record(node_text(decl, source), text)
+
+    scan(_walk(fn_body))
+
+    # Parameters live in the function_declarator's parameter_list, outside the
+    # compound_statement that fn_body points at.  Walk there separately so the
+    # encoder knows their types rather than defaulting to (INT_BITS, signed).
+    parent = fn_body.parent
+    if parent is not None and parent.type == 'function_definition':
+        for child in parent.children:
+            if child.type == 'function_declarator':
+                for sub in child.children:
+                    if sub.type == 'parameter_list':
+                        scan(c for c in sub.children if c.is_named)
 
     for name in conflict:
         out.pop(name, None)
