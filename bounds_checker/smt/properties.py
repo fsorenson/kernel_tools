@@ -278,6 +278,8 @@ def prop_overflow(path, expr_node):
     lhs = path.enc.encode(node.child_by_field_name('left'))
     rhs = path.enc.encode(node.child_by_field_name('right'))
     l, r, width, signed = usual_conversions(lhs, rhs)
+    if not _grounded(l):
+        return UNMODELLED
     if op == '*':
         ok = z3.BVMulNoOverflow(l.bv, r.bv, signed)
         term = l.bv * r.bv

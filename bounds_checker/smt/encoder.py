@@ -283,7 +283,8 @@ class Encoder:
         return self.read_var(self._text(node))
 
     def _e_sizeof_expression(self, node):
-        val = self.fresh('sizeof', PTR_BITS, False, opaque=True)
+        # The type is size_t — width and signedness are not a guess.
+        val = self.fresh('sizeof', PTR_BITS, False, opaque=True, guessed=False)
         self.facts.append(z3.And(z3.UGE(val.bv, 1),
                                  z3.ULE(val.bv, _SIZEOF_MAX)))
         return val
@@ -316,7 +317,8 @@ class Encoder:
                                z3.BitVecVal(0, INT_BITS)), INT_BITS, True)
         if op == '+':
             return val
-        return self.fresh('unary', INT_BITS, True, opaque=True)
+        # INT_BITS, signed is the C arithmetic default — not a guess.
+        return self.fresh('unary', INT_BITS, True, opaque=True, guessed=False)
 
     def _op_text(self, node):
         for c in node.children:
@@ -370,7 +372,8 @@ class Encoder:
             return Value(l.bv | r.bv, width, signed, l.guessed)
         if op == '^':
             return Value(l.bv ^ r.bv, width, signed, l.guessed)
-        return self.fresh('binop', width, signed, opaque=True)
+        # width and signed came from usual_conversions — not a guess.
+        return self.fresh('binop', width, signed, opaque=True, guessed=False)
 
     @staticmethod
     def compare(op, l, r, signed):
