@@ -1297,9 +1297,15 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         _rhs_has_additive_arith(rhs) or ref_kind == 'pointer'
                     ) else 'value'
                 origin = prev or tainted[ref]
+                # A field read from a tainted pointer (ea->field) is the taint
+                # contact for the new variable — show that line, not the pointer's
+                # origin.  Pointer-to-pointer propagation and plain value copies
+                # keep the original source so callers see where server data entered.
+                field_read = (not is_merge and ref_kind == 'pointer'
+                              and rhs.type == 'field_expression')
                 tainted[lhs_var] = {
                     'source_fn': origin['source_fn'],
-                    'line': origin['line'],   # keep the original source line
+                    'line': (node.start_point[0] + 1) if field_read else origin['line'],
                     'kind': kind,
                     'width': width,
                 }
