@@ -211,9 +211,19 @@ def _decide(path, claim, prop, detail, proved, extra=None, timeout_ms=200):
     assumed = path.assumptions()
     free = _opaque_terms([claim] + assumed, path.enc)
     if free:
+        # Fix the non-opaque free variables (wire values) to their basic-check
+        # values before the universal quantification.  Without this, z3 can set
+        # wire values to values that make the path condition vacuously False, and
+        # Implies(False, anything) trivially satisfies ForAll — a vacuous witness
+        # whose premise is an unreachable path.  Pinning them at the solver level
+        # (not inside the ForAll body) keeps z3 from choosing different values.
+        opaque_names = path.enc.opaque
         robust = z3.ForAll(free, z3.Implies(z3.And(assumed), claim))
         q = z3.Solver()
         q.set('timeout', timeout_ms)
+        for d in s.model().decls():
+            if d.name() not in opaque_names and d.arity() == 0:
+                q.add(z3.Const(d.name(), d.range()) == s.model()[d])
         q.add(robust)
         if q.check() != z3.sat:
             return SmtResult('unknown', prop, {},
