@@ -907,6 +907,18 @@ For each finding above, determine:
    caught by a guard.  "No counterexample found" without stating the \
    values tested is not acceptable.
 
+2b. **SMT witness reachability** (only when the finding carries \
+   "SMT: COUNTEREXAMPLE"): the solver produced a concrete assignment of \
+   wire-supplied values that breaks the named property on that path.  Walk \
+   it through the code: can a real server actually send those specific values \
+   (is the field unconstrained by the protocol, or does the protocol cap it \
+   to a range that excludes the witness value)?  Is the code path to the sink \
+   actually reachable with those values, or does an earlier guard cut it off?  \
+   Set smt_witness_reachable to true if the assignment is reachable, false if \
+   it is not.  For findings without an SMT witness, set smt_witness_reachable \
+   to null.  State the reasoning in notes — this is the one field where \
+   "unreachable because protocol caps field to N bits" is a complete answer.
+
 3. **Real bug**: combining the above, is this a genuine missing-validation bug?
 
 4. **Impact** (choose one if real bug, else "none"):
@@ -937,6 +949,7 @@ Return ONLY valid JSON:
       "taint_is_server_supplied": <true|false>,
       "bounds_check_present": <true|false>,
       "bounds_check_sufficient": <true|false>,
+      "smt_witness_reachable": <true|false|null>,
       "real_bug": <true|false>,
       "impact": "<impact category or empty>",
       "symptom": "<observable symptom or empty>",

@@ -217,6 +217,7 @@ def _build_context(run_dir, s1, s2):
                 'taint_server':    llm.get('taint_is_server_supplied'),
                 'check_present':   llm.get('bounds_check_present'),
                 'check_sufficient':llm.get('bounds_check_sufficient'),
+                'smt_witness_reachable': llm.get('smt_witness_reachable'),
                 'impact':          llm.get('impact', ''),
                 'symptom':         llm.get('symptom', ''),
                 'suggested_fix':   llm.get('suggested_fix', ''),
@@ -504,6 +505,11 @@ def _md_finding(buf, r, has_llm):
               f"*({_SMT_WITNESS_NOTE})* |")
             if sv['witness']:
                 W(f"| SMT witness | `{sv['witness']}` |")
+            wr = r.get('smt_witness_reachable')
+            if wr is True:
+                W(f"| SMT witness (LLM) | **reachable** — see notes |")
+            elif wr is False:
+                W(f"| SMT witness (LLM) | **not reachable** — see notes |")
 
     if has_llm and r['real_bug'] is True:
         W(f"| Server-supplied | {'yes' if r['taint_server'] else 'no'} |")
@@ -693,6 +699,11 @@ def _fn_copy_text(s, has_llm):
                          f" ({_SMT_WITNESS_NOTE})")
             if sv['witness']:
                 parts.append(f"  SMT witness:   {sv['witness']}")
+            wr = r.get('smt_witness_reachable')
+            if wr is True:
+                parts.append("  SMT witness (LLM): reachable — see notes")
+            elif wr is False:
+                parts.append("  SMT witness (LLM): not reachable — see notes")
         if has_llm and real is True:
             if r.get('symptom'):
                 parts.append(f"  Symptom: {r['symptom']}")
@@ -978,6 +989,14 @@ def _html_finding(lines, r, has_llm):
         if sv['verdict'] == 'witness' and sv['witness']:
             W(f'<tr><th>SMT witness</th>'
               f'<td><code>{_e(sv["witness"])}</code></td></tr>')
+        if sv['verdict'] == 'witness':
+            wr = r.get('smt_witness_reachable')
+            if wr is True:
+                W(f'<tr><th>SMT witness (LLM)</th>'
+                  f'<td><b style="color:var(--bug)">reachable</b> &mdash; see notes</td></tr>')
+            elif wr is False:
+                W(f'<tr><th>SMT witness (LLM)</th>'
+                  f'<td><b style="color:var(--fp)">not reachable</b> &mdash; see notes</td></tr>')
     if has_llm and real is True:
         W(f'<tr><th>Server-supplied</th>'
           f'<td>{"yes" if r["taint_server"] else "no"}</td></tr>')
