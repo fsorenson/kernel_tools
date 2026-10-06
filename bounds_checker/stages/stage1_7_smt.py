@@ -188,7 +188,7 @@ def _print_summary(retired, kept, errors, verbose):
     if retired:
         by = Counter((f.get('guard_kind', '') or '—',
                       f['smt']['property']) for f in retired)
-        print("  Retired by (Stage 1 verdict, property proved):")
+        print("  Retired by (guard_kind, property proved):")
         for (kind, prop), n in by.most_common():
             print(f"    {kind:24} {prop:24} {n}")
         if verbose:

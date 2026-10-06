@@ -193,6 +193,7 @@ def _build_context(run_dir, s1, s2):
                 'taint_source_fn': s1f['taint_source_fn'],
                 'taint_line':      s1f['taint_line'],
                 'taint_snippet':   s1f['taint_snippet'],
+                'taint_indirect':  s1f.get('taint_indirect', False),
                 'tainted_var':     s1f['tainted_var'],
                 # cross-function extras
                 'callee_fn':           s1f.get('callee_fn', ''),
@@ -460,7 +461,12 @@ def _md_finding(buf, r, has_llm):
     W(f"| Field | Value |")
     W(f"|---|---|")
     W(f"| Category | {r['cat_label']} |")
-    W(f"| Taint source | `{r['taint_source_fn']}()` line {r['taint_line']} |")
+    fn = r['taint_source_fn']
+    # taint_indirect: the source function was not called at taint_line — the
+    # value arrived through a tainted variable, so the snippet shows the
+    # assignment, not the server-read call.
+    src_label = f'via `{fn}()`' if r.get('taint_indirect') else f'`{fn}()`'
+    W(f"| Taint source | {src_label} line {r['taint_line']} |")
     W(f"| Taint snippet | `{r['taint_snippet']}` |")
     W(f"| Tainted var | `{r['tainted_var']}` |")
     if ovf:
@@ -659,7 +665,9 @@ def _fn_copy_text(s, has_llm):
             f"Finding #{r['idx']} [Category {r['category']}{callee_part}{verdict_part}]"
             f"  {r['cat_label']}"
         )
-        parts.append(f"  Taint source: {r['taint_source_fn']}() line {r['taint_line']}")
+        fn = r['taint_source_fn']
+        src_pfx = 'via ' if r.get('taint_indirect') else ''
+        parts.append(f"  Taint source: {src_pfx}{fn}() line {r['taint_line']}")
         parts.append(f"  Taint snippet: {r['taint_snippet']}")
         parts.append(f"  Tainted var:   {r['tainted_var']}")
         if ovf:
@@ -917,8 +925,10 @@ def _html_finding(lines, r, has_llm):
 
     W('<table>')
     W(f'<tr><th>Category</th><td>{_e(r["cat_label"])}</td></tr>')
+    fn = r['taint_source_fn']
+    src_pfx = 'via ' if r.get('taint_indirect') else ''
     W(f'<tr><th>Taint source</th><td>'
-      f'<code>{_e(r["taint_source_fn"])}()</code> line {r["taint_line"]}</td></tr>')
+      f'{src_pfx}<code>{_e(fn)}()</code> line {r["taint_line"]}</td></tr>')
     W(f'<tr><th>Taint snippet</th><td><code>{_e(r["taint_snippet"])}</code></td></tr>')
     W(f'<tr><th>Tainted var</th><td><code>{_e(r["tainted_var"])}</code></td></tr>')
     if ovf:

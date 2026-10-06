@@ -1435,6 +1435,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 src_fn = _node_has_taint_source_call(arg, source)
                 tainted_var = None
                 taint_line = sink_line
+                taint_indirect = False
 
                 if src_fn:
                     tainted_var = node_text(arg, source)[:40]
@@ -1445,6 +1446,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         src_fn = tainted[ref]['source_fn']
                         tainted_var = ref
                         taint_line = tainted[ref]['line']
+                        taint_indirect = True
 
                 if src_fn:
                     guarded = _find_guards_between(
@@ -1461,6 +1463,7 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         'tainted_var': tainted_var or '(inline)',
                         'taint_line': taint_line,
                         'taint_snippet': get_source_line(source, taint_line),
+                        'taint_indirect': taint_indirect,
                         'sink_fn': sink_fn,
                         'sink_line': sink_line,
                         'sink_snippet': sink_snippet,
