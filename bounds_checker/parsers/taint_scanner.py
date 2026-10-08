@@ -116,6 +116,15 @@ DANGEROUS_SINKS = {
 
 _ALLOC_FNS = frozenset(k for k, v in DANGEROUS_SINKS.items() if v.get('alloc'))
 
+# Functions that convert potentially-unterminated server data into a
+# kernel-allocated, NUL-terminated string.  Their return value is always safe
+# to pass to strlen() regardless of what the server sent, so taint does not
+# propagate through them for strlen/size-argument purposes.
+_NUL_TERM_CONVERTERS = frozenset({
+    'cifs_strndup_from_utf16',  # UTF-16 wire → NUL-terminated UTF-8 kstring
+    'cifs_strndup_from_utf8',   # UTF-8 wire → NUL-terminated kstring (ksmbd)
+})
+
 
 def _rhs_is_alloc(rhs, source):
     """
@@ -133,6 +142,19 @@ def _rhs_is_alloc(rhs, source):
         return False
     fn_id = next((c for c in n.children if c.type == 'identifier'), None)
     return fn_id is not None and node_text(fn_id, source) in _ALLOC_FNS
+
+
+def _rhs_is_nul_term_converter(rhs, source):
+    """Whether `rhs` is a call to a function that always returns a NUL-terminated string."""
+    n = rhs
+    while n is not None and n.type in ('cast_expression', 'parenthesized_expression'):
+        n = n.child_by_field_name('value') or (
+            n.children[1] if n.type == 'parenthesized_expression'
+            and len(n.children) > 1 else None)
+    if n is None or n.type != 'call_expression':
+        return False
+    fn_id = next((c for c in n.children if c.type == 'identifier'), None)
+    return fn_id is not None and node_text(fn_id, source) in _NUL_TERM_CONVERTERS
 
 
 # For Category C: these operators produce a subscript expression
@@ -1212,6 +1234,16 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
             # to propagate, it makes every write into the fresh buffer look
             # like a server-controlled dereference.
             if not is_merge and _rhs_is_alloc(rhs, source):
+                if lhs_var in tainted:
+                    killed[lhs_var] = (_kill_extent(node, fn_body),
+                                       tainted.pop(lhs_var))
+                continue
+
+            # Encoding-conversion functions that guarantee NUL-termination of
+            # their output regardless of what the server sent.  strlen() on
+            # the returned string is safe; Cat B/D findings based on its length
+            # are false positives.
+            if not is_merge and _rhs_is_nul_term_converter(rhs, source):
                 if lhs_var in tainted:
                     killed[lhs_var] = (_kill_extent(node, fn_body),
                                        tainted.pop(lhs_var))
