@@ -829,6 +829,33 @@ Common false positive patterns in kernel taint analysis:
    finding that depends on that boundary is a real bug regardless of
    how thorough the downstream guards appear.
 
+10. Distinguishing caps from inflations: `if (x > limit) x = limit`
+   REDUCES x — it cannot make x larger than it already is.  Before
+   concluding that a user-supplied or server-supplied value inflates a
+   size or offset, verify the direction of every comparison that touches
+   the tainted variable after the taint source.  A value inflates x
+   only if it appears on the right side of an addition or as a
+   multiplier.  An `if (x > y) x = y` pattern is a ceiling that bounds
+   x from above; treating it as inflation is a reasoning error.  Apply
+   the counterexample test: assign a specific numeric value to the
+   "inflating" term and show that x at the sink EXCEEDS the server's
+   response length.  If you cannot, the finding is a false positive.
+
+11. copy_to_user with a user-controlled size cap: if the size argument
+   to copy_to_user is bounded by a value the USER supplied from their
+   own ioctl or syscall buffer (not from the server), this is
+   self-limiting — copy_to_user returns -EFAULT if the destination
+   range is not fully mapped, so the user cannot cause the kernel to
+   write past their own buffer allocation.  The security-relevant
+   question is whether the kernel SOURCE buffer (retbuf, iov_base, etc.)
+   is shorter than the copy length, which would cause an OOB read of
+   kernel memory before the copy even starts.  If the kernel source is
+   bounded by the server's actual response length (e.g., ret_data_len
+   returned by SMB2_ioctl), and the user's supplied cap only further
+   reduces what gets copied, there is no OOB read and the finding is a
+   false positive.  Do NOT confuse the user's size declaration with
+   server-controlled inflation of the copy length.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
