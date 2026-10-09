@@ -52,21 +52,28 @@ def main():
 
     cfg = load_config(args.config, args)
 
-    if not cfg['target']['source_dirs']:
-        print("Error: specify --source-dir DIR (e.g. --source-dir fs/smb/client)",
-              file=sys.stderr)
+    if not cfg['target']['source_dirs'] and not cfg['target']['source_paths']:
+        print("Error: specify at least one path to scan (positional PATH, or "
+              "--source-dir DIR)", file=sys.stderr)
         sys.exit(1)
 
-    # Create run directory
+    # Create run directory, naming it after the first scan target.
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    subsystem = cfg['target']['source_dirs'][0].replace('/', '_')
-    run_dir = Path(cfg['output']['dir']) / f"{ts}_{subsystem}"
+    if cfg['target']['source_dirs']:
+        label = cfg['target']['source_dirs'][0].replace('/', '_')
+    else:
+        first = cfg['target']['source_paths'][0]
+        label = first.name  # file or dir basename
+    run_dir = Path(cfg['output']['dir']) / f"{ts}_{label}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config snapshot
+    # Save config snapshot (source_paths contains Path objects; stringify them).
     snapshot = {
         'kernel_source': str(cfg['kernel_source']),
-        'target': cfg['target'],
+        'target': {
+            'source_dirs':  cfg['target']['source_dirs'],
+            'source_paths': [str(p) for p in cfg['target']['source_paths']],
+        },
         'categories': cfg['categories'],
     }
     (run_dir / 'config_snapshot.json').write_text(json.dumps(snapshot, indent=2))
@@ -76,7 +83,9 @@ def main():
     print(f"{'='*60}")
     print(f"Run directory: {run_dir}")
     print(f"Kernel source: {cfg['kernel_source']}")
-    print(f"Source dirs:   {', '.join(cfg['target']['source_dirs'])}")
+    all_targets = (cfg['target']['source_dirs'] +
+                   [str(p) for p in cfg['target']['source_paths']])
+    print(f"Scan targets:  {', '.join(all_targets)}")
     print(f"Categories:    {', '.join(cfg['categories'])}")
 
     # Stage 1: taint scan (Categories A, B, C)

@@ -1,6 +1,7 @@
 """Configuration loading for the bounds checker."""
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -17,10 +18,58 @@ KNOWN_MODELS = [
 ]
 
 
+# Ordered list used for range expansion in --categories / --llm-categories.
+_VALID_CATS = ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H']
+_CAT_INDEX  = {c: i for i, c in enumerate(_VALID_CATS)}
+
+
+def parse_categories(s):
+    """
+    Parse a category specification into a deduplicated ordered list.
+
+    Accepts comma-separated tokens, whitespace-separated tokens, and
+    hyphen-separated ranges.  Examples:
+        'A,B,C'   → ['A','B','C']
+        'A-D'     → ['A','B','C','D']
+        'A-C,G1'  → ['A','B','C','G1']
+        'A B C'   → ['A','B','C']
+    """
+    tokens = re.split(r'[,\s]+', s.strip())
+    result = []
+    for tok in tokens:
+        if not tok:
+            continue
+        if tok in _CAT_INDEX:
+            result.append(tok)
+        elif '-' in tok:
+            # Hyphen separates two valid category names.
+            # Split at the FIRST hyphen; multi-char names like G1, G2 never
+            # contain hyphens, so this is unambiguous.
+            lo, hi = tok.split('-', 1)
+            if lo not in _CAT_INDEX or hi not in _CAT_INDEX:
+                raise argparse.ArgumentTypeError(
+                    f"Unknown category in range {tok!r} — "
+                    f"valid: {', '.join(_VALID_CATS)}")
+            si, ei = _CAT_INDEX[lo], _CAT_INDEX[hi]
+            if si > ei:
+                raise argparse.ArgumentTypeError(
+                    f"Range {tok!r}: {lo!r} comes after {hi!r} in the "
+                    f"category order ({', '.join(_VALID_CATS)})")
+            result.extend(_VALID_CATS[si:ei + 1])
+        else:
+            raise argparse.ArgumentTypeError(
+                f"Unknown category {tok!r} — valid: {', '.join(_VALID_CATS)}")
+    # Deduplicate while preserving first-seen order.
+    seen = set()
+    return [c for c in result if not (c in seen or seen.add(c))]
+
+
 DEFAULT_CONFIG = {
     'kernel_source': '/home/src/linux',
     'target': {
-        'source_dirs': [],
+        'source_dirs':  [],   # relative to kernel_source; recursed for .c/.h
+        'source_paths': [],   # absolute Path objects: files scanned directly,
+                              # directories recursed — from positional CLI args
     },
     'categories': ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],   # which categories to scan
     'output': {
@@ -85,6 +134,15 @@ def load_config(config_path=None, cli_args=None):
         if getattr(cli_args, 'llm_categories', None):
             cfg['llm']['categories'] = cli_args.llm_categories
 
+        # Positional PATH arguments: resolve each against CWD; files are
+        # scanned directly, directories are recursed for .c/.h files.
+        for raw in getattr(cli_args, 'paths', None) or []:
+            p = Path(raw).expanduser().resolve()
+            if not p.exists():
+                print(f"Error: path not found: {raw}", file=sys.stderr)
+                sys.exit(1)
+            cfg['target']['source_paths'].append(p)
+
     cfg['kernel_source'] = Path(cfg['kernel_source']).expanduser().resolve()
     if not cfg['kernel_source'].exists():
         print(f"Error: kernel_source not found: {cfg['kernel_source']}", file=sys.stderr)
@@ -94,26 +152,36 @@ def load_config(config_path=None, cli_args=None):
 
 
 def build_arg_parser():
+    _cat_metavar = 'CAT[,CAT|-CAT]'
+    _cat_help_suffix = (
+        f'  Categories: {", ".join(_VALID_CATS)}.  '
+        f'Accepts comma-separated values, hyphen ranges, or a mix: '
+        f'"A-D", "A,B,G1", "A-C,G1-H".'
+    )
     p = argparse.ArgumentParser(
         description='Kernel bounds / data validation checker',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --source-dir fs/smb/client
-  %(prog)s --source-dir fs/xfs --categories A B
-  %(prog)s --config bc_config.yaml
+  %(prog)s fs/smb/client
+  %(prog)s fs/smb/client/reparse.c --llm
+  %(prog)s --source-dir fs/xfs --categories A-D
+  %(prog)s --config bc_config.yaml fs/smb/client
 """,
     )
+    p.add_argument('paths', metavar='PATH', nargs='*',
+                   help='Files (.c/.h) or directories to scan (resolved from CWD; '
+                        'directories are recursed for .c and .h files)')
     p.add_argument('--config', default=None,
                    help='Path to YAML config file')
     p.add_argument('--kernel-source', metavar='PATH',
                    help='Path to kernel source tree')
     p.add_argument('--source-dir', metavar='DIR', action='append',
                    help='Source directory to scan (relative to kernel_source); '
-                        'may be repeated')
-    p.add_argument('--categories', metavar='CAT', nargs='+',
-                   choices=['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],
-                   help='Categories to scan (default: A B C D E F G1 G2 H)')
+                        'may be repeated; superseded by positional PATH args '
+                        'when both are given')
+    p.add_argument('--categories', metavar=_cat_metavar, type=parse_categories,
+                   help='Categories to scan (default: all).' + _cat_help_suffix)
     p.add_argument('--output-dir', metavar='DIR',
                    help='Output directory for run artifacts')
     p.add_argument('--no-smt', action='store_true',
@@ -134,10 +202,10 @@ Examples:
                    help='Extended thinking budget in tokens (0=disabled; min 1024)')
     p.add_argument('--llm-workers', metavar='N', type=int, default=None,
                    help='Number of parallel LLM API calls (default: 4; use 1 for serial)')
-    p.add_argument('--llm-categories', metavar='CAT', nargs='+',
-                   choices=['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],
+    p.add_argument('--llm-categories', metavar=_cat_metavar, type=parse_categories,
                    help='Limit LLM analysis to these categories (default: all scanned); '
-                        'useful to skip noisy categories like H or G2')
+                        'useful to skip noisy categories like H or G2.'
+                        + _cat_help_suffix)
     p.add_argument('--debug', action='store_true',
                    help='Write full LLM prompts and responses to stage2_llm_analysis.debug')
     p.add_argument('--verbose', '-v', action='store_true')

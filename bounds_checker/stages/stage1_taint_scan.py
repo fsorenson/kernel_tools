@@ -91,17 +91,19 @@ def _progress_wrap(paths, label, verbose=False):
 
 def run(cfg, run_dir, verbose=False, write_report=True):
     """
-    Scan all .c files in cfg['target']['source_dirs'] for taint flows.
+    Scan all .c and .h files in the configured targets for taint flows.
     Writes stage1_taint_scan.json to run_dir and returns the output dict.
     """
     kernel_src = Path(cfg['kernel_source'])
     cats = set(cfg.get('categories', []))
-    source_dirs = cfg['target'].get('source_dirs', [])
-    if not source_dirs:
-        print("Stage 1: no source_dirs configured")
+    source_dirs  = cfg['target'].get('source_dirs', [])
+    source_paths = cfg['target'].get('source_paths', [])  # resolved Path objects
+
+    if not source_dirs and not source_paths:
+        print("Stage 1: no source directories or files configured")
         return None
 
-    # Collect candidate .c files
+    # Collect candidate .c/.h files
     c_paths = []
     for d in source_dirs:
         dpath = kernel_src / d
@@ -109,9 +111,23 @@ def run(cfg, run_dir, verbose=False, write_report=True):
             print(f"  Warning: source_dir not found: {dpath}")
             continue
         c_paths.extend(sorted(dpath.rglob('*.c')) + sorted(dpath.rglob('*.h')))
+    for sp in source_paths:
+        if sp.is_file():
+            if sp.suffix in ('.c', '.h'):
+                c_paths.append(sp)
+        elif sp.is_dir():
+            c_paths.extend(sorted(sp.rglob('*.c')) + sorted(sp.rglob('*.h')))
+
+    # Deduplicate (a file might match both a source_dir glob and a source_path)
+    seen, deduped = set(), []
+    for p in c_paths:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    c_paths = deduped
 
     if not c_paths:
-        print("Stage 1: no .c files found")
+        print("Stage 1: no .c/.h files found")
         return None
 
     git_info = _get_kernel_git_info(kernel_src)
@@ -119,8 +135,9 @@ def run(cfg, run_dir, verbose=False, write_report=True):
         branch_str = f"  branch: {git_info['branch']}" if git_info['branch'] else ''
         print(f"  Kernel: {git_info['version']}{branch_str}")
 
-    # Intra-procedural scan
-    _pfx_intra = f"  Scanning {len(c_paths)} file(s) in {', '.join(source_dirs)} ..."
+    # Build a human-readable label for what we're scanning.
+    _scan_targets = list(source_dirs) + [str(p) for p in source_paths]
+    _pfx_intra = f"  Scanning {len(c_paths)} file(s) in {', '.join(_scan_targets)} ..."
     findings_intra = scan_files(_progress_wrap(c_paths, _pfx_intra, verbose), verbose=verbose)
     for f in findings_intra:
         f['propagation'] = 'intra'
@@ -163,7 +180,7 @@ def run(cfg, run_dir, verbose=False, write_report=True):
     output = {
         'stage':                'taint_scan',
         'files_scanned':        len(c_paths),
-        'source_dirs':          source_dirs,
+        'source_dirs':          _scan_targets,
         'kernel_source':        str(kernel_src),
         'kernel_git':           git_info,
         'findings_count':       len(all_findings),
