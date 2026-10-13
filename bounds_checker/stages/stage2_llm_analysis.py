@@ -856,6 +856,27 @@ Common false positive patterns in kernel taint analysis:
    false positive.  Do NOT confuse the user's size declaration with
    server-controlled inflation of the copy length.
 
+12. Struct cast from server buffer — header read before size check: when
+   a server-supplied buffer `src` is cast to a struct pointer
+   (`cifs_acl = (struct T *)src`) and fields are read from it BEFORE
+   a check that `received_length >= sizeof(struct T)`, any field read
+   that lies beyond the actual received bytes is an OOB read —
+   regardless of what happens with the value afterwards.  This is a
+   class of bug the taint scanner can miss: it treats le16_to_cpu() /
+   be32_to_cpu() calls as taint SOURCES (where dangerous values
+   enter), not as potentially-OOB reads.  Before concluding that struct
+   field reads are safe, verify that a size check establishing
+   `buffer_len >= sizeof(*struct_ptr)` (or a tighter equivalent)
+   appears BEFORE the first field access.  Count offsets carefully:
+   if `version` is at offset 0 and `entry_count` is at offset 2 and
+   `default_count` is at offset 4, a server that sends only 2 bytes
+   makes both entry_count and default_count reads OOB even though
+   `version` was safe.  This finding is distinct from what happens with
+   the tainted VALUE once it is read — the issue is whether the READ
+   ITSELF is in bounds.  A finding dismissed because "the size check
+   at line N guards the dereference" may still be a real bug if the
+   read occurs before line N.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
