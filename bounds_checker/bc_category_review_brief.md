@@ -172,6 +172,15 @@ reasoning error observed in practice:
   Deferred: tree-wide scan would surface hundreds of instances needing Stage 2
   analysis against the monthly LLM quota.
 
+  *Multi-cast variant (Gap P):* The same pattern appears when validation is done
+  through one cast pointer (`smb2_hdr *hdr = buf`) and the field read is done
+  through a different-type cast of the same buffer (`smb2_read_rsp *rsp = buf;
+  rsp->DataLength`).  A length check via `hdr->Command` may or may not establish
+  that `buf` is long enough to hold `smb2_read_rsp`; if not, reading `rsp->DataLength`
+  is an OOB read, but the scanner has no way to connect the two pointer names to
+  the same memory without alias analysis.  Stage 2 prompt item 12 applies here
+  too; the alias aspect is out of scope for single-function-body analysis.
+
 - **Category J** — server-reported transfer count not validated against the
   requested length.  The taint IS seeded (e.g., `written = le16_to_cpu(smb->Count)`)
   but never reaches a memory sink — the value goes to inode accounting, a warning,
