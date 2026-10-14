@@ -955,6 +955,15 @@ For each finding above, determine:
    specific values you tested and whether they produced OOB or were \
    caught by a guard.  "No counterexample found" without stating the \
    values tested is not acceptable.
+   For Cat B findings (tainted size → allocator): specifically test \
+   size=0.  In Linux, kmalloc(0) returns ZERO_SIZE_PTR — a small \
+   non-null sentinel (typically 0x10–0x20), not NULL.  A subsequent \
+   `if (!p) return -ENOMEM;` null check does NOT exclude this: it \
+   passes the check but the pointer is not dereferenceable.  Any write \
+   to or field access on the returned pointer (memset, memcpy as \
+   destination, struct field assignment) then panics.  A missing \
+   lower-bound check (`if (size == 0)` or `if (size < sizeof(*p))`) is \
+   a real bug even when the upper bound is correctly validated.
 
 2b. **SMT witness reachability** (only when the finding carries \
    "SMT: COUNTEREXAMPLE"): the solver produced a concrete assignment of \
