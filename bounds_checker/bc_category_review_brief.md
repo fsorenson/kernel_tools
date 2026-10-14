@@ -36,7 +36,9 @@ Taint does **not** propagate through:
 
 A finding carries a `possibly_guarded` flag when a comparison or a
 `check_*_overflow()`/`size_{add,mul}()` call referencing the tainted variable
-appears between the taint source and the sink.
+appears between the taint source and the sink.  A Cat D finding additionally
+requires that the guard call's return value is actually used (a bare
+`memchr(buf, 0, len);` with no result check is not a guard).
 
 ---
 
@@ -48,12 +50,13 @@ appears between the taint source and the sink.
 | B | `kmalloc`/`kzalloc`/`kcalloc`/`kmalloc_array`/`vmalloc`/`devm_*` etc. | Tainted value reaches an allocation size argument |
 | B (OVF) | Same allocators | Size argument is a `*` or `+` expression with a tainted operand and no safe-overflow wrapper; emitted as a separate finding with `overflow=True` |
 | C | `arr[idx]` | Tainted value used as an array subscript |
-| D | `strlen`/`strlcpy`/`strcat`/`kstrdup` | String function applied to a buffer derived via tainted offset arithmetic, with no prior `strnlen`/`memchr` that establishes a terminator in bounds |
+| D | `strlen`/`strlcpy`/`strcat`/`kstrdup` | String function applied to a buffer derived via tainted offset arithmetic, with no prior `strnlen`/`memchr` *whose return value is checked* that establishes a terminator in bounds |
 | E | `p->field` | Dereference of a pointer computed from a tainted offset, without first checking the resulting pointer against the packet end |
 | F | `for (i = 0; i < n; i++)` | Tainted value used as a loop iteration bound |
 | G1 | `copy_{to,from}_user` | Return value discarded or not compared against zero — a partial copy is treated as success |
 | G2 | `copy_{to,from}_user` | Size argument is user-supplied and unvalidated at the call site |
 | H | declaration / assignment | Tainted wide value stored into a narrower integer type; the truncated value is what later bounds checks see |
+| L | `x << n` / `x >> n` | Tainted value used as the shift amount without a prior check that it is less than the type width — shifting by ≥ width is undefined behaviour in C |
 
 ### Cross-function pass
 
@@ -78,6 +81,12 @@ suffices).
   tainted pointer (`nlen = ea->ea_name_length`), the report marks the taint as
   indirect (`via le16_to_cpu()`) rather than a direct call, since the endian
   helper was not at the assignment line.
+- **Cat L / bitmask guard**: `tag = le16_to_cpu(x) & 0x1f` followed by
+  `1 << tag` surfaces as Cat L with `guarded=False` because the scanner's guard
+  detection looks for comparisons, not bitwise masks.  The SMT encoder models the
+  mask correctly (ULE(val & 0x1f, 31) is provable), so Stage 1.7 will retire
+  these when a shift-bounds property is added; in the meantime Stage 2 handles
+  them correctly.
 
 ---
 
@@ -130,6 +139,22 @@ Per-finding schema fields: `taint_is_server_supplied`, `bounds_check_present`,
 LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
 `suggested_fix`, `cve_pattern`, `notes`.
 
+The analysis task prompt carries 12 numbered items covering the main classes of
+reasoning error observed in practice:
+
+1. Taint is genuinely server-supplied (vs. a locally-built request)
+2. Bounds check present and sufficient (and callee postcondition analysis)
+2a. Counterexample test (mandatory for every finding)
+2b. SMT witness reachability
+2c. Packet-relative bounds check — `count * sizeof(element) <= received_size`,
+    not just `count <= MAX` (the SMT layer cannot see buffer sizes)
+3–11. Real bug, impact, symptom, suggested fix, CVE pattern, validation notes
+10. Caps vs. inflations — `if (x > limit) x = limit` reduces x, never inflates it
+11. `copy_to_user` with user-controlled size cap is self-limiting
+12. Struct cast from server buffer — field reads before the header size check
+    (the scanner treats `le16_to_cpu(ptr->field)` as a taint source, not asking
+    whether the READ ITSELF is in bounds if the buffer is too short for the struct)
+
 ---
 
 ## Designed but not yet implemented
@@ -139,13 +164,13 @@ LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
 
 - **Category I** — struct cast from server buffer with field reads before the
   header size check.  Pattern: `(struct T *)src` followed by `le16_to_cpu(ptr->field)`
-  reads before a `size_of_data_area >= sizeof(struct T)` check.  The taint model
-  treats those `le16_to_cpu` calls as taint sources, never asking whether the read
-  itself is in bounds.  Confirmed instance: `cifs_to_posix_acl()` (fixed
+  reads before a `size_of_data_area >= sizeof(struct T)` check.  The scanner
+  treats those `le16_to_cpu` calls as taint SOURCES, never asking whether the
+  read itself is in bounds.  Confirmed instance: `cifs_to_posix_acl()` (fixed
   `9b2b3cda`).  Stage 2 prompt item 12 covers the reasoning gap; scanner
   detection requires a new category keyed on cast-from-response-buffer.
-  Deferred until monthly LLM quota resets (tree-wide scan would surface hundreds
-  of instances needing Stage 2 analysis).
+  Deferred: tree-wide scan would surface hundreds of instances needing Stage 2
+  analysis against the monthly LLM quota.
 
 - **Category J** — server-reported transfer count not validated against the
   requested length.  The taint IS seeded (e.g., `written = le16_to_cpu(smb->Count)`)
@@ -153,16 +178,43 @@ LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
   or a result out-param.  The sink model has no hook for "value returned to caller
   without an upper-bound check against the original request size."
 
+- **Category K** — zero-length TLV / infinite loop.  Loop advancement
+  `offset += tainted_len` where `tainted_len == 0` never advances, causing a
+  soft lockup.  Missing guard: `if (tainted_len == 0) return -EINVAL` or
+  `if (tainted_len < MIN_HEADER)`.  Not a memory-safety finding — a DoS
+  finding — so a scope decision (does this tool want DoS findings?) is needed
+  before implementing.  Intra-procedural, detectable with the current taint model.
+
+- **Category M** — `%s` over-read via printk/cifs_dbg/seq_printf.  Passing a
+  tainted, potentially non-NUL-terminated pointer to `%s` causes an OOB slab
+  read.  Requires parsing format strings to match `%s` positions to their
+  arguments.  Lower priority: many tainted `%s` pointers are from
+  `cifs_strndup_from_utf16()` output (already suppressed as NUL-terminated), and
+  most kernel debug logging (`cifs_dbg(FYI, ...)`) does not expose data to
+  userspace.
+
+- **Cat L / shift-bounds SMT property** — the encoder already models bitwise
+  masks correctly, so adding `prop_shift_bounds` to Stage 1.7 would retire Cat L
+  findings where a prior `& 0x1f` or `& 0x3f` mask provably limits the shift
+  amount below the type width.  Low complexity, pairs naturally with Cat L.
+
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
-  findings where Stage 2 cannot determine safety from the function body, enumerate
-  direct callers and extract any guards applied to the tainted parameter before the
-  call.  Addresses cases like `__smb2_calc_size()` where every call site validates
-  `shdr->Command` but Stage 2 only sees the callee.
+  findings where Stage 2 cannot determine safety from the function body alone,
+  enumerate direct callers and extract any guards applied to the tainted parameter
+  before the call.  Addresses cases like `__smb2_calc_size()` where every call
+  site validates `shdr->Command` but Stage 2 only sees the callee.
 
 - **L3 / allocation-formula vs write-formula mismatch** — caller sizes a buffer
   with formula A (e.g., POSIX xattr layout); callee writes it with formula B
   (CIFS wire layout, larger).  Neither formula is wrong internally; the defect is
   that A < B for large counts.  Two confirmed CIFS instances.
+
+- **Cat H / same-width unsigned→signed sign-conversion** — assigning a
+  `u32` wire value into an `int` local of the same width reinterprets large
+  values as negative, bypassing subsequent `if (local_len > MAX)` ceiling
+  checks.  Cat H currently fires only on width narrowing; same-width sign changes
+  are caught downstream by the SMT `negative` property but not flagged at the
+  conversion point.
 
 ---
 
@@ -174,15 +226,15 @@ LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
 - Purely local overflow with no server-supplied input — covered by the sibling
   `syntactic_lint` tool (narrow-integer wrap, pointer/length pairing, scan loops)
 - Cross-function UAF and refcount accounting (whole-program alias analysis)
-- Buffer-too-small-for-struct issues where the struct pointer is not derived from
-  a server response buffer (covered by KASAN/UBSAN at runtime)
+- Double-fetch / TOCTOU (requires alias analysis to detect two reads from the
+  same expression across branches — out of scope for single-function-body analysis)
 
 ---
 
 ## The review question
 
 Which classes of kernel bounds, length, offset, or integer-range bug that occur
-in real protocol-parsing and driver code are not covered by A–H and the gaps
+in real protocol-parsing and driver code are not covered by A–H, L, and the gaps
 listed above?  For each gap: name the bug class, give a concrete kernel or CVE
 example, state the sink and the guard whose absence defines it, and say whether
 it is detectable from a single function body given the taint model above (or
