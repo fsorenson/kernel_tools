@@ -967,6 +967,24 @@ For each finding above, determine:
    to null.  State the reasoning in notes — this is the one field where \
    "unreachable because protocol caps field to N bits" is a complete answer.
 
+2c. **Packet-relative bounds check** (apply when the tainted value dictates \
+   how far into the same packet buffer the code reads or writes — subscript, \
+   offset, or loop-count derived from the packet): the SMT layer has no \
+   visibility into how large the packet buffer actually is, so an SMT PROVED \
+   result covers the arithmetic of the value in isolation, not whether it \
+   stays inside the buffer.  A bounds check on the value itself (e.g., \
+   `if (count > 100) return -EINVAL`) is necessary but not sufficient — \
+   the only check that matters here is one of the form \
+   `sizeof(header) + count * sizeof(element) <= received_length`, with the \
+   actual received-packet length on the right-hand side.  Check: is this \
+   inequality (or a mathematically equivalent one) present in code?  If \
+   the guard is only `count <= MAX_ENTRIES` without reference to the \
+   received buffer length, a server can send a packet shorter than what \
+   `count * sizeof(element)` would require, and the OOB read or write \
+   still occurs.  Common example: `struct T { u32 count; u32 data[]; }` — \
+   a check that `count < 256` does not prevent an OOB read of `data[count-1]` \
+   if the server sent a 12-byte packet claiming count=255.
+
 3. **Real bug**: combining the above, is this a genuine missing-validation bug?
 
 4. **Impact** (choose one if real bug, else "none"):
