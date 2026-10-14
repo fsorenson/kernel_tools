@@ -1084,11 +1084,15 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
 def _find_string_guard(fn_body, var_name, line_lo, line_hi, source):
     """
     Return True if a safe bounded-length call (strnlen, memchr, memchr_inv)
-    on var_name appears between line_lo and line_hi.
+    on var_name appears between line_lo and line_hi AND its return value is
+    actually used.
 
-    These are the only constructs that establish a null-termination guarantee
-    without unbounded scanning; a strnlen() result stored and compared is
-    sufficient even if not paired with a return.
+    A bare `memchr(buf, 0, len);` whose parent is an expression_statement
+    discards the return value and establishes no termination guarantee — the
+    scanner would otherwise suppress real Cat D findings wherever the call
+    appears as dead code or where the programmer called it without acting on
+    the result.  Any other context (assigned, used in a condition, passed as
+    an argument) means the result is at least in play.
     """
     for node in _walk(fn_body):
         if node.type != 'call_expression':
@@ -1103,9 +1107,19 @@ def _find_string_guard(fn_body, var_name, line_lo, line_hi, source):
         if not args:
             continue
         # var_name must appear in the first argument (possibly through a cast)
+        found = False
         for n in _walk(args[0]):
             if n.type == 'identifier' and node_text(n, source) == var_name:
-                return True
+                found = True
+                break
+        if not found:
+            continue
+        # The return value must not be discarded — a bare call in an
+        # expression_statement is just noise.
+        parent = node.parent
+        if parent is not None and parent.type == 'expression_statement':
+            continue
+        return True
     return False
 
 
