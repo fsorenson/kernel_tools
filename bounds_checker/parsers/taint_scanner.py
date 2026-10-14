@@ -1797,6 +1797,64 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 ),
             })
 
+        # ── Category L: tainted shift amount ──
+        # Shifting by >= the bit-width of the type is UB in C; on x86 the
+        # hardware masks the count modulo 64 so the result appears but is
+        # wrong, while on ARM a count >= 32 yields 0 for logical shifts.
+        # Drivers and protocol parsers that extract a page_order, exponent,
+        # or field width directly from a packet and then compute `1 << order`
+        # are vulnerable to this.
+        elif (node.type == 'binary_expression'
+              and len(node.children) >= 3
+              and node_text(node.children[1], source) in ('<<', '>>')):
+            shift_amount_node = node.children[2]
+            src_fn = _node_has_taint_source_call(shift_amount_node, source)
+            ref = None
+            taint_line = node.start_point[0] + 1
+
+            if src_fn:
+                pass  # direct taint source inline as the shift amount
+            else:
+                ref = _node_references_tainted_var(
+                    shift_amount_node, source, tainted)
+                if ref:
+                    src_fn = tainted[ref]['source_fn']
+                    taint_line = tainted[ref]['line']
+
+            if not src_fn:
+                continue
+
+            sink_line = node.start_point[0] + 1
+            sink_snippet = get_source_line(source, sink_line)
+            op = node_text(node.children[1], source)
+            guarded = _find_guards_between(
+                fn_body, {ref} if ref else set(),
+                taint_line, sink_line, source,
+                signed_vars, sink_expr=shift_amount_node,
+            )
+            findings.append({
+                'function': fn_name,
+                'file': str(filepath),
+                'category': 'L',
+                'severity': 'medium',
+                'taint_source_fn': src_fn,
+                'tainted_var': ref or node_text(shift_amount_node, source)[:40],
+                'taint_line': taint_line,
+                'taint_snippet': get_source_line(source, taint_line),
+                'sink_fn': op,
+                'sink_line': sink_line,
+                'sink_snippet': sink_snippet,
+                'sink_arg_index': 1,
+                'sink_arg_role': 'shift_amount',
+                'possibly_guarded': guarded.found,
+                'guard_kind':       guarded.kind,
+                'reason': (
+                    f"server-supplied value from {src_fn}() used as {op} shift "
+                    f"amount without bounding it below the type width — shifting "
+                    f"by >= width is undefined behaviour in C"
+                ),
+            })
+
     # Deduplicate and resolve conflicts between overflow and plain Cat B.
     # When an overflow finding and a plain Cat B cover the same
     # (function, sink_fn, sink_line, arg_idx), suppress the plain Cat B —

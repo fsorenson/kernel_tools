@@ -19,7 +19,7 @@ KNOWN_MODELS = [
 
 
 # Ordered list used for range expansion in --categories / --llm-categories.
-_VALID_CATS = ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H']
+_VALID_CATS = ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H', 'L']
 _CAT_INDEX  = {c: i for i, c in enumerate(_VALID_CATS)}
 
 
@@ -71,7 +71,7 @@ DEFAULT_CONFIG = {
         'source_paths': [],   # absolute Path objects: files scanned directly,
                               # directories recursed — from positional CLI args
     },
-    'categories': ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H'],   # which categories to scan
+    'categories': ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H', 'L'],   # which categories to scan
     'output': {
         'dir': 'bc_runs/',
     },

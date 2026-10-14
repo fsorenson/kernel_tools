@@ -60,6 +60,7 @@ _CAT_LABEL = {
     'G1': 'Cat G1 — copy_from/to_user return value unchecked (partial copy = success)',
     'G2': 'Cat G2 — unvalidated size argument to copy_from/to_user',
     'H':  'Cat H — server value → narrow integer type (silent truncation)',
+    'L':  'Cat L — server value → shift amount (undefined behaviour if >= type width)',
 }
 _ASSESSMENT_LABEL = {
     'real_bug': 'BUG', 'false_positive': 'FP',
@@ -1037,7 +1038,7 @@ _IMPACT_SCORE = {
     'oob_write': 100, 'stack_overflow': 90, 'oob_read': 80,
     'integer_overflow': 60, 'undersized_alloc': 60, 'info_disclosure': 40,
 }
-_CAT_BASE = {'A': 50, 'E': 50, 'C': 40, 'B': 40, 'F': 30, 'G1': 30, 'G2': 40, 'H': 20}
+_CAT_BASE = {'A': 50, 'E': 50, 'C': 40, 'B': 40, 'F': 30, 'G1': 30, 'G2': 40, 'H': 20, 'L': 30}
 
 _TIERS = [
     (250, 'Critical'),   # LLM-confirmed real bug

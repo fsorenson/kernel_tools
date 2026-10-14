@@ -53,6 +53,7 @@ _CATEGORY_LABELS = {
     'G1':    'copy_from_user/copy_to_user return value unchecked: partial copy treated as success',
     'G2':    'unvalidated size argument to copy_from_user/copy_to_user: user-controlled size',
     'H':     'server-supplied wide value silently truncated to narrower integer type',
+    'L':     'server-supplied value used as shift amount without bounding below type width',
 }
 
 _IMPACT_CHOICES = (
