@@ -228,6 +228,18 @@ reasoning error observed in practice:
 - Cross-function UAF and refcount accounting (whole-program alias analysis)
 - Double-fetch / TOCTOU (requires alias analysis to detect two reads from the
   same expression across branches — out of scope for single-function-body analysis)
+- **Integer promotion / architecture-specific multiplication widths**: The Cat B
+  (OVF) finder and Stage 1.7 model `sizeof` as `size_t` (PTR_BITS, unsigned),
+  which is correct for 64-bit Linux.  When a programmer explicitly intermediate-
+  casts both operands to 32-bit (`(int)count * (int)stride`) before passing to
+  a `size_t` parameter, the multiplication is done in 32-bit C arithmetic and can
+  wrap before implicit widening to `size_t`.  The encoder cannot in general
+  determine whether a local `int stride` variable holds a compile-time constant
+  from `sizeof` or a narrower programmer-chosen value.  Findings involving such
+  expressions are correctly flagged by Cat B (OVF); the SMT verdict on overflow
+  depends on whether the encoder infers the right width for each operand.
+  Architecture-specific behavior (e.g., whether `size_t` is 32 or 64 bits on the
+  target) is not modelled.
 
 ---
 
