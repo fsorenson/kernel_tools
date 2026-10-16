@@ -151,9 +151,12 @@ def run(run_dirs, output_dir=None, verbose=False):
         run_fn_groups.append(groups)
 
     # -----------------------------------------------------------------------
-    # Merge Stage 1: deduplicate findings by stable key, first-seen wins
+    # Merge Stage 1: deduplicate findings by stable key, first-seen wins.
+    # When a later run carries SMT data that the earlier run did not, the
+    # canonical finding is upgraded in place — a run with Stage 1.7 enabled
+    # and one without should not silently lose the solver verdict.
     # -----------------------------------------------------------------------
-    seen_keys = set()
+    seen_keys = {}   # sk -> index into merged_findings
     merged_findings = []
     merged_fn_groups = defaultdict(list)   # (fn, file) -> deduplicated findings
 
@@ -162,9 +165,15 @@ def run(run_dirs, output_dir=None, verbose=False):
             for f in fn_findings:
                 sk = _s1_key(f)
                 if sk not in seen_keys:
-                    seen_keys.add(sk)
+                    seen_keys[sk] = len(merged_findings)
                     merged_findings.append(f)
                     merged_fn_groups[fn_key].append(f)
+                else:
+                    # Upgrade: if the new occurrence has SMT data and the
+                    # canonical does not, prefer the richer annotation.
+                    canon = merged_findings[seen_keys[sk]]
+                    if f.get('smt') and not canon.get('smt'):
+                        canon['smt'] = f['smt']
 
     total_raw = sum(len(s1.get('findings', [])) for _, s1, _ in runs)
     n_dupes = total_raw - len(merged_findings)
