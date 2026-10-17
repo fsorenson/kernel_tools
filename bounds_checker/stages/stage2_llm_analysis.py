@@ -879,6 +879,23 @@ Common false positive patterns in kernel taint analysis:
    at line N guards the dereference" may still be a real bug if the
    read occurs before line N.
 
+14. Unsigned subtraction underflow / remaining-length wrapping: a
+   common pattern in protocol parsers uses a "bytes remaining" variable
+   to track how much packet is left — `remaining -= server_len`.  For
+   unsigned arithmetic, if `server_len > remaining`, this wraps to a
+   huge positive value (e.g., `0xFFFF_FF00`).  The parser then believes
+   it has gigabytes of buffer left; subsequent copies or loops run
+   wildly out of bounds.  For Cat B or F findings where the tainted
+   variable was derived by subtracting a server-supplied value from a
+   remaining-length or buffer-size variable, check whether the code
+   validated `remaining >= server_len` BEFORE the subtraction.  An
+   unguarded `remaining -= server_len` is a real bug even if the
+   destination variable is unsigned and the SMT layer cannot flag the
+   wrapped value as negative.  This is the shape to look for: (1) a
+   local counter initialised from a trusted buffer length, (2) a
+   server-supplied value subtracted from it without a lower-bound guard,
+   (3) the counter then used as a loop bound or copy size.
+
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
 
