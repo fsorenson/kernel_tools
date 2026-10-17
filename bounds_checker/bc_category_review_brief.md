@@ -241,28 +241,103 @@ reasoning error observed in practice:
 
 ---
 
-## What is deliberately out of scope
+## Current scope limitations (not permanent)
 
-- Values that never pass through an endian helper (see taint model)
-- Transitive taint beyond one call hop
-- Guards established more than one frame up the call stack
+- **Transitive taint beyond one call hop** — the cross-function pass follows
+  taint one level into callees.  Extending to two hops would catch vulnerabilities
+  buried two wrappers deep, but at significant false-positive cost: intermediate
+  functions often validate before passing further.  The higher-value change is
+  Stage 1.5 (upward caller enumeration), not deeper callee following.
+
+- **Guards established more than one frame up the call stack** — when every
+  caller of an internal helper validates the tainted parameter before calling,
+  Stage 2 cannot see that context and reports `needs_validation`.  This is the
+  highest-value precision improvement in the queue: **Stage 1.5** (deferred,
+  see above) addresses it by enumerating callers and checking their guard
+  conditions.
+
+## What is deliberately out of scope (current)
+
+- Values that never pass through an endian helper (see taint model and expansion
+  notes below)
 - Purely local overflow with no server-supplied input — covered by the sibling
   `syntactic_lint` tool (narrow-integer wrap, pointer/length pairing, scan loops)
 - Cross-function UAF and refcount accounting (whole-program alias analysis)
-- Double-fetch / TOCTOU (requires alias analysis to detect two reads from the
-  same expression across branches — out of scope for single-function-body analysis)
+- Double-fetch / TOCTOU (requires alias analysis — see alias analysis note below)
 - **Integer promotion / architecture-specific multiplication widths**: The Cat B
   (OVF) finder and Stage 1.7 model `sizeof` as `size_t` (PTR_BITS, unsigned),
   which is correct for 64-bit Linux.  When a programmer explicitly intermediate-
   casts both operands to 32-bit (`(int)count * (int)stride`) before passing to
   a `size_t` parameter, the multiplication is done in 32-bit C arithmetic and can
-  wrap before implicit widening to `size_t`.  The encoder cannot in general
-  determine whether a local `int stride` variable holds a compile-time constant
-  from `sizeof` or a narrower programmer-chosen value.  Findings involving such
-  expressions are correctly flagged by Cat B (OVF); the SMT verdict on overflow
-  depends on whether the encoder infers the right width for each operand.
-  Architecture-specific behavior (e.g., whether `size_t` is 32 or 64 bits on the
-  target) is not modelled.
+  wrap before implicit widening to `size_t`.  Findings involving such expressions
+  are correctly flagged by Cat B (OVF); the SMT verdict depends on whether the
+  encoder infers the right width for each operand.  Architecture-specific behavior
+  (e.g., `size_t` is 32 or 64 bits) is not modelled.
+
+---
+
+## Potential scope expansions (not yet scheduled)
+
+The following would require deliberate scope decisions.  Each is tracked here to
+record the new gaps that would open if the tool expanded in that direction.
+
+### Hardware drivers (MMIO / DMA)
+
+Taint sources would be `readl()`, `readw()`, `readb()`, `ioread32/16/8()`, and
+DMA buffer reads (via `dma_sync_*`, URB data pointers, etc.).  These values
+arrive from a device rather than a network server, but the downstream concerns
+are identical: OOB read/write, integer overflow in allocation sizes.
+
+The endian-helper requirement does not apply here — hardware registers are often
+read with raw byte/word operations.  Identifying "which pointer is a device
+buffer" requires the same kind of alias/provenance analysis as the u8 struct-field
+gap.  A practical starting point would be a hardcoded set of MMIO/DMA access
+patterns per driver class.
+
+### Additional filesystems (ext4, XFS, btrfs, NFS)
+
+**NFS** uses `be32_to_cpu`/XDR helpers that are already in `TAINT_SOURCES` —
+largely covered today.  **ext4/XFS/btrfs** use `le32_to_cpu` reads from
+`struct buffer_head` data — also already covered.  The open question is whether
+ALL reads from disk-derived buffers should be tainted (for the on-disk threat
+model), not just the multi-byte endian-converted ones.  Expanding would surface
+u8 metadata fields (inode flags, directory entry lengths, etc.) that are
+currently not tracked.
+
+### Local privilege escalation / user-space data
+
+`get_user(val, user_ptr)` and structs received via `copy_from_user()` are
+user-controlled.  All current categories (B, C, F, H, L, etc.) would apply.
+G1/G2 already handle the copy operations themselves; this expansion would also
+taint the DATA read.  The biggest new concern is ioctl handlers that take struct
+arguments from userspace and use fields as sizes, indices, or loop bounds.
+Low priority; different threat model (LPE rather than remote exploitation).
+
+### String-parsed taint (kstrtoul, sscanf)
+
+If a server-supplied string is parsed into an integer via `kstrtoul()` or
+`sscanf()`, the resulting value is server-controlled but currently not tainted.
+Adding these to a `TAINT_SOURCES`-like hook is low complexity.  Rare in kernel
+protocol code; only matters if the tool is applied to text-protocol or sysfs
+drivers.  Deferred until a concrete case surfaces.
+
+### u8 field reads and known-struct-type list
+
+Single-byte fields (`u8 name_len = rsp->NameLength`) from server response
+structs are server-controlled but need no endian conversion.  Tracking these
+requires knowing WHICH struct pointers originate from server buffers.  Options:
+(a) alias analysis (needed anyway for several other gaps); (b) a
+per-subsystem table of known server-response struct types.  Option (b) is
+tractable for a focused subsystem (all `smb2_*_rsp` structs, etc.) but does
+not scale to kernel-wide use without (a).  Deferred pending alias analysis.
+
+### Alias analysis
+
+Would unlock: (1) u8/struct-field taint sourcing without endian helpers,
+(2) G3 infoleak detection (per-field write coverage), (3) double-fetch
+detection, (4) the multi-cast struct aliasing variant of Category I.  A
+significant investment; the benefit compounds across multiple categories.
+Deferred for LLM budget reasons.
 
 ---
 
