@@ -145,7 +145,7 @@ Per-finding schema fields: `taint_is_server_supplied`, `bounds_check_present`,
 LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
 `suggested_fix`, `cve_pattern`, `notes`.
 
-The analysis task prompt carries 13 numbered items covering the main classes of
+The analysis task prompt carries 14 numbered items covering the main classes of
 reasoning error observed in practice:
 
 1. Taint is genuinely server-supplied (vs. a locally-built request)
@@ -163,6 +163,10 @@ reasoning error observed in practice:
     whether the READ ITSELF is in bounds if the buffer is too short for the struct)
 13. `kmalloc(0)` returns ZERO_SIZE_PTR (non-null, non-dereferenceable); a `if (!p)`
     null check does not exclude this case
+14. Unsigned subtraction underflow — `remaining -= server_len` wraps to a huge
+    positive value when `server_len > remaining`; the SMT layer cannot flag the
+    wrapped unsigned value as dangerous, so Stage 2 must check that
+    `remaining >= server_len` was validated before the subtraction
 
 ---
 
@@ -210,6 +214,19 @@ reasoning error observed in practice:
   `cifs_strndup_from_utf16()` output (already suppressed as NUL-terminated), and
   most kernel debug logging (`cifs_dbg(FYI, ...)`) does not expose data to
   userspace.
+
+- **`prop_underflow` (Stage 1.7)** — the "remaining-length underflow" pattern
+  (`remaining -= server_len` without a prior `remaining >= server_len` check) is
+  already detected by Stage 1 (Cat F when `remaining` drives a loop, Cat B when
+  it is a copy size), but Stage 1.7 cannot retire or witness it: the wrapped
+  unsigned value is a huge positive number, not negative, so `prop_negative`
+  returns early as safe.  Adding a `prop_underflow` property — check
+  `UGT(subtrahend, minuend)` on the subtraction in the taint path — would
+  produce witnesses for the underflow case and retire findings where a guard
+  provably prevents it.  Moderate complexity: requires identifying that the
+  tainted variable was derived via subtraction and recovering both operands from
+  the path condition.  Stage 2 prompt item 14 covers the reasoning gap in the
+  meantime.
 
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
   findings where Stage 2 cannot determine safety from the function body alone,
