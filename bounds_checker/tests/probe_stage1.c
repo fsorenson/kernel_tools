@@ -318,7 +318,7 @@ u8 bug_H_u16_to_u8(struct pkt *p)
 	return narrow;
 }
 
-/* FP: same width — no truncation */
+/* FP: same width unsigned → unsigned — no sign change */
 u16 fp_H_same_width(struct pkt *p)
 {
 	u16 v = le16_to_cpu(p->len);
@@ -330,6 +330,27 @@ u32 fp_H_widening(struct pkt *p)
 {
 	u32 v = le16_to_cpu(p->count);   /* 16 → 32: safe */
 	return v;
+}
+
+/* ── Category H (sign-conversion): same-width unsigned→signed ── */
+
+/*
+ * u32 wire value stored into signed int — any value with MSB set becomes
+ * negative, bypassing a subsequent `if (local > MAX)` ceiling check.
+ */
+s32 bug_H_u32_to_int(struct pkt *p)
+{
+	s32 local = le32_to_cpu(p->size32);   /* u32 → s32: sign reinterpret */
+	if (local > 1000)
+		return -1;
+	return local;
+}
+
+/* FP: u16 → int is widening AND sign-safe (u16 always fits in int positive range) */
+int fp_H_u16_to_int(struct pkt *p)
+{
+	int local = le16_to_cpu(p->count);    /* u16 (0-65535) → int: MSB never set */
+	return local;
 }
 
 /* ── Category L: tainted shift amount ── */

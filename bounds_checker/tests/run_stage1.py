@@ -77,9 +77,12 @@ EXPECTED = {
 
     # ── Category H ──────────────────────────────────────────────────────────
     'bug_H_u32_to_u16':             {'cat': 'H', 'guarded': False},
-    'bug_H_u16_to_u8':              {'cat': 'H', 'guarded': False},
+    'bug_H_u16_to_u8':             {'cat': 'H', 'guarded': False},
     'fp_H_same_width':              'no_finding',
     'fp_H_widening':                'no_finding',
+    # ── Cat H sign-conversion cases ─────────────────────────────────────
+    'bug_H_u32_to_int':             {'cat': 'H', 'guarded': False},
+    'fp_H_u16_to_int':              'no_finding',   # widening (16→32), MSB safe
 
     # ── Category L ──────────────────────────────────────────────────────────
     'bug_L_left_shift':             {'cat': 'L', 'guarded': False},

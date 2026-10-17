@@ -60,6 +60,8 @@ _CAT_LABEL = {
     'G1': 'Cat G1 — copy_from/to_user return value unchecked (partial copy = success)',
     'G2': 'Cat G2 — unvalidated size argument to copy_from/to_user',
     'H':  'Cat H — server value → narrow integer type (silent truncation)',
+    # sign_conversion role: same-width unsigned→signed reinterpretation
+    # (no separate display label needed; it still renders as Cat H)
     'L':  'Cat L — server value → shift amount (undefined behaviour if >= type width)',
 }
 _ASSESSMENT_LABEL = {

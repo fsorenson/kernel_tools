@@ -267,6 +267,14 @@ _STRING_UNSAFE_SINKS = {
 # Calls that establish a safe bounded-length search — constitute a guard for Cat D.
 _STRING_SAFE_CALLS = frozenset({'strnlen', 'memchr', 'memchr_inv'})
 
+# Variable names that conventionally hold error/return codes in kernel C.
+# Storing a server-supplied u32 in an `int rc` is intentional (error codes are
+# signed), so Cat H sign-conversion is suppressed for these names.
+_ERROR_CODE_VARS = frozenset({
+    'rc', 'ret', 'err', 'error', 'retval', 'rval', 'result', 'status',
+    'r', 'rv', 'retcode',
+})
+
 
 # ---------------------------------------------------------------------------
 # Expression taint analysis helpers
@@ -1190,7 +1198,12 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         src_fn_h = tainted[ref_h]['source_fn']
                         src_width_h = tainted[ref_h].get('width')
 
-                if src_fn_h and src_width_h and src_width_h > dest_width:
+                dest_signed = dest_type.strip() in _SIGNED_TYPES
+                is_narrowing = bool(src_fn_h and src_width_h and src_width_h > dest_width)
+                is_sign_conv = bool(src_fn_h and src_width_h
+                                    and src_width_h == dest_width and dest_signed
+                                    and dest_var not in _ERROR_CODE_VARS)
+                if is_narrowing or is_sign_conv:
                     guard_vars = {ref_h} if ref_h else set()
                     taint_ln = tainted[ref_h]['line'] if ref_h else line
                     guarded_h = _find_guards_between(
@@ -1198,6 +1211,17 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         signed_vars,
                     ) if guard_vars and taint_ln < line else _NO_GUARD
                     snippet = get_source_line(source, line)
+                    role_h = 'narrowed_value' if is_narrowing else 'sign_conversion'
+                    reason_h = (
+                        f"{src_width_h}-bit value from {src_fn_h}() silently "
+                        f"truncated to {dest_width}-bit {dest_type} in {dest_var!r}; "
+                        f"a later bounds check on {dest_var!r} may pass even when "
+                        f"the original value would not"
+                    ) if is_narrowing else (
+                        f"{src_width_h}-bit unsigned value from {src_fn_h}() stored "
+                        f"in signed {dest_type} {dest_var!r}; values with the MSB "
+                        f"set become negative, bypassing unsigned ceiling checks"
+                    )
                     findings.append({
                         'function':        fn_name,
                         'file':            str(filepath),
@@ -1211,18 +1235,13 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         'sink_line':       line,
                         'sink_snippet':    snippet,
                         'sink_arg_index':  0,
-                        'sink_arg_role':   'narrowed_value',
+                        'sink_arg_role':   role_h,
                         'src_width':       src_width_h,
                         'dest_width':      dest_width,
                         'dest_type':       dest_type,
                         'possibly_guarded': guarded_h.found,
                         'guard_kind':       guarded_h.kind,
-                        'reason': (
-                            f"{src_width_h}-bit value from {src_fn_h}() silently "
-                            f"truncated to {dest_width}-bit {dest_type} in {dest_var!r}; "
-                            f"a later bounds check on {dest_var!r} may pass even when "
-                            f"the original value would not"
-                        ),
+                        'reason':          reason_h,
                     })
             continue   # skip the rest of the loop body for declaration nodes
 
@@ -1291,9 +1310,24 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                         and lhs_var in var_widths):
                     dest_width_h = var_widths[lhs_var]
                     src_width_h = TAINT_SOURCE_WIDTHS.get(src_fn)
-                    if src_width_h and src_width_h > dest_width_h:
+                    is_narrowing_h = bool(src_width_h and src_width_h > dest_width_h)
+                    is_sign_conv_h = bool(src_width_h and src_width_h == dest_width_h
+                                          and lhs_var in signed_vars
+                                          and lhs_var not in _ERROR_CODE_VARS)
+                    if is_narrowing_h or is_sign_conv_h:
                         line_h = node.start_point[0] + 1
                         snippet_h = get_source_line(source, line_h)
+                        role_h = 'narrowed_value' if is_narrowing_h else 'sign_conversion'
+                        reason_h = (
+                            f"{src_width_h}-bit value from {src_fn}() silently "
+                            f"truncated to {dest_width_h}-bit {lhs_var!r}; "
+                            f"a later bounds check on {lhs_var!r} may pass even "
+                            f"when the original value would not"
+                        ) if is_narrowing_h else (
+                            f"{src_width_h}-bit unsigned value from {src_fn}() stored "
+                            f"in signed {lhs_var!r}; values with the MSB set become "
+                            f"negative, bypassing unsigned ceiling checks"
+                        )
                         findings.append({
                             'function':        fn_name,
                             'file':            str(filepath),
@@ -1307,17 +1341,12 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                             'sink_line':       line_h,
                             'sink_snippet':    snippet_h,
                             'sink_arg_index':  0,
-                            'sink_arg_role':   'narrowed_value',
+                            'sink_arg_role':   role_h,
                             'src_width':       src_width_h,
                             'dest_width':      dest_width_h,
                             'dest_type':       f'u{dest_width_h}',
                             'possibly_guarded': False,
-                            'reason': (
-                                f"{src_width_h}-bit value from {src_fn}() silently "
-                                f"truncated to {dest_width_h}-bit {lhs_var!r}; "
-                                f"a later bounds check on {lhs_var!r} may pass even "
-                                f"when the original value would not"
-                            ),
+                            'reason':          reason_h,
                         })
                 continue
 
@@ -1358,13 +1387,17 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                 # A retaint supersedes a pending kill; otherwise the restore at
                 # the end of the branch would put the older taint back.
                 killed.pop(lhs_var, None)
-                # Cat H: narrowing via tainted variable (assignment_expression only;
-                # see the note above for why compound assignments are excluded)
+                # Cat H: narrowing or sign-conversion via tainted variable
+                # (assignment_expression only; compound assignments excluded)
                 if (node.type == 'assignment_expression' and not is_merge
                         and lhs_var in var_widths):
                     dest_width_h = var_widths[lhs_var]
                     src_width_h = tainted[ref].get('width')
-                    if src_width_h and src_width_h > dest_width_h:
+                    is_narrowing_h = bool(src_width_h and src_width_h > dest_width_h)
+                    is_sign_conv_h = bool(src_width_h and src_width_h == dest_width_h
+                                          and lhs_var in signed_vars
+                                          and lhs_var not in _ERROR_CODE_VARS)
+                    if is_narrowing_h or is_sign_conv_h:
                         line_h = node.start_point[0] + 1
                         src_fn_h = tainted[ref]['source_fn']
                         snippet_h = get_source_line(source, line_h)
@@ -1373,6 +1406,19 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                             fn_body, {ref}, taint_ln_h, line_h, source,
                             signed_vars,
                         ) if taint_ln_h < line_h else _NO_GUARD
+                        role_h = 'narrowed_value' if is_narrowing_h else 'sign_conversion'
+                        reason_h = (
+                            f"{src_width_h}-bit value (via {ref!r}, from "
+                            f"{src_fn_h}()) silently truncated to "
+                            f"{dest_width_h}-bit {lhs_var!r}; a later bounds "
+                            f"check on {lhs_var!r} may pass even when the "
+                            f"original value would not"
+                        ) if is_narrowing_h else (
+                            f"{src_width_h}-bit unsigned value (via {ref!r}, from "
+                            f"{src_fn_h}()) stored in signed {lhs_var!r}; values "
+                            f"with the MSB set become negative, bypassing unsigned "
+                            f"ceiling checks"
+                        )
                         findings.append({
                             'function':        fn_name,
                             'file':            str(filepath),
@@ -1386,19 +1432,13 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
                             'sink_line':       line_h,
                             'sink_snippet':    snippet_h,
                             'sink_arg_index':  0,
-                            'sink_arg_role':   'narrowed_value',
+                            'sink_arg_role':   role_h,
                             'src_width':       src_width_h,
                             'dest_width':      dest_width_h,
                             'dest_type':       f'u{dest_width_h}',
                             'possibly_guarded': guarded_h.found,
                             'guard_kind':       guarded_h.kind,
-                            'reason': (
-                                f"{src_width_h}-bit value (via {ref!r}, from "
-                                f"{src_fn_h}()) silently truncated to "
-                                f"{dest_width_h}-bit {lhs_var!r}; a later bounds "
-                                f"check on {lhs_var!r} may pass even when the "
-                                f"original value would not"
-                            ),
+                            'reason':          reason_h,
                         })
 
         # ── Sink / call site ──
