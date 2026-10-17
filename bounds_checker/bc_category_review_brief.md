@@ -16,7 +16,8 @@ A value is tainted if it comes from a scalar endian helper —
 
 Taint propagates through:
 - Arithmetic on tainted values (`+`, `-`, `*`, `>>`, `|`, `&`)
-- Assignment to a narrower type (also triggers Cat H)
+- Assignment to a narrower type (also triggers Cat H `narrowed_value`)
+- Assignment to a signed type of the same width (also triggers Cat H `sign_conversion`)
 - Compound assignments (`|=`, `+=`, etc.)
 - Field reads from a struct pointer that is itself derived via tainted offset
   arithmetic (pointer-kind taint)
@@ -55,7 +56,8 @@ requires that the guard call's return value is actually used (a bare
 | F | `for (i = 0; i < n; i++)` | Tainted value used as a loop iteration bound |
 | G1 | `copy_{to,from}_user` | Return value discarded or not compared against zero — a partial copy is treated as success |
 | G2 | `copy_{to,from}_user` | Size argument is user-supplied and unvalidated at the call site |
-| H | declaration / assignment | Tainted wide value stored into a narrower integer type; the truncated value is what later bounds checks see |
+| H (narrowing) | declaration / assignment | Tainted wide value stored into a narrower integer type; the truncated value is what later bounds checks see |
+| H (sign-conv) | declaration / assignment | Tainted unsigned value stored into a signed local of the **same width**; values with the MSB set become negative, bypassing `if (local > MAX)` ceiling checks.  Not emitted for conventional error-code variable names (`rc`, `ret`, `err`, etc.). |
 | L | `x << n` / `x >> n` | Tainted value used as the shift amount without a prior check that it is less than the type width — shifting by ≥ width is undefined behaviour in C |
 
 ### Cross-function pass
@@ -81,19 +83,22 @@ suffices).
   tainted pointer (`nlen = ea->ea_name_length`), the report marks the taint as
   indirect (`via le16_to_cpu()`) rather than a direct call, since the endian
   helper was not at the assignment line.
+- **Cat H sign-conversion / error-code variables**: variable names conventionally
+  used for return codes (`rc`, `ret`, `err`, `error`, `retval`, `result`, etc.)
+  are excluded from sign-conversion findings.  Storing `le32_to_cpu(status)` in
+  `int rc` is intentional kernel idiom; the sign change is by design.
 - **Cat L / bitmask guard**: `tag = le16_to_cpu(x) & 0x1f` followed by
   `1 << tag` surfaces as Cat L with `guarded=False` because the scanner's guard
-  detection looks for comparisons, not bitwise masks.  The SMT encoder models the
-  mask correctly (ULE(val & 0x1f, 31) is provable), so Stage 1.7 will retire
-  these when a shift-bounds property is added; in the meantime Stage 2 handles
-  them correctly.
+  detection looks for comparisons, not bitwise masks.  Stage 1.7's
+  `prop_shift_bounds` retires these — the bitvector model proves `val & 0x1f`
+  is always < 32.
 
 ---
 
 ## Stage 1.7: SMT refinement
 
 Z3 (bitvector arithmetic, not integer) is run on each surviving finding in a
-worker pool before Stage 2 sees it.  The four properties it can decide:
+worker pool before Stage 2 sees it.  The five properties it can decide:
 
 | Property | Claim checked | Retires on UNSAT? |
 |---|---|---|
@@ -101,6 +106,7 @@ worker pool before Stage 2 sees it.  The four properties it can decide:
 | `overflow` | Can this `*` or `+` expression wrap before the allocator or copy sees it? | Yes, when role is `size_mul_overflow` |
 | `truncation` | Can this value lose bits that matter when narrowed to the destination type? | Yes, when role is `narrowing_assignment` or `narrowed_value` |
 | `guard-transfer` | Does the ceiling the guard established still cover the value reaching the sink? | Yes, when Stage 1's verdict was `covers-base-not-offset` or `stale-redefinition` |
+| `shift-bounds` | Can the shift amount reach or exceed the bit-width of the left operand? | Yes, when role is `shift_amount` (Cat L) |
 
 Properties that need a buffer size (how big is the destination of this `memcpy`,
 how many entries does this table have) are absent — guessing would convert a
@@ -139,12 +145,13 @@ Per-finding schema fields: `taint_is_server_supplied`, `bounds_check_present`,
 LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
 `suggested_fix`, `cve_pattern`, `notes`.
 
-The analysis task prompt carries 12 numbered items covering the main classes of
+The analysis task prompt carries 13 numbered items covering the main classes of
 reasoning error observed in practice:
 
 1. Taint is genuinely server-supplied (vs. a locally-built request)
 2. Bounds check present and sufficient (and callee postcondition analysis)
-2a. Counterexample test (mandatory for every finding)
+2a. Counterexample test (mandatory for every finding; includes `size=0` / ZERO_SIZE_PTR
+    check for Cat B)
 2b. SMT witness reachability
 2c. Packet-relative bounds check — `count * sizeof(element) <= received_size`,
     not just `count <= MAX` (the SMT layer cannot see buffer sizes)
@@ -154,6 +161,8 @@ reasoning error observed in practice:
 12. Struct cast from server buffer — field reads before the header size check
     (the scanner treats `le16_to_cpu(ptr->field)` as a taint source, not asking
     whether the READ ITSELF is in bounds if the buffer is too short for the struct)
+13. `kmalloc(0)` returns ZERO_SIZE_PTR (non-null, non-dereferenceable); a `if (!p)`
+    null check does not exclude this case
 
 ---
 
@@ -202,11 +211,6 @@ reasoning error observed in practice:
   most kernel debug logging (`cifs_dbg(FYI, ...)`) does not expose data to
   userspace.
 
-- **Cat L / shift-bounds SMT property** — the encoder already models bitwise
-  masks correctly, so adding `prop_shift_bounds` to Stage 1.7 would retire Cat L
-  findings where a prior `& 0x1f` or `& 0x3f` mask provably limits the shift
-  amount below the type width.  Low complexity, pairs naturally with Cat L.
-
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
   findings where Stage 2 cannot determine safety from the function body alone,
   enumerate direct callers and extract any guards applied to the tainted parameter
@@ -217,13 +221,6 @@ reasoning error observed in practice:
   with formula A (e.g., POSIX xattr layout); callee writes it with formula B
   (CIFS wire layout, larger).  Neither formula is wrong internally; the defect is
   that A < B for large counts.  Two confirmed CIFS instances.
-
-- **Cat H / same-width unsigned→signed sign-conversion** — assigning a
-  `u32` wire value into an `int` local of the same width reinterprets large
-  values as negative, bypassing subsequent `if (local_len > MAX)` ceiling
-  checks.  Cat H currently fires only on width narrowing; same-width sign changes
-  are caught downstream by the SMT `negative` property but not flagged at the
-  conversion point.
 
 ---
 
@@ -255,8 +252,9 @@ reasoning error observed in practice:
 ## The review question
 
 Which classes of kernel bounds, length, offset, or integer-range bug that occur
-in real protocol-parsing and driver code are not covered by A–H, L, and the gaps
-listed above?  For each gap: name the bug class, give a concrete kernel or CVE
-example, state the sink and the guard whose absence defines it, and say whether
-it is detectable from a single function body given the taint model above (or
-whether it requires cross-function, caller-level, or whole-program information).
+in real protocol-parsing and driver code are not covered by A–H (including sign-
+conversion), L, and the gaps listed above?  For each gap: name the bug class,
+give a concrete kernel or CVE example, state the sink and the guard whose absence
+defines it, and say whether it is detectable from a single function body given
+the taint model above (or whether it requires cross-function, caller-level, or
+whole-program information).
