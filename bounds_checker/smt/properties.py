@@ -7,7 +7,7 @@ take, so the finding is noise; SAT means there is a concrete assignment that
 breaks it, which is a witness and not a verdict.  Everything else keeps the
 finding.
 
-The four here are the ones decidable from the slice alone.  Properties that
+The five here are the ones decidable from the slice alone.  Properties that
 need a buffer size — how big is the destination of this memcpy, how many
 entries does this table have — are deliberately absent: they need declaration
 data the scanner does not collect, and guessing would convert a sound
@@ -94,6 +94,20 @@ def _sink_expr(finding, fn_body, source):
             for a in args:
                 if _mentions(a, var, source):
                     return a
+        return None
+
+    if cat == 'L' or role == 'shift_amount':
+        # Return the whole shift expression (x << amount or x >> amount) so
+        # prop_shift_bounds can read both the left width and the right operand.
+        for n in _nodes_on_line(fn_body, line):
+            if n.type != 'binary_expression' or len(n.children) < 3:
+                continue
+            op = node_text_raw(next((c for c in n.children if not c.is_named), n))
+            if op not in ('<<', '>>'):
+                continue
+            rhs = n.child_by_field_name('right')
+            if rhs is not None and _mentions(rhs, var, source):
+                return n
         return None
 
     return None
@@ -399,6 +413,33 @@ def _match_width(val, like):
     return z3.Extract(w - 1, 0, val.bv)
 
 
+def prop_shift_bounds(path, shift_expr_node):
+    """
+    Can the shift amount reach or exceed the bit-width of the left operand?
+
+    Shifting by >= width is undefined behaviour in C.  The property encodes
+    the claim `amount >= left_width` and asks if it is satisfiable.  UNSAT
+    means the shift amount is always within bounds — a bitmask like `& 0x1f`
+    makes this immediately provable by the bitvector model.  SAT gives a
+    concrete out-of-bounds shift amount as a witness.
+    """
+    if shift_expr_node.type != 'binary_expression' or len(shift_expr_node.children) < 3:
+        return UNMODELLED
+    lhs_enc = path.enc.encode(shift_expr_node.child_by_field_name('left'))
+    rhs_enc = path.enc.encode(shift_expr_node.child_by_field_name('right'))
+    if not _grounded(rhs_enc):
+        return UNMODELLED
+    left_width  = lhs_enc.width
+    # Compare the shift amount against the left operand's width, matching widths
+    # so z3 gets a well-typed comparison.
+    amt = _match_width(rhs_enc, z3.BitVecVal(left_width, left_width))
+    bound = z3.BitVecVal(left_width, left_width)
+    return _decide(path, z3.UGE(amt, bound), 'shift-bounds',
+                   f'shift amount can reach or exceed the {left_width}-bit type width (UB)',
+                   f'shift amount is always < {left_width} (type width of the shifted value)',
+                   {'shift amount': rhs_enc.bv})
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -416,6 +457,7 @@ _BASIS_BY_ROLE = {
     'size_mul_overflow':     ('overflow',),
     'narrowing_assignment':  ('truncation',),
     'narrowed_value':        ('truncation',),
+    'shift_amount':          ('shift-bounds',),
 }
 
 
@@ -456,6 +498,8 @@ def check_finding(finding, fn_body, source, timeout_ms=200, decl_types=None,
         if not width:
             return UNMODELLED
         checks.append(lambda: prop_truncation(path, expr, width))
+    elif cat == 'L' or role == 'shift_amount':
+        checks.append(lambda: prop_shift_bounds(path, expr))
     else:
         if role == 'size_mul_overflow' or cat == 'B':
             checks.append(lambda: prop_overflow(path, expr))

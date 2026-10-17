@@ -21,7 +21,8 @@ from kernel_analysis.parsers.c_parser import parse_file, find_functions
 from bounds_checker.parsers.taint_scanner import scan_files
 from bounds_checker.smt import check_finding
 
-PROBE_SMT = Path(__file__).parent / 'probe_smt.c'
+PROBE_SMT    = Path(__file__).parent / 'probe_smt.c'
+PROBE_STAGE1 = Path(__file__).parent / 'probe_stage1.c'
 
 # ---------------------------------------------------------------------------
 # Expected SMT verdicts
@@ -59,18 +60,24 @@ EXPECT = {
     'cfg_goto_fallthrough':    'safe',     # label clears the env
     'cfg_ctl_ok':              'safe',
     'cfg_ctl_goto_below':      'safe',
+    # ── Cat L (shift-bounds) cases from probe_stage1.c ──────────────────
+    'bug_L_left_shift':        'unsafe',   # unbounded shift → witness at 0x20
+    'bug_L_right_shift':       'unsafe',   # same for >>
+    'guarded_L_bounded':       'safe',     # if (order >= 32) return 0
+    'fp_L_masked':             'safe',     # & 0x1f → shift-bounds UNSAT, retires
 }
 
 # Whether the clean answer retires (suppresses) the finding.
 SUPPRESS = {
     'ctl_signed_div':      True,
     'ctl_offset_shrinks':  True,
+    'fp_L_masked':         True,          # mask proves shift safe; finding retires
 }
 
 
 def run(paths=None):
     if paths is None:
-        paths = [str(PROBE_SMT)]
+        paths = [str(PROBE_SMT), str(PROBE_STAGE1)]
 
     rows, bad = [], 0
 
