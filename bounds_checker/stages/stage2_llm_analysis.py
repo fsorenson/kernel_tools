@@ -1016,7 +1016,7 @@ For each finding above, determine:
    the guard is only `count <= MAX_ENTRIES` without reference to the \
    received buffer length, a server can send a packet shorter than what \
    `count * sizeof(element)` would require, and the OOB read or write \
-   still occurs.  Common example: `struct T { u32 count; u32 data[]; }` — \
+   still occurs.  Common example: `struct T {{ u32 count; u32 data[]; }}` — \
    a check that `count < 256` does not prevent an OOB read of `data[count-1]` \
    if the server sent a 12-byte packet claiming count=255.
 
@@ -1356,12 +1356,15 @@ def _build_prompt(fn_name, short_file, fn_source, findings,
             parts.append(f'\n### {callee_fn}() in {callee_short_file}\n```c\n{src}\n```\n')
         sections.append(''.join(parts))
 
+    def _esc(s):
+        return s.replace('{', '{{').replace('}', '}}')
+
     return _PROMPT_TEMPLATE.format(
         fn_name=fn_name,
         short_file=short_file,
-        fn_source=fn_source,
-        callee_sources_section=''.join(sections),
-        findings_text=_format_findings(findings),
+        fn_source=_esc(fn_source),
+        callee_sources_section=_esc(''.join(sections)),
+        findings_text=_esc(_format_findings(findings)),
     )
 
 
