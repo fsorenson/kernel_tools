@@ -879,22 +879,29 @@ Common false positive patterns in kernel taint analysis:
    at line N guards the dereference" may still be a real bug if the
    read occurs before line N.
 
-14. Unsigned subtraction underflow / remaining-length wrapping: a
-   common pattern in protocol parsers uses a "bytes remaining" variable
-   to track how much packet is left — `remaining -= server_len`.  For
-   unsigned arithmetic, if `server_len > remaining`, this wraps to a
-   huge positive value (e.g., `0xFFFF_FF00`).  The parser then believes
-   it has gigabytes of buffer left; subsequent copies or loops run
-   wildly out of bounds.  For Cat B or F findings where the tainted
-   variable was derived by subtracting a server-supplied value from a
-   remaining-length or buffer-size variable, check whether the code
-   validated `remaining >= server_len` BEFORE the subtraction.  An
-   unguarded `remaining -= server_len` is a real bug even if the
-   destination variable is unsigned and the SMT layer cannot flag the
-   wrapped value as negative.  This is the shape to look for: (1) a
-   local counter initialised from a trusted buffer length, (2) a
-   server-supplied value subtracted from it without a lower-bound guard,
-   (3) the counter then used as a loop bound or copy size.
+14. Unsigned subtraction underflow — two patterns, same root cause: for
+   unsigned arithmetic, a subtraction that goes below zero wraps to a
+   huge positive value (e.g., `0xFFFF_FF00`).  The SMT layer returns
+   "safe" for these because the wrapped value is unsigned and non-
+   negative — but "non-negative" does not mean "safe" when the value is
+   being passed to `memcpy` or driving a loop.  Watch for both shapes:
+
+   Pattern A — remaining-length loop: `remaining -= server_len` without
+   a prior `remaining >= server_len` check.  Detected by Stage 1 as Cat
+   F (loop) or Cat B (copy size) on the wrapped `remaining`.  Look for:
+   (1) a counter initialised from a trusted buffer length, (2) a server-
+   supplied value subtracted from it without a lower-bound guard, (3)
+   the counter then used as a loop bound or copy size.
+
+   Pattern B — subtraction-derived size reaching a Cat A/B sink: \
+   `size = total_len - sizeof(header)` where `total_len` is tainted.  \
+   If `total_len < sizeof(header)`, `size` wraps to a huge positive \
+   value that is then passed directly to `memcpy(..., ..., size)` or \
+   `kmalloc(size, ...)`.  Stage 1 fires Cat B or A correctly; Stage 1.7 \
+   may report "proved — value is unsigned" which is technically true but \
+   misleading here — the wrapped value IS the exploit.  Check for a \
+   missing `if (total_len < sizeof(header)) return -EINVAL` guard before \
+   the subtraction.
 
 Respond only with the JSON object requested — no markdown fences, no prose.
 """
