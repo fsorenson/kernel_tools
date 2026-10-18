@@ -215,18 +215,27 @@ reasoning error observed in practice:
   most kernel debug logging (`cifs_dbg(FYI, ...)`) does not expose data to
   userspace.
 
-- **`prop_underflow` (Stage 1.7)** — the "remaining-length underflow" pattern
-  (`remaining -= server_len` without a prior `remaining >= server_len` check) is
-  already detected by Stage 1 (Cat F when `remaining` drives a loop, Cat B when
-  it is a copy size), but Stage 1.7 cannot retire or witness it: the wrapped
-  unsigned value is a huge positive number, not negative, so `prop_negative`
-  returns early as safe.  Adding a `prop_underflow` property — check
-  `UGT(subtrahend, minuend)` on the subtraction in the taint path — would
-  produce witnesses for the underflow case and retire findings where a guard
-  provably prevents it.  Moderate complexity: requires identifying that the
-  tainted variable was derived via subtraction and recovering both operands from
-  the path condition.  Stage 2 prompt item 14 covers the reasoning gap in the
-  meantime.
+- **`prop_underflow` (Stage 1.7)** — applies to two patterns, both already
+  detected by Stage 1 but not refinable by Stage 1.7:
+
+  1. *Remaining-length loop* (`remaining -= server_len` without a prior
+     `remaining >= server_len` check): Stage 1 fires Cat F or Cat B on the
+     tainted `remaining`; Stage 1.7 sees an unsigned value and returns `safe`
+     via `prop_negative`, which is misleading — the wrapped 0xFFFF_FF00 IS
+     dangerous.
+
+  2. *Subtraction-derived size at Cat A/B sink* (`size = total_len - sizeof(header)`
+     where `total_len` is tainted and may be smaller than `sizeof(header)`):
+     Stage 1 fires Cat B on `memcpy(..., size)`; Stage 1.7 again sees an unsigned
+     value and reports "safe — value is unsigned at the sink", which Stage 2 may
+     use to incorrectly dismiss the finding.
+
+  In both cases, `prop_negative` returns the right answer for the wrong question.
+  Adding `prop_underflow` — check `UGT(subtrahend, minuend)` — would produce
+  witnesses for the underflow case and retire findings where a guard provably
+  prevents it.  Moderate complexity: requires identifying that the tainted
+  variable was derived via subtraction and recovering both operands from the path
+  condition.  Stage 2 prompt item 14 covers the reasoning gap in the meantime.
 
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
   findings where Stage 2 cannot determine safety from the function body alone,
