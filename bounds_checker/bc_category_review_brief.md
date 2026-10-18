@@ -237,6 +237,16 @@ reasoning error observed in practice:
   variable was derived via subtraction and recovering both operands from the path
   condition.  Stage 2 prompt item 14 covers the reasoning gap in the meantime.
 
+- **`min()`/`min_t()`/`clamp()` as ceiling guards** — `min(tainted, 256)` is
+  functionally equivalent to `if (tainted > 256) tainted = 256` and establishes
+  an upper-bound ceiling on the tainted value, but `_find_guards_between` only
+  recognises comparison operators in `if` conditions.  A finding where `min()`
+  was the guard will currently show `possibly_guarded=False` when it should be
+  `True` with `guard_kind='bounded'`.  Fix: recognise the pattern
+  `var = min(tainted_var, const)` (or its `min_t`/`clamp` variants) between
+  the taint source and the sink and set the guard flag accordingly.  Moderate
+  complexity; reduces false positives without generating new findings.
+
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
   findings where Stage 2 cannot determine safety from the function body alone,
   enumerate direct callers and extract any guards applied to the tainted parameter
