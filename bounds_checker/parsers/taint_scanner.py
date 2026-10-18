@@ -243,6 +243,7 @@ _SAFE_SIZE_HELPERS = frozenset({
     'size_mul',             # 5.8+: size_mul(a, b)
     'size_add',             # 5.8+: size_add(a, b)
     'struct_size',          # struct_size(p, member, n) for trailing-array allocs
+    'flex_array_size',      # flex_array_size(p, member, n) → saturates on overflow
     'check_mul_overflow',   # explicit check; caller handles the error path
     'check_add_overflow',
     'saturate_add',
