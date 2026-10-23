@@ -90,6 +90,14 @@ EXPECTED = {
     'guarded_L_bounded':            {'cat': 'L', 'guarded': True},
     # Stage 1 fires even with a bitmask; Stage 1.7 proves it safe.
     'fp_L_masked':                  {'cat': 'L', 'guarded': False},
+
+    # ── min()/min_t()/clamp() ceiling guards ────────────────────────────────
+    # In-place min before kmalloc — upper-bound guard credited.
+    'guarded_B_min':                {'cat': 'B', 'guarded': True},
+    # In-place min_t before kmalloc — upper-bound guard credited (tests min_t variant).
+    'guarded_B_min_t':              {'cat': 'B', 'guarded': True},
+    # min inside a branch that doesn't dominate the sink — not a guard.
+    'bug_B_min_nondominant':        {'cat': 'B', 'guarded': False},
 }
 
 

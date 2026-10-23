@@ -36,7 +36,6 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 | Item | Prerequisite / blocker |
 |---|---|
-| **`min()`/`min_t()`/`clamp()` ceiling guards** — `min(tainted, 256)` ≡ `if (t > 256) t = 256`; `_find_guards_between` only sees `if`-condition comparisons; fix: detect `var = min(tainted_var, const)` between source and sink | Moderate complexity; reduces false positives without new findings |
 | **`prop_underflow`** (Stage 1.7) — Pattern 1: `remaining -= server_len` without guard; Pattern 2: `size = total_len - sizeof(header)` at Cat A/B sink. Fix: `UGT(subtrahend, minuend)`; must recover both operands from path condition | Moderate complexity; requires operand extraction from path condition |
 | **Stage 1.5** — caller enumeration for `needs_validation` findings; check guards on tainted param at each call site | Highest-value precision improvement; moderate complexity |
 | **G3** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak | Needs per-field write coverage |
@@ -48,9 +47,8 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. `min()`/`min_t()`/`clamp()` ceiling guard recognition in `_find_guards_between` — moderate complexity, reduces false positives
-2. `prop_underflow` Stage 1.7 property — covers Gap R (remaining-length loop) and Gap S (subtraction-derived size at sink)
-3. Stage 1.5 caller enumeration — highest-value precision improvement, addresses `needs_validation` false positives
+1. `prop_underflow` Stage 1.7 property — covers Gap R (remaining-length loop) and Gap S (subtraction-derived size at sink)
+2. Stage 1.5 caller enumeration — highest-value precision improvement, addresses `needs_validation` false positives
 
 ## Constraints
 
@@ -62,8 +60,8 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Recently completed
 
+- `min()`/`min_t()`/`clamp()` ceiling guard recognition in `_find_guards_between` — `V = min(V, LIMIT)` now credits `possibly_guarded=True`; non-dominating guards correctly rejected
 - `flex_array_size` added to `_SAFE_SIZE_HELPERS` — false-positive fix for `kmalloc(flex_array_size(...))`
-- `min()`/`min_t()` ceiling guard gap documented in `bc_category_review_brief.md`
 - Cat H extended to same-width unsigned→signed sign-conversion; `_ERROR_CODE_VARS` filter added
 - Cat L added (tainted shift amount); `prop_shift_bounds` SMT property wired in
 - Stage 2 prompt extended to 14 items: caps-vs-inflations, copy_to_user user-controlled size, struct cast before header check, kmalloc(0) ZERO_SIZE_PTR, unsigned subtraction underflow (both patterns)

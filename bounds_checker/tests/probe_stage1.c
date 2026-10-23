@@ -68,6 +68,13 @@ extern size_t strnlen(const char *, size_t);
 extern long copy_to_user(void *dst, const void *src, size_t n);
 extern long copy_from_user(void *dst, const void *src, size_t n);
 
+/* ceiling-capping macros — kernel macros stubbed here for the probe file */
+#define min(a, b)            ((a) < (b) ? (a) : (b))
+#define min_t(t, a, b)       ((__typeof__(a))(a) < (__typeof__(a))(b) ? (a) : (b))
+#define clamp(val, lo, hi)   ((val) < (lo) ? (lo) : (val) > (hi) ? (hi) : (val))
+#define clamp_t(t, val, lo, hi) clamp(val, lo, hi)
+#define clamp_val(val, lo, hi)  clamp(val, lo, hi)
+
 /* ── Category A: tainted value → pointer arg of memory op ── */
 
 /* tainted SOURCE pointer reaching memcpy */
@@ -387,4 +394,39 @@ u32 fp_L_masked(struct pkt *p)
 {
 	u16 order = le16_to_cpu(p->shift_amt) & 0x1f;
 	return 1U << order;
+}
+
+/* ── min()/min_t()/clamp() ceiling guards ── */
+
+/*
+ * In-place min_t ceiling: size is capped before kmalloc.
+ * The min_t assignment should be credited as an upper-bound guard.
+ */
+void *guarded_B_min_t(struct pkt *p)
+{
+	u16 size = le16_to_cpu(p->len);
+	size = min_t(u16, size, 4096);
+	return kmalloc(size, GFP_KERNEL);
+}
+
+/*
+ * In-place min ceiling: size is capped before kmalloc.
+ */
+void *guarded_B_min(struct pkt *p)
+{
+	u16 size = le16_to_cpu(p->len);
+	size = min(size, (u16)1024);
+	return kmalloc(size, GFP_KERNEL);
+}
+
+/*
+ * min inside a branch that does not dominate the sink — the cap only runs
+ * on one path, so it is not a guard.
+ */
+void *bug_B_min_nondominant(struct pkt *p)
+{
+	u16 size = le16_to_cpu(p->len);
+	if (cond)
+		size = min(size, (u16)1024);
+	return kmalloc(size, GFP_KERNEL);
 }

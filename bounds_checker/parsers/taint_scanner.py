@@ -540,6 +540,12 @@ Guard = namedtuple('Guard', 'found kind')
 _NO_GUARD = Guard(False, '')
 _GUARDED  = Guard(True, 'bounded')
 
+# Macros that cap a variable from above (min/min_t) or from both sides
+# (clamp/clamp_val/clamp_t).  An assignment V = min(V, LIMIT) is treated as
+# an upper-bound guard on V, exactly as if (V > LIMIT) V = LIMIT were written.
+_CEILING_MACROS = frozenset({'min', 'min_t', 'clamp', 'clamp_val', 'clamp_t'})
+_CLAMP_MACROS   = frozenset({'clamp', 'clamp_val', 'clamp_t'})
+
 
 def _build_local_signed(fn_body, source):
     """
@@ -1076,6 +1082,48 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
             if not on_left:
                 direction = _FLIP[direction]
             bounds.add(_FLIP[direction] if early else direction)
+
+    # Second pass: ceiling-capping assignments — V = min(V, LIMIT),
+    # V = min_t(type, V, LIMIT), V = clamp(V, lo, hi), etc.
+    # Kernel code frequently caps a tainted value with min() instead of
+    # an explicit if-guard; these are equivalent upper-bound guarantees.
+    for node in _walk(fn_body):
+        if node.type != 'assignment_expression':
+            continue
+        if node_text(node.children[1], source) != '=':
+            continue
+        lhs = node.child_by_field_name('left')
+        if lhs is None or node_text(lhs, source) not in var_names:
+            continue
+        stmt_line = node.start_point[0] + 1
+        if not (line_lo < stmt_line < line_hi):
+            continue
+        rhs = node.child_by_field_name('right')
+        if rhs is None or rhs.type != 'call_expression':
+            continue
+        fn_node = rhs.child_by_field_name('function')
+        if fn_node is None:
+            continue
+        cap_fn = node_text(fn_node, source)
+        if cap_fn not in _CEILING_MACROS:
+            continue
+        if not _dominates(node, fn_body, line_hi):
+            saw_nondominating = True
+            continue
+        if labels is None:
+            labels = _label_lines(fn_body, source)
+        if writes is None:
+            writes = _fresh_writes(fn_body, var_names, source)
+        if any(stmt_line < wline < line_hi
+               and _write_reaches(w, fn_body, line_hi, var_names, source, labels)
+               for wline, w in writes):
+            saw_stale = True
+            continue
+        found_any = True
+        if cap_fn in _CLAMP_MACROS:
+            bounds |= {'upper', 'lower'}
+        else:
+            bounds.add('upper')
 
     if not found_any:
         if saw_nondominating:

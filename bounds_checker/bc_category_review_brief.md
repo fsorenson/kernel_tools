@@ -35,11 +35,19 @@ Taint does **not** propagate through:
   that is not endian-converted at this site)
 - Transitive taint beyond one call hop
 
-A finding carries a `possibly_guarded` flag when a comparison or a
-`check_*_overflow()`/`size_{add,mul}()` call referencing the tainted variable
-appears between the taint source and the sink.  A Cat D finding additionally
-requires that the guard call's return value is actually used (a bare
-`memchr(buf, 0, len);` with no result check is not a guard).
+A finding carries a `possibly_guarded` flag when any of the following appear
+between the taint source and the sink and dominate the use:
+
+- A relational comparison on the tainted variable in an `if` condition (the
+  classic `if (n > MAX) return;` guard)
+- A `check_*_overflow()`/`size_{add,mul}()` call referencing the tainted variable
+- A ceiling-capping assignment: `V = min(V, LIMIT)`, `V = min_t(type, V, LIMIT)`,
+  `V = clamp(V, lo, hi)`, `V = clamp_val(V, lo, hi)`, or `V = clamp_t(type, V, lo, hi)`
+  where V is the variable that reaches the sink.  `min`/`min_t` establish an
+  upper-bound ceiling; `clamp`/`clamp_val`/`clamp_t` establish both floor and ceiling.
+
+A Cat D finding additionally requires that the guard call's return value is
+actually used (a bare `memchr(buf, 0, len);` with no result check is not a guard).
 
 ---
 
@@ -236,16 +244,6 @@ reasoning error observed in practice:
   prevents it.  Moderate complexity: requires identifying that the tainted
   variable was derived via subtraction and recovering both operands from the path
   condition.  Stage 2 prompt item 14 covers the reasoning gap in the meantime.
-
-- **`min()`/`min_t()`/`clamp()` as ceiling guards** — `min(tainted, 256)` is
-  functionally equivalent to `if (tainted > 256) tainted = 256` and establishes
-  an upper-bound ceiling on the tainted value, but `_find_guards_between` only
-  recognises comparison operators in `if` conditions.  A finding where `min()`
-  was the guard will currently show `possibly_guarded=False` when it should be
-  `True` with `guard_kind='bounded'`.  Fix: recognise the pattern
-  `var = min(tainted_var, const)` (or its `min_t`/`clamp` variants) between
-  the taint source and the sink and set the guard flag accordingly.  Moderate
-  complexity; reduces false positives without generating new findings.
 
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
   findings where Stage 2 cannot determine safety from the function body alone,
