@@ -106,7 +106,7 @@ suffices).
 ## Stage 1.7: SMT refinement
 
 Z3 (bitvector arithmetic, not integer) is run on each surviving finding in a
-worker pool before Stage 2 sees it.  The five properties it can decide:
+worker pool before Stage 2 sees it.  The six properties it can decide:
 
 | Property | Claim checked | Retires on UNSAT? |
 |---|---|---|
@@ -115,6 +115,16 @@ worker pool before Stage 2 sees it.  The five properties it can decide:
 | `truncation` | Can this value lose bits that matter when narrowed to the destination type? | Yes, when role is `narrowing_assignment` or `narrowed_value` |
 | `guard-transfer` | Does the ceiling the guard established still cover the value reaching the sink? | Yes, when Stage 1's verdict was `covers-base-not-offset` or `stale-redefinition` |
 | `shift-bounds` | Can the shift amount reach or exceed the bit-width of the left operand? | Yes, when role is `shift_amount` (Cat L) |
+| `underflow` | Can an unsigned `A - B` subtraction wrap because `B > A`? | No — corrects the misleading `safe` verdict from `prop_negative` on unsigned subtraction results; surfaces a witness when wrap is possible, and `safe` when a floor guard provably prevents it |
+
+**Note on Gap R/S interaction:** `prop_negative` returns `safe: value is unsigned at the sink` for
+any unsigned value — this is correct but misleading when the value was computed
+via unsigned subtraction.  `prop_underflow` detects `A - B` (including under
+integer-promotion wrapping like `Extract(n, 0, ZeroExt(A) - B)`) and poses
+`UGT(B, A)`.  This is satisfiable when no floor guard covers the case.  Gap R
+(remaining-length loop, where the subtraction is inside a loop and the loop
+body is clobbered by the path encoder) remains not-modelled — the path
+condition does not retain the subtraction structure across a loop back-edge.
 
 Properties that need a buffer size (how big is the destination of this `memcpy`,
 how many entries does this table have) are absent — guessing would convert a
@@ -222,28 +232,6 @@ reasoning error observed in practice:
   `cifs_strndup_from_utf16()` output (already suppressed as NUL-terminated), and
   most kernel debug logging (`cifs_dbg(FYI, ...)`) does not expose data to
   userspace.
-
-- **`prop_underflow` (Stage 1.7)** — applies to two patterns, both already
-  detected by Stage 1 but not refinable by Stage 1.7:
-
-  1. *Remaining-length loop* (`remaining -= server_len` without a prior
-     `remaining >= server_len` check): Stage 1 fires Cat F or Cat B on the
-     tainted `remaining`; Stage 1.7 sees an unsigned value and returns `safe`
-     via `prop_negative`, which is misleading — the wrapped 0xFFFF_FF00 IS
-     dangerous.
-
-  2. *Subtraction-derived size at Cat A/B sink* (`size = total_len - sizeof(header)`
-     where `total_len` is tainted and may be smaller than `sizeof(header)`):
-     Stage 1 fires Cat B on `memcpy(..., size)`; Stage 1.7 again sees an unsigned
-     value and reports "safe — value is unsigned at the sink", which Stage 2 may
-     use to incorrectly dismiss the finding.
-
-  In both cases, `prop_negative` returns the right answer for the wrong question.
-  Adding `prop_underflow` — check `UGT(subtrahend, minuend)` — would produce
-  witnesses for the underflow case and retire findings where a guard provably
-  prevents it.  Moderate complexity: requires identifying that the tainted
-  variable was derived via subtraction and recovering both operands from the path
-  condition.  Stage 2 prompt item 14 covers the reasoning gap in the meantime.
 
 - **Stage 1.5** — caller enumeration for `needs_validation` findings.  For
   findings where Stage 2 cannot determine safety from the function body alone,

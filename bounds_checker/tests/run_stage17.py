@@ -65,6 +65,9 @@ EXPECT = {
     'bug_L_right_shift':       'unsafe',   # same for >>
     'guarded_L_bounded':       'safe',     # if (order >= 32) return 0
     'fp_L_masked':             'safe',     # & 0x1f → shift-bounds UNSAT, retires
+    # ── prop_underflow cases ─────────────────────────────────────────────
+    'probe_underflow_sub':     'unsafe',   # total - 8 can wrap when total < 8
+    'ctl_underflow_guarded':   'safe',     # if (total < 8) return guards subtraction
 }
 
 # Whether the clean answer retires (suppresses) the finding.

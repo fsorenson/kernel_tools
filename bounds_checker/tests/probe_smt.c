@@ -381,3 +381,31 @@ void gap3_bare_too(void *base, struct hdr *h)
 		return;
 	total += rsp->data[0];
 }
+
+/* ── prop_underflow: subtraction-derived size ─────────────────────────── */
+
+/*
+ * Server-supplied total minus a fixed header size.  No guard checks that
+ * total >= 8, so if the server sends total = 0..7, payload wraps to a huge
+ * unsigned value.  prop_underflow must produce a witness.
+ */
+void probe_underflow_sub(struct hdr *h, void *src)
+{
+	u16 total = le16_to_cpu(h->len);
+	u16 payload = total - 8;
+	memcpy(buf, src, payload);
+}
+
+/*
+ * Same pattern but the floor guard `if (total < 8) return` is present.
+ * The path condition includes total >= 8, so UGT(8, total) is UNSAT.
+ * prop_underflow must return safe.
+ */
+void ctl_underflow_guarded(struct hdr *h, void *src)
+{
+	u16 total = le16_to_cpu(h->len);
+	if (total < 8)
+		return;
+	u16 payload = total - 8;
+	memcpy(buf, src, payload);
+}

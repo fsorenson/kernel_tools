@@ -7,7 +7,7 @@ take, so the finding is noise; SAT means there is a concrete assignment that
 breaks it, which is a witness and not a verdict.  Everything else keeps the
 finding.
 
-The five here are the ones decidable from the slice alone.  Properties that
+The six here are the ones decidable from the slice alone.  Properties that
 need a buffer size — how big is the destination of this memcpy, how many
 entries does this table have — are deliberately absent: they need declaration
 data the scanner does not collect, and guessing would convert a sound
@@ -413,6 +413,56 @@ def _match_width(val, like):
     return z3.Extract(w - 1, 0, val.bv)
 
 
+def _find_subtraction(bv, depth=0):
+    """
+    Walk the Z3 expression tree and return the first BVSUB's (minuend, subtrahend),
+    or None.  The outer expression may be an Extract (integer promotion + narrowing
+    back to the declared width) wrapping the actual subtraction, so a shallow search
+    is needed rather than a top-level check.
+    """
+    if depth > 4:
+        return None
+    if (z3.is_bv(bv) and bv.num_args() == 2
+            and bv.decl().name() == 'bvsub'):
+        return bv.arg(0), bv.arg(1)
+    for c in bv.children():
+        if z3.is_bv(c):
+            r = _find_subtraction(c, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def prop_underflow(path, expr_node):
+    """
+    Can this unsigned value wrap to a huge positive via subtraction underflow?
+
+    Checks UGT(subtrahend, minuend) for any A - B embedded in the value.
+    SAT: there is a server-supplied input that makes the subtraction wrap.
+    UNSAT: the path condition (typically a prior A >= B check) prevents wrap.
+
+    This corrects the misleading 'safe: value is unsigned' from prop_negative
+    when the unsigned value was computed as A - B — prop_negative is right that
+    the result cannot be negative as unsigned, but wrong to call it safe when
+    the subtraction itself can produce a huge wrapped value that looks positive.
+    """
+    val = path.enc.encode(expr_node)
+    if not _grounded(val):
+        return UNMODELLED
+    if val.signed:
+        # Signed subtraction yielding a negative result is caught by prop_negative;
+        # the unsigned-wrap scenario only applies to unsigned types at the sink.
+        return UNMODELLED
+    sub = _find_subtraction(val.bv)
+    if sub is None:
+        return UNMODELLED
+    minuend, subtrahend = sub
+    return _decide(path, z3.UGT(subtrahend, minuend), 'underflow',
+                   'subtraction underflows: subtrahend can exceed minuend (unsigned wrap to huge positive)',
+                   'subtraction cannot underflow: minuend >= subtrahend holds on every path',
+                   {'minuend': minuend, 'subtrahend': subtrahend})
+
+
 def prop_shift_bounds(path, shift_expr_node):
     """
     Can the shift amount reach or exceed the bit-width of the left operand?
@@ -503,6 +553,7 @@ def check_finding(finding, fn_body, source, timeout_ms=200, decl_types=None,
     else:
         if role == 'size_mul_overflow' or cat == 'B':
             checks.append(lambda: prop_overflow(path, expr))
+        checks.append(lambda: prop_underflow(path, expr))
         checks.append(lambda: prop_negative(path, expr))
         checks.append(lambda: prop_guard_transfer(
             path, finding['tainted_var'], expr, source))

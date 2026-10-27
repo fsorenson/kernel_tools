@@ -36,7 +36,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 | Item | Prerequisite / blocker |
 |---|---|
-| **`prop_underflow`** (Stage 1.7) — Pattern 1: `remaining -= server_len` without guard; Pattern 2: `size = total_len - sizeof(header)` at Cat A/B sink. Fix: `UGT(subtrahend, minuend)`; must recover both operands from path condition | Moderate complexity; requires operand extraction from path condition |
+| **Gap R (remaining-length loop)** — `prop_underflow` covers Pattern 2 (straight-line subtraction at sink) but NOT Pattern 1 (subtraction inside a loop body). The path encoder clobbers loop-written variables, so the BVSUB structure is not visible at the post-loop sink. Stage 2 prompt item 14 covers the semantic reasoning for this case. | Path encoder limitation — would need loop-invariant recovery |
 | **Stage 1.5** — caller enumeration for `needs_validation` findings; check guards on tainted param at each call site | Highest-value precision improvement; moderate complexity |
 | **G3** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak | Needs per-field write coverage |
 | **Category I** — struct cast from server buffer with field reads before header size check; confirmed instance: `cifs_to_posix_acl` (fixed `9b2b3cda`); multi-cast variant (Gap P) needs alias analysis | LLM quota (tree-wide scan too expensive); alias analysis for multi-cast |
@@ -47,8 +47,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. `prop_underflow` Stage 1.7 property — covers Gap R (remaining-length loop) and Gap S (subtraction-derived size at sink)
-2. Stage 1.5 caller enumeration — highest-value precision improvement, addresses `needs_validation` false positives
+1. Stage 1.5 caller enumeration — highest-value precision improvement, addresses `needs_validation` false positives
 
 ## Constraints
 
@@ -60,6 +59,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Recently completed
 
+- `prop_underflow` (Stage 1.7) — detects unsigned `A - B` subtraction (including under integer-promotion wrapping); `UGT(subtrahend, minuend)` produces a witness when no floor guard prevents wrap; UNSAT when a `total >= min` guard covers the path. Fixes misleading `safe: value is unsigned` from `prop_negative` for Gap S (subtraction-derived size at sink). Gap R (subtraction inside a loop body) remains not-modelled — loop clobber prevents BVSUB recovery at the post-loop sink.
 - `min()`/`min_t()`/`clamp()` ceiling guard recognition in `_find_guards_between` — `V = min(V, LIMIT)` now credits `possibly_guarded=True`; non-dominating guards correctly rejected
 - `flex_array_size` added to `_SAFE_SIZE_HELPERS` — false-positive fix for `kmalloc(flex_array_size(...))`
 - Cat H extended to same-width unsigned→signed sign-conversion; `_ERROR_CODE_VARS` filter added
