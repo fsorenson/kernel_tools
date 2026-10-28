@@ -1,9 +1,10 @@
 # bounds_checker
 
-Static bounds/data-validation checker for Linux kernel C. Three-stage pipeline:
+Static bounds/data-validation checker for Linux kernel C. Four-stage pipeline:
 
 - **Stage 1** (`parsers/taint_scanner.py`, `parsers/cross_function.py`): per-function taint scanner + one-hop cross-function pass
 - **Stage 1.7** (`smt/`): Z3 SMT refinement using bitvector arithmetic
+- **Stage 1.5** (`stages/stage1_5_callers.py`): caller enumeration — annotates findings in static functions with per-call-site guard detection
 - **Stage 2** (`stages/stage2_llm_analysis.py`): LLM adjudication per function
 
 Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_review_brief.md`
@@ -12,7 +13,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 - **Bitvectors, not unbounded integers in SMT**: wraparound and truncation must be exact; unbounded integers would make `prop_overflow` unsound.
 - **Retirement condition**: Stage 1.7 retires a finding only when the `safe` property matches what Stage 1's verdict rested on. A size that cannot be negative is still unbounded against the destination buffer — retiring on any `safe` result would be unsound.
-- **Cross-function pass is one hop only**: extending to two hops raises false positives because intermediate functions often validate before passing further. The higher-value fix is Stage 1.5 (upward caller enumeration), not deeper callee following.
+- **Cross-function pass is one hop only**: extending to two hops raises false positives because intermediate functions often validate before passing further. Stage 1.5 (upward caller enumeration, now implemented) addresses the complementary direction: it looks UP from the callee to check whether every caller already validates before calling.
 - **Cat H excludes error-code variable names**: `_ERROR_CODE_VARS` = {rc, ret, err, error, retval, result, status, r, rv, retcode}. Storing `le32_to_cpu(status)` into `int rc` is intentional kernel idiom; the sign change is by design.
 - **NUL-term converters clear taint**: `_NUL_TERM_CONVERTERS` = {cifs_strndup_from_utf16, cifs_strndup_from_utf8}. Their return values are kernel-allocated NUL-terminated strings; taint on them would produce false positives on downstream `strlen`.
 - **Cat L bitmask guard gap**: `le16_to_cpu(x) & 0x1f` → `1 << tag` shows `guarded=False` in Stage 1 (guard detection uses comparisons, not bitwise masks). Stage 1.7 `prop_shift_bounds` correctly retires these — `val & 0x1f` is provably < 32 in bitvectors.
@@ -36,8 +37,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 | Item | Prerequisite / blocker |
 |---|---|
-| **Gap R (remaining-length loop)** — `prop_underflow` covers Pattern 2 (straight-line subtraction at sink) but NOT Pattern 1 (subtraction inside a loop body). The path encoder clobbers loop-written variables, so the BVSUB structure is not visible at the post-loop sink. Stage 2 prompt item 14 covers the semantic reasoning for this case. | Path encoder limitation — would need loop-invariant recovery |
-| **Stage 1.5** — caller enumeration for `needs_validation` findings; check guards on tainted param at each call site | Highest-value precision improvement; moderate complexity |
+| **Gap R (remaining-length loop)** — `prop_underflow` covers Pattern 2 (straight-line subtraction) but NOT Pattern 1 (subtraction inside a loop body, where the path encoder clobbers loop-written variables so BVSUB is not visible at the post-loop sink). Stage 2 prompt item 14 covers the reasoning gap. | Path encoder limitation — would need loop-invariant recovery |
 | **G3** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak | Needs per-field write coverage |
 | **Category I** — struct cast from server buffer with field reads before header size check; confirmed instance: `cifs_to_posix_acl` (fixed `9b2b3cda`); multi-cast variant (Gap P) needs alias analysis | LLM quota (tree-wide scan too expensive); alias analysis for multi-cast |
 | **Category J** — server-reported transfer count not validated against requested length | New sink type needed (value-out-of-bounds, no memory sink) |
