@@ -98,6 +98,14 @@ EXPECTED = {
     'guarded_B_min_t':              {'cat': 'B', 'guarded': True},
     # min inside a branch that doesn't dominate the sink — not a guard.
     'bug_B_min_nondominant':        {'cat': 'B', 'guarded': False},
+
+    # ── Provenance-based taint (Step 2 of alias analysis) ────────────────
+    # u8 field from smb2_read_rsp (in _SERVER_RESPONSE_STRUCTS) — tainted
+    # without any endian helper, via struct provenance.
+    'bug_B_provenance_u8':          {'cat': 'B', 'guarded': False},
+    'guarded_B_provenance_u8':      {'cat': 'B', 'guarded': True},
+    # local_state is NOT in the table — no taint, no finding.
+    'fp_provenance_local_struct':   'no_finding',
 }
 
 

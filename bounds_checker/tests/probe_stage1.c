@@ -75,6 +75,13 @@ extern long copy_from_user(void *dst, const void *src, size_t n);
 #define clamp_t(t, val, lo, hi) clamp(val, lo, hi)
 #define clamp_val(val, lo, hi)  clamp(val, lo, hi)
 
+/*
+ * Server-response struct stub for provenance tests.
+ * smb2_read_rsp is in _SERVER_RESPONSE_STRUCTS; local_state is not.
+ */
+struct smb2_read_rsp { u8 DataOffset; u32 DataLength; };
+struct local_state    { u8 offset;    u32 length; };
+
 /* ── Category A: tainted value → pointer arg of memory op ── */
 
 /* tainted SOURCE pointer reaching memcpy */
@@ -429,4 +436,35 @@ void *bug_B_min_nondominant(struct pkt *p)
 	if (cond)
 		size = min(size, (u16)1024);
 	return kmalloc(size, GFP_KERNEL);
+}
+
+/* ── Provenance-based taint: u8 field from server-response struct ── */
+
+/*
+ * u8 DataOffset is in smb2_read_rsp (in _SERVER_RESPONSE_STRUCTS).
+ * No endian helper is needed — the provenance table makes this tainted.
+ */
+void *bug_B_provenance_u8(struct smb2_read_rsp *rsp)
+{
+	u8 off = rsp->DataOffset;
+	return kmalloc(off, GFP_KERNEL);
+}
+
+/* guarded: off is bounded before kmalloc */
+void *guarded_B_provenance_u8(struct smb2_read_rsp *rsp)
+{
+	u8 off = rsp->DataOffset;
+	if (off > 64)
+		return NULL;
+	return kmalloc(off, GFP_KERNEL);
+}
+
+/*
+ * local_state is NOT in _SERVER_RESPONSE_STRUCTS.
+ * Stage 1 must NOT fire — the field read is not server-tainted.
+ */
+void *fp_provenance_local_struct(struct local_state *s)
+{
+	u8 off = s->offset;
+	return kmalloc(off, GFP_KERNEL);
 }

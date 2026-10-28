@@ -336,6 +336,30 @@ def _ptr_is_server_response(var_name, var_type_map):
     return var_type_map.get(var_name) in _SERVER_RESPONSE_STRUCTS
 
 
+def _field_expr_ptr(node, source):
+    """
+    If node is `ptr->field` or `(type)ptr->field`, return the pointer
+    variable name.  Returns None for all other shapes.
+
+    Peels one cast so that `(u8)rsp->DataOffset` is treated the same as
+    `rsp->DataOffset`.  Only a bare identifier on the left of `->` is
+    accepted — `ptr->inner->field` and computed pointers are not.
+    """
+    n = node
+    if n is None:
+        return None
+    if n.type == 'cast_expression':
+        inner = n.child_by_field_name('value')
+        if inner is not None:
+            n = inner
+    if n.type != 'field_expression':
+        return None
+    obj = n.child_by_field_name('argument')
+    if obj is None or obj.type != 'identifier':
+        return None
+    return node_text(obj, source)
+
+
 # ---------------------------------------------------------------------------
 # Expression taint analysis helpers
 # ---------------------------------------------------------------------------
@@ -1458,6 +1482,24 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None,
                             'reason':          reason_h,
                         })
                 continue
+
+            # Provenance: bare field read from a known server-response struct.
+            # u8 (and other fields without endian helpers) carry server-supplied
+            # values that the endian-helper check above cannot detect.
+            # Only applies to direct `ptr->field` (or cast thereof) where the
+            # pointer's declared struct type is in _SERVER_RESPONSE_STRUCTS.
+            if var_type_map and not is_merge:
+                ptr_var = _field_expr_ptr(rhs, source)
+                if ptr_var and _ptr_is_server_response(ptr_var, var_type_map):
+                    struct_name = var_type_map[ptr_var]
+                    tainted[lhs_var] = {
+                        'source_fn': struct_name,
+                        'line':      node.start_point[0] + 1,
+                        'kind':      'value',
+                        'width':     var_widths.get(lhs_var),
+                    }
+                    killed.pop(lhs_var, None)
+                    continue
 
             ref = _node_references_tainted_var(rhs, source, tainted)
 
