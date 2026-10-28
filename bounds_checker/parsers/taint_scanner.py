@@ -278,6 +278,65 @@ _ERROR_CODE_VARS = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Server-response struct provenance (Step 1 of alias analysis)
+# ---------------------------------------------------------------------------
+
+# Struct types that are definitionally server-supplied in the CIFS/SMB
+# client.  A pointer to one of these was cast from a received network
+# buffer; field reads on it are server-controlled even without an endian
+# helper.  Used by Step 2 to source taint from u8/single-byte fields.
+#
+# Only response-only types are included here.  Dual-use types (smb2_hdr,
+# smb2_pdu, smb_hdr) are excluded: they appear in both locally-built
+# requests and received responses, so the type name alone does not
+# establish provenance.  Step 2 will handle initialization-based
+# provenance for those.
+_SERVER_RESPONSE_STRUCTS = frozenset({
+    # SMBv2/SMB3 command responses (fs/smb/common/)
+    'smb2_err_rsp',
+    'smb2_negotiate_rsp',
+    'smb2_sess_setup_rsp',
+    'smb2_logoff_rsp',
+    'smb2_tree_connect_rsp',
+    'smb2_tree_disconnect_rsp',
+    'smb2_create_rsp',
+    'smb2_close_rsp',
+    'smb2_flush_rsp',
+    'smb2_read_rsp',
+    'smb2_write_rsp',
+    'smb2_lock_rsp',
+    'smb2_echo_rsp',
+    'smb2_ioctl_rsp',
+    'smb2_query_directory_rsp',
+    'smb2_change_notify_rsp',
+    'smb2_query_info_rsp',
+    'smb2_set_info_rsp',
+    # Unsolicited server messages
+    'smb2_oplock_break',
+    'smb2_lease_break',
+    'smb2_lease_ack',
+    # Error/extension types — always from server
+    'smb2_symlink_err_rsp',
+    'smb2_error_context_rsp',
+    'smb2_transform_hdr',   # SMB3 encryption header; in client always received
+    # POSIX extension response info
+    'smb2_posix_info',
+})
+
+
+def _ptr_is_server_response(var_name, var_type_map):
+    """
+    True if var_name is declared with a known server-response struct type.
+
+    var_type_map maps variable names to their declared struct-type names
+    (from build_var_type_map).  Returns False when the variable is absent
+    from the map (type unknown or not a struct pointer) or its type is not
+    in _SERVER_RESPONSE_STRUCTS.
+    """
+    return var_type_map.get(var_name) in _SERVER_RESPONSE_STRUCTS
+
+
+# ---------------------------------------------------------------------------
 # Expression taint analysis helpers
 # ---------------------------------------------------------------------------
 
@@ -1184,7 +1243,8 @@ def _find_string_guard(fn_body, var_name, line_lo, line_hi, source):
 # Core taint walk (shared by intra and cross-function modes)
 # ---------------------------------------------------------------------------
 
-def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None):
+def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None,
+               var_type_map=None):
     """
     Core taint walk for one function body.
 
@@ -2019,7 +2079,10 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
         'reason':          str,
       }
     """
-    findings, _ = _scan_body(fn_name, fn_body, source, filepath)
+    from kernel_analysis.parsers.c_parser import build_var_type_map
+    vtm = build_var_type_map(fn_def_node, fn_body, source)
+    findings, _ = _scan_body(fn_name, fn_body, source, filepath,
+                              var_type_map=vtm)
     return findings
 
 
@@ -2029,7 +2092,9 @@ def scan_files(source_paths, verbose=False):
 
     Returns list of finding dicts (see scan_function for schema).
     """
-    from kernel_analysis.parsers.c_parser import parse_file, find_functions
+    from kernel_analysis.parsers.c_parser import (
+        parse_file, find_functions, build_var_type_map,
+    )
 
     all_findings = []
     for path in source_paths:
@@ -2040,8 +2105,10 @@ def scan_files(source_paths, verbose=False):
                 print(f"  [skip {path}: {e}]")
             continue
         for fn in find_functions(tree, source):
+            vtm = build_var_type_map(fn['node'], fn['body'], source)
             findings, _ = _scan_body(
-                fn['name'], fn['body'], source, path
+                fn['name'], fn['body'], source, path,
+                var_type_map=vtm,
             )
             all_findings.extend(findings)
 
