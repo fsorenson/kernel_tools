@@ -173,6 +173,11 @@ reasoning error observed in practice:
 2b. SMT witness reachability
 2c. Packet-relative bounds check — `count * sizeof(element) <= received_size`,
     not just `count <= MAX` (the SMT layer cannot see buffer sizes)
+2d. Caller-level guard evidence — when Stage 1.5 reports "ALL N sites guarded", the
+    static function is always called with the tainted parameter already validated; the
+    LLM should dismiss such findings as false_positive and note which parameter is
+    always validated.  When "X of N sites guarded", the finding is real on the
+    unguarded call paths.
 3–11. Real bug, impact, symptom, suggested fix, CVE pattern, validation notes
 10. Caps vs. inflations — `if (x > limit) x = limit` reduces x, never inflates it
 11. `copy_to_user` with user-controlled size cap is self-limiting

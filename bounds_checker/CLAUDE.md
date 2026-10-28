@@ -47,7 +47,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. Stage 1.5 caller enumeration — highest-value precision improvement, addresses `needs_validation` false positives
+*(no immediate pending items — see deferred list for larger investments)*
 
 ## Constraints
 
@@ -59,6 +59,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Recently completed
 
+- **Stage 1.5** (caller enumeration) — `stages/stage1_5_callers.py`: for static functions with findings, scans all source files once (via `build_call_site_index`), identifies the taint-originating parameter, checks each call site for guards via one-hop variable derivation + `_find_guards_between`. Attaches `caller_context` (determinable, all_callers_guarded, call_sites[{guarded, guard_kind, snippet}]) to each finding. Wired into cli.py between Stage 1.7 and Stage 2; rendered in all three report formats. Stage 2 prompt item 2d added: LLM dismisses findings where all callers guard.
 - `prop_underflow` (Stage 1.7) — detects unsigned `A - B` subtraction (including under integer-promotion wrapping); `UGT(subtrahend, minuend)` produces a witness when no floor guard prevents wrap; UNSAT when a `total >= min` guard covers the path. Fixes misleading `safe: value is unsigned` from `prop_negative` for Gap S (subtraction-derived size at sink). Gap R (subtraction inside a loop body) remains not-modelled — loop clobber prevents BVSUB recovery at the post-loop sink.
 - `min()`/`min_t()`/`clamp()` ceiling guard recognition in `_find_guards_between` — `V = min(V, LIMIT)` now credits `possibly_guarded=True`; non-dominating guards correctly rejected
 - `flex_array_size` added to `_SAFE_SIZE_HELPERS` — false-positive fix for `kmalloc(flex_array_size(...))`

@@ -1020,6 +1020,18 @@ For each finding above, determine:
    a check that `count < 256` does not prevent an OOB read of `data[count-1]` \
    if the server sent a 12-byte packet claiming count=255.
 
+2d. **Caller-level guard evidence** (only when finding shows \
+   "Caller context: ALL ... sites guarded"): the scanner has \
+   statically verified that this static function is always called \
+   with the tainted parameter already validated by the caller.  \
+   When all_callers_guarded is true: set real_bug to false and \
+   assessment to false_positive; state in notes which parameter is \
+   always validated and that every call site guards before calling.  \
+   When the line says "X of N sites guarded": the finding is real on \
+   the unguarded call paths; note which callers do and do not validate.  \
+   Do NOT dismiss a finding solely because the current function body \
+   looks unguarded — that is exactly the scenario this field covers.
+
 3. **Real bug**: combining the above, is this a genuine missing-validation bug?
 
 4. **Impact** (choose one if real bug, else "none"):
@@ -1284,6 +1296,24 @@ def _format_findings(findings):
                     "    Witness: "
                     + '  '.join(f'{k}={v}' for k, v in smt['witness'].items())
                     + "\n"
+                )
+        cc = f.get('caller_context') or {}
+        if cc.get('determinable'):
+            n     = cc.get('call_site_count', 0)
+            label = f"{n} site{'s' if n != 1 else ''}"
+            if cc.get('all_callers_guarded'):
+                entry += (
+                    f"    Caller context: ALL {label} guarded (static) — "
+                    f"every caller validates param '{cc.get('param_name','?')}' "
+                    f"before passing it here\n"
+                )
+            else:
+                guarded_n = sum(
+                    1 for s in cc.get('call_sites', []) if s.get('guarded') is True
+                )
+                entry += (
+                    f"    Caller context: {guarded_n} of {label} guarded (static) — "
+                    f"not all callers validate before passing the tainted parameter\n"
                 )
         entry += (
             f"    Possibly guarded: {guard_tag}\n"
