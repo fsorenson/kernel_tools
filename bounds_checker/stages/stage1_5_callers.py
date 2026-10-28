@@ -11,7 +11,9 @@ Step B: identify_taint_param(), annotate_with_guards() — guard detection
 Step C: annotate_findings() — full pipeline wired into the stages.
 """
 
+import json
 import re
+from pathlib import Path
 
 from kernel_analysis.parsers.c_parser import (
     parse_file, find_functions, find_calls_to, node_text, get_source_line,
@@ -354,6 +356,54 @@ def find_call_sites(fn_name, paths, context_lines=5):
 
 
 # ---------------------------------------------------------------------------
+# Efficient multi-function call-site index
+# ---------------------------------------------------------------------------
+
+def build_call_site_index(fn_names, paths, context_lines=5):
+    """
+    Scan each file in `paths` ONCE and collect call sites for all fn_names.
+
+    Returns {fn_name: [call_site_dict]}.  Equivalent to calling
+    find_call_sites() for each name separately but parses each file only once,
+    which matters when there are many unique function names with findings.
+    """
+    index = {name: [] for name in fn_names}
+    fn_set = set(fn_names)
+    if not fn_set:
+        return index
+
+    for path in paths:
+        try:
+            tree, source = parse_file(str(path))
+        except Exception:
+            continue
+
+        fn_ranges = [
+            (f['start_line'], f['end_line'], f['name'])
+            for f in find_functions(tree, source)
+        ]
+
+        for call_node, name, arg_nodes, call_line in find_calls_to(
+                tree.root_node, source, fn_set):
+            caller = ''
+            for start, end, fn in fn_ranges:
+                if start <= call_line <= end:
+                    caller = fn
+                    break
+            arg_texts = [node_text(a, source) for a in arg_nodes]
+            index[name].append({
+                'file':      str(path),
+                'line':      call_line,
+                'caller_fn': caller,
+                'args':      arg_texts,
+                'arg_names': [_arg_idents(t) for t in arg_texts],
+                'snippet':   _snippet(source, call_line, context_lines),
+            })
+
+    return index
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline: annotate a findings list
 # ---------------------------------------------------------------------------
 
@@ -365,34 +415,25 @@ def annotate_findings(findings, paths):
     Attach caller_context to each finding in the list, in place.
 
     For static functions, caller_context includes:
-      determinable       — True
-      param_name         — the formal parameter that roots the taint, or None
-      param_idx          — 0-based index of that parameter, or None
-      call_site_count    — number of direct call sites found
+      determinable        — True
+      param_name          — formal parameter that roots the taint, or None
+      param_idx           — 0-based index of that parameter, or None
+      call_site_count     — number of direct call sites found
       all_callers_guarded — True iff every call site guards param before calling
-      call_sites         — list of per-site dicts (file, line, caller_fn,
-                           args, snippet, guarded, guard_kind)
+      call_sites          — list of per-site dicts (file, line, caller_fn,
+                            args, snippet, guarded, guard_kind)
 
     For non-static or otherwise undeterminable functions:
       determinable — False
       reason       — short string explaining why
 
-    Call sites are found once per unique function name (cached), then
-    re-annotated for each finding in case different findings in the same
-    function have different taint-originating parameters.
+    All files in `paths` are parsed once (via build_call_site_index) rather
+    than once per unique function name.
     """
-    # fn_name → raw call-site list (no guard annotation — copied per finding)
-    cs_cache = {}
-    # file_path → {'source': bytes, 'fns': {name: fn_info}}
+    # Parse the defining files to get fn_def / fn_body (cached by filepath).
     file_cache = {}
 
-    for finding in findings:
-        fn_name  = finding.get('function')
-        filepath = finding.get('file')
-        if not fn_name or not filepath:
-            continue
-
-        # Parse the file that defines the function (cached).
+    def _fdata(filepath):
         if filepath not in file_cache:
             try:
                 tree, source = parse_file(filepath)
@@ -402,19 +443,41 @@ def annotate_findings(findings, paths):
                 }
             except Exception:
                 file_cache[filepath] = None
+        return file_cache[filepath]
 
-        fdata = file_cache.get(filepath)
+    # Identify which functions are static (need the defining file).
+    # Simultaneously decide which fn_names need call-site enumeration.
+    static_fns = set()
+    for f in findings:
+        fn_name  = f.get('function')
+        filepath = f.get('file')
+        if not fn_name or not filepath:
+            continue
+        fdata = _fdata(filepath)
+        if fdata is None:
+            continue
+        fn_info = fdata['fns'].get(fn_name)
+        if fn_info and is_static_fn(fn_info['node'], fdata['source']):
+            static_fns.add(fn_name)
+
+    # Build call-site index for all static functions in one file-scan pass.
+    cs_index = build_call_site_index(static_fns, paths) if static_fns else {}
+
+    # Annotate each finding.
+    for finding in findings:
+        fn_name  = finding.get('function')
+        filepath = finding.get('file')
+        if not fn_name or not filepath:
+            continue
+
+        fdata = _fdata(filepath)
         if not fdata:
-            finding['caller_context'] = {
-                'determinable': False, 'reason': 'parse-error',
-            }
+            finding['caller_context'] = {'determinable': False, 'reason': 'parse-error'}
             continue
 
         fn_info = fdata['fns'].get(fn_name)
         if fn_info is None:
-            finding['caller_context'] = {
-                'determinable': False, 'reason': 'fn-not-found',
-            }
+            finding['caller_context'] = {'determinable': False, 'reason': 'fn-not-found'}
             continue
 
         source  = fdata['source']
@@ -422,21 +485,14 @@ def annotate_findings(findings, paths):
         fn_body = fn_info['body']
 
         if not is_static_fn(fn_def, source):
-            finding['caller_context'] = {
-                'determinable': False, 'reason': 'not-static',
-            }
+            finding['caller_context'] = {'determinable': False, 'reason': 'not-static'}
             continue
 
-        # Which parameter does the taint originate from?
         param_result = identify_taint_param(finding, fn_body, source)
-        param_name = param_result[0] if param_result else None
-        param_idx  = param_result[1] if param_result else None
+        param_name   = param_result[0] if param_result else None
+        param_idx    = param_result[1] if param_result else None
 
-        # Call sites — cached; annotated on a per-finding copy.
-        if fn_name not in cs_cache:
-            cs_cache[fn_name] = find_call_sites(fn_name, paths)
-
-        raw_sites = cs_cache[fn_name]
+        raw_sites = cs_index.get(fn_name, [])
         if not raw_sites:
             finding['caller_context'] = {
                 'determinable': False, 'reason': 'no-call-sites',
@@ -444,7 +500,7 @@ def annotate_findings(findings, paths):
             }
             continue
 
-        cs = [dict(s) for s in raw_sites]   # shallow copy; values are immutable
+        cs = [dict(s) for s in raw_sites]
         annotate_with_guards(cs, param_idx)
 
         all_guarded = (
@@ -453,10 +509,10 @@ def annotate_findings(findings, paths):
         )
 
         finding['caller_context'] = {
-            'determinable':       True,
-            'param_name':         param_name,
-            'param_idx':          param_idx,
-            'call_site_count':    len(cs),
+            'determinable':        True,
+            'param_name':          param_name,
+            'param_idx':           param_idx,
+            'call_site_count':     len(cs),
             'all_callers_guarded': all_guarded,
             'call_sites': [
                 {k: v for k, v in s.items() if k not in _OMIT_FROM_SITE}
@@ -465,3 +521,67 @@ def annotate_findings(findings, paths):
         }
 
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Stage entry point
+# ---------------------------------------------------------------------------
+
+def _resolve_paths(cfg):
+    """Resolve scan targets to a flat list of Path objects."""
+    from pathlib import Path as _P
+    kernel_source = cfg.get('kernel_source', '')
+    c_paths = []
+    for d in cfg['target'].get('source_dirs', []):
+        root = _P(kernel_source) / d
+        c_paths += sorted(root.rglob('*.c')) + sorted(root.rglob('*.h'))
+    for sp in cfg['target'].get('source_paths', []):
+        sp = _P(sp)
+        if sp.is_dir():
+            c_paths += sorted(sp.rglob('*.c')) + sorted(sp.rglob('*.h'))
+        else:
+            c_paths.append(sp)
+    return c_paths
+
+
+def run(cfg, run_dir, stage1_output, verbose=False):
+    """
+    Annotate Stage 1 findings with caller_context.
+
+    `stage1_output` is modified in place (caller_context added to each
+    finding).  Writes stage1_5_callers.json with aggregate statistics.
+    """
+    findings = stage1_output.get('findings', [])
+    if not findings:
+        print("Stage 1.5 (callers): no findings to annotate.")
+        return None
+
+    paths = _resolve_paths(cfg)
+    n_paths = len(paths)
+    print(f"Stage 1.5 (callers): annotating {len(findings)} finding(s) "
+          f"across {n_paths} source file(s) ...")
+
+    annotate_findings(findings, paths)
+
+    n_det      = sum(1 for f in findings
+                     if f.get('caller_context', {}).get('determinable'))
+    n_guarded  = sum(1 for f in findings
+                     if f.get('caller_context', {}).get('all_callers_guarded'))
+    n_not_static = sum(1 for f in findings
+                       if f.get('caller_context', {}).get('reason') == 'not-static')
+
+    print(f"Stage 1.5: {n_det} annotated "
+          f"({n_guarded} fully guarded, {n_not_static} non-static)")
+
+    output = {
+        'stage':               'caller_enumeration',
+        'files_scanned':       n_paths,
+        'findings_annotated':  n_det,
+        'all_callers_guarded': n_guarded,
+        'not_static':          n_not_static,
+        'total_findings':      len(findings),
+    }
+    out_path = Path(run_dir) / 'stage1_5_callers.json'
+    out_path.write_text(json.dumps(output, indent=2))
+    print(f"Stage 1.5 output: {out_path}")
+    return output

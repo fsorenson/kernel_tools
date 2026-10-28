@@ -95,6 +95,31 @@ def _smt_view(r):
     }
 
 
+def _caller_context_view(r):
+    """
+    One-line summary of caller_context for report tables, or None.
+
+    Examples:
+      'all 3 sites guarded (static)'
+      '1 of 3 sites guarded (static)'
+      'not determinable (not-static)'
+    """
+    ctx = r.get('caller_context')
+    if not ctx:
+        return None
+    if not ctx.get('determinable'):
+        reason = ctx.get('reason', '?')
+        return f'not determinable ({reason})'
+    n      = ctx.get('call_site_count', 0)
+    label  = f"{n} site{'s' if n != 1 else ''}"
+    if ctx.get('all_callers_guarded'):
+        return f'all {label} guarded (static)'
+    guarded_n = sum(
+        1 for s in ctx.get('call_sites', []) if s.get('guarded') is True
+    )
+    return f'{guarded_n} of {label} guarded (static)'
+
+
 def _smt_retired(s1):
     """
     Findings Stage 1.7 proved away, or None when it did not run — a zero and
@@ -519,6 +544,9 @@ def _md_finding(buf, r, has_llm):
                 W(f"| SMT witness (LLM) | **reachable** — see notes |")
             elif wr is False:
                 W(f"| SMT witness (LLM) | **not reachable** — see notes |")
+    cc = _caller_context_view(r)
+    if cc:
+        W(f"| Caller context | {cc} |")
 
     if has_llm and r['real_bug'] is True:
         W(f"| Server-supplied | {'yes' if r['taint_server'] else 'no'} |")
@@ -715,6 +743,9 @@ def _fn_copy_text(s, has_llm):
                 parts.append("  SMT witness (LLM): reachable — see notes")
             elif wr is False:
                 parts.append("  SMT witness (LLM): not reachable — see notes")
+        cc = _caller_context_view(r)
+        if cc:
+            parts.append(f"  Caller context: {cc}")
         if has_llm and real is True:
             if r.get('symptom'):
                 parts.append(f"  Symptom: {r['symptom']}")
@@ -1010,6 +1041,9 @@ def _html_finding(lines, r, has_llm):
             elif wr is False:
                 W(f'<tr><th>SMT witness (LLM)</th>'
                   f'<td><b style="color:var(--fp)">not reachable</b> &mdash; see notes</td></tr>')
+    cc = _caller_context_view(r)
+    if cc:
+        W(f'<tr><th>Caller context</th><td>{_e(cc)}</td></tr>')
     if has_llm and real is True:
         W(f'<tr><th>Server-supplied</th>'
           f'<td>{"yes" if r["taint_server"] else "no"}</td></tr>')

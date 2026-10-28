@@ -8,7 +8,7 @@ from pathlib import Path
 
 from bounds_checker.config import build_arg_parser, load_config, KNOWN_MODELS
 from bounds_checker.stages import (
-    stage1_taint_scan, stage1_7_smt, stage2_llm_analysis,
+    stage1_taint_scan, stage1_7_smt, stage1_5_callers, stage2_llm_analysis,
 )
 
 
@@ -105,6 +105,12 @@ def main():
         print("\n--- Stage 1.7: SMT Refinement ---")
         stage1_7_smt.run(cfg, run_dir, s1, verbose=args.verbose,
                          n_workers=cfg['smt'].get('workers', 8))
+
+    # Stage 1.5: caller enumeration — annotates each finding with caller_context
+    # before Stage 2 sees it.  Only useful when Stage 2 will run.
+    if s1 and args.llm and s1.get('findings'):
+        print("\n--- Stage 1.5: Caller Enumeration ---")
+        stage1_5_callers.run(cfg, run_dir, s1, verbose=args.verbose)
 
     # Stage 2: LLM analysis
     if args.llm:
