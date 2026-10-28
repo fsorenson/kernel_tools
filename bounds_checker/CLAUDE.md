@@ -24,10 +24,10 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Scope
 
-**In scope**: values tainted through scalar endian helpers (`le16_to_cpu` etc.) reaching memory, allocation, loop, shift, or sign-conversion sinks within one function or one call hop.
+**In scope**: values tainted through scalar endian helpers (`le16_to_cpu` etc.) OR direct field reads from known server-response struct types (`_SERVER_RESPONSE_STRUCTS`), reaching memory, allocation, loop, shift, or sign-conversion sinks within one function or one call hop.
 
 **Deliberately out of scope** (design boundaries, not temporary gaps):
-- Values never passing through an endian helper
+- Dual-use struct types (`smb2_hdr`, `smb2_pdu`) — type alone does not establish provenance (used for both requests and responses)
 - Purely local overflow — covered by `syntactic_lint`
 - Cross-function UAF / refcount / double-fetch — requires whole-program alias analysis
 - Architecture-specific multiplication widths (32-bit intermediate wrap before `size_t` widening)
@@ -39,7 +39,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 |---|---|
 | **Gap R (remaining-length loop)** — `prop_underflow` covers Pattern 2 (straight-line subtraction) but NOT Pattern 1 (subtraction inside a loop body, where the path encoder clobbers loop-written variables so BVSUB is not visible at the post-loop sink). Stage 2 prompt item 14 covers the reasoning gap. | Path encoder limitation — would need loop-invariant recovery |
 | **G3** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak | Needs per-field write coverage |
-| **Category I** — struct cast from server buffer with field reads before header size check; confirmed instance: `cifs_to_posix_acl` (fixed `9b2b3cda`); multi-cast variant (Gap P) needs alias analysis | LLM quota (tree-wide scan too expensive); alias analysis for multi-cast |
+| **Category I** — struct cast from server buffer with field reads before header size check; confirmed instance: `cifs_to_posix_acl` (fixed `9b2b3cda`); multi-cast variant (Gap P) needs alias analysis. Single-cast form now tractable with alias Step 2 complete. | LLM quota (tree-wide scan too expensive; implement with per-run limit or flag); alias analysis Step 3 for multi-cast |
 | **Category J** — server-reported transfer count not validated against requested length | New sink type needed (value-out-of-bounds, no memory sink) |
 | **Category K** — zero-length TLV / infinite loop (DoS) | Scope decision needed first |
 | **Category M** — `%s` over-read via printk/cifs_dbg | Format string parser needed |
@@ -47,7 +47,25 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-*(no immediate pending items — see deferred list for larger investments)*
+1. **Category I scanner (alias analysis Step 3)** — single-cast form: detect `(struct T *)server_buf` followed by `le16_to_cpu(ptr->field)` or provenance field read before a `received_len >= sizeof(T)` check. Steps 1+2 are prerequisites (done); implement as new Cat I in taint_scanner with a per-run count limit to manage LLM quota.
+
+## Alias analysis progress
+
+Six-step plan; steps 1–2 complete (not yet committed):
+
+| Step | Status | Description |
+|---|---|---|
+| 1 | **Done** | `_SERVER_RESPONSE_STRUCTS` frozenset + `_ptr_is_server_response()` helper + `var_type_map` threaded through `scan_files()`/`scan_function()` |
+| 2 | **Done** | Provenance taint sourcing: `u8 off = rsp->DataOffset` taints `off` via struct type (no endian helper needed); `_field_expr_ptr()` helper |
+| 3 | **Next** | Category I scanner — single-cast: struct cast from server buf, field read before header size check |
+| 4 | Deferred | Intra-procedural alias root tracking (`_alias_roots()`): `smb2_hdr *hdr = buf; smb2_read_rsp *rsp = buf` → same root |
+| 5 | Deferred | Category I multi-cast (Gap P): validation through one cast pointer, read through another alias |
+| 6 | Deferred | G3 field-write coverage: which struct fields are initialized before `copy_to_user` |
+
+**Key design decisions for alias analysis:**
+- Dual-use types (`smb2_hdr`, `smb2_pdu`, `smb_hdr`) excluded from `_SERVER_RESPONSE_STRUCTS` — type alone does not establish provenance; initialization-based provenance deferred to Step 4
+- `_field_expr_ptr` peels one cast level only (`(u8)rsp->field`) — deeper nesting returns None (conservative)
+- provenance findings use struct type name as `taint_source_fn` (e.g., `'smb2_read_rsp'`) — the `()` suffix in Stage 2 display is a known cosmetic issue, acceptable for now
 
 ## Constraints
 
@@ -59,6 +77,8 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Recently completed
 
+- **Alias analysis Step 2** — provenance-based taint sourcing: `u8 off = rsp->DataOffset` now taints `off` when `rsp` is declared as a type in `_SERVER_RESPONSE_STRUCTS`; `_field_expr_ptr()` helper peels one cast; `fp_provenance_local_struct` test confirms non-server structs are not tainted. Tests: 39/39 Stage 1, 37/37 provenance.
+- **Alias analysis Step 1** — `_SERVER_RESPONSE_STRUCTS` (21 SMBv2/SMB3 _rsp types + oplock/lease/transform), `_ptr_is_server_response()` helper, `build_var_type_map()` wired into `scan_files()`/`scan_function()` per function; `run_provenance.py` test harness.
 - **Stage 1.5** (caller enumeration) — `stages/stage1_5_callers.py`: for static functions with findings, scans all source files once (via `build_call_site_index`), identifies the taint-originating parameter, checks each call site for guards via one-hop variable derivation + `_find_guards_between`. Attaches `caller_context` (determinable, all_callers_guarded, call_sites[{guarded, guard_kind, snippet}]) to each finding. Wired into cli.py between Stage 1.7 and Stage 2; rendered in all three report formats. Stage 2 prompt item 2d added: LLM dismisses findings where all callers guard.
 - `prop_underflow` (Stage 1.7) — detects unsigned `A - B` subtraction (including under integer-promotion wrapping); `UGT(subtrahend, minuend)` produces a witness when no floor guard prevents wrap; UNSAT when a `total >= min` guard covers the path. Fixes misleading `safe: value is unsigned` from `prop_negative` for Gap S (subtraction-derived size at sink). Gap R (subtraction inside a loop body) remains not-modelled — loop clobber prevents BVSUB recovery at the post-loop sink.
 - `min()`/`min_t()`/`clamp()` ceiling guard recognition in `_find_guards_between` — `V = min(V, LIMIT)` now credits `possibly_guarded=True`; non-dominating guards correctly rejected
