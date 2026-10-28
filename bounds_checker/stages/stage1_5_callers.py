@@ -351,3 +351,117 @@ def find_call_sites(fn_name, paths, context_lines=5):
             })
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline: annotate a findings list
+# ---------------------------------------------------------------------------
+
+_OMIT_FROM_SITE = frozenset({'arg_names'})   # frozensets are not JSON-safe
+
+
+def annotate_findings(findings, paths):
+    """
+    Attach caller_context to each finding in the list, in place.
+
+    For static functions, caller_context includes:
+      determinable       — True
+      param_name         — the formal parameter that roots the taint, or None
+      param_idx          — 0-based index of that parameter, or None
+      call_site_count    — number of direct call sites found
+      all_callers_guarded — True iff every call site guards param before calling
+      call_sites         — list of per-site dicts (file, line, caller_fn,
+                           args, snippet, guarded, guard_kind)
+
+    For non-static or otherwise undeterminable functions:
+      determinable — False
+      reason       — short string explaining why
+
+    Call sites are found once per unique function name (cached), then
+    re-annotated for each finding in case different findings in the same
+    function have different taint-originating parameters.
+    """
+    # fn_name → raw call-site list (no guard annotation — copied per finding)
+    cs_cache = {}
+    # file_path → {'source': bytes, 'fns': {name: fn_info}}
+    file_cache = {}
+
+    for finding in findings:
+        fn_name  = finding.get('function')
+        filepath = finding.get('file')
+        if not fn_name or not filepath:
+            continue
+
+        # Parse the file that defines the function (cached).
+        if filepath not in file_cache:
+            try:
+                tree, source = parse_file(filepath)
+                file_cache[filepath] = {
+                    'source': source,
+                    'fns':    {f['name']: f for f in find_functions(tree, source)},
+                }
+            except Exception:
+                file_cache[filepath] = None
+
+        fdata = file_cache.get(filepath)
+        if not fdata:
+            finding['caller_context'] = {
+                'determinable': False, 'reason': 'parse-error',
+            }
+            continue
+
+        fn_info = fdata['fns'].get(fn_name)
+        if fn_info is None:
+            finding['caller_context'] = {
+                'determinable': False, 'reason': 'fn-not-found',
+            }
+            continue
+
+        source  = fdata['source']
+        fn_def  = fn_info['node']
+        fn_body = fn_info['body']
+
+        if not is_static_fn(fn_def, source):
+            finding['caller_context'] = {
+                'determinable': False, 'reason': 'not-static',
+            }
+            continue
+
+        # Which parameter does the taint originate from?
+        param_result = identify_taint_param(finding, fn_body, source)
+        param_name = param_result[0] if param_result else None
+        param_idx  = param_result[1] if param_result else None
+
+        # Call sites — cached; annotated on a per-finding copy.
+        if fn_name not in cs_cache:
+            cs_cache[fn_name] = find_call_sites(fn_name, paths)
+
+        raw_sites = cs_cache[fn_name]
+        if not raw_sites:
+            finding['caller_context'] = {
+                'determinable': False, 'reason': 'no-call-sites',
+                'param_name': param_name, 'param_idx': param_idx,
+            }
+            continue
+
+        cs = [dict(s) for s in raw_sites]   # shallow copy; values are immutable
+        annotate_with_guards(cs, param_idx)
+
+        all_guarded = (
+            param_idx is not None
+            and all(s.get('guarded') is True for s in cs)
+        )
+
+        finding['caller_context'] = {
+            'determinable':       True,
+            'param_name':         param_name,
+            'param_idx':          param_idx,
+            'call_site_count':    len(cs),
+            'all_callers_guarded': all_guarded,
+            'call_sites': [
+                {k: v for k, v in s.items() if k not in _OMIT_FROM_SITE}
+                for s in cs
+            ],
+        }
+
+    return findings

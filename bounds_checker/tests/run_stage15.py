@@ -17,6 +17,7 @@ from bounds_checker.parsers.taint_scanner import scan_files
 from bounds_checker.stages.stage1_5_callers import (
     find_call_sites, is_static_fn,
     fn_param_names, identify_taint_param, annotate_with_guards,
+    annotate_findings,
 )
 
 PROBE = Path(__file__).parent / 'probe_callers.c'
@@ -105,6 +106,40 @@ def run():
     annotate_with_guards(none_sites, param_idx=None)
     check('param_unknown guarded',      none_sites[0].get('guarded'),   None)
     check('param_unknown guard_kind',   none_sites[0].get('guard_kind'), 'param-unknown')
+
+    # ── Step C: annotate_findings ────────────────────────────────────────
+    all_findings = scan_files([str(PROBE)])
+    annotate_findings(all_findings, [PROBE])
+
+    by_fn = {}
+    for f in all_findings:
+        by_fn.setdefault(f['function'], []).append(f)
+
+    # static_helper: determinable, 2 call sites, NOT all guarded
+    sh = (by_fn.get('static_helper') or [{}])[0]
+    ctx = sh.get('caller_context', {})
+    check('sh ctx.determinable',       ctx.get('determinable'),       True)
+    check('sh ctx.call_site_count',    ctx.get('call_site_count'),    2)
+    check('sh ctx.all_callers_guarded', ctx.get('all_callers_guarded'), False)
+    check('sh ctx.param_name',         ctx.get('param_name'),         'h')
+    check('sh ctx has call_sites',     isinstance(ctx.get('call_sites'), list), True)
+    # call_sites should have guarded and guard_kind fields
+    site_by_caller = {s['caller_fn']: s for s in ctx.get('call_sites', [])}
+    check('sh site caller_guarded.guarded',   site_by_caller.get('caller_guarded',   {}).get('guarded'), True)
+    check('sh site caller_unguarded.guarded', site_by_caller.get('caller_unguarded', {}).get('guarded'), False)
+
+    # all_guarded_helper: determinable, 2 call sites, ALL guarded
+    ag = (by_fn.get('all_guarded_helper') or [{}])[0]
+    ctx_ag = ag.get('caller_context', {})
+    check('ag ctx.determinable',        ctx_ag.get('determinable'),        True)
+    check('ag ctx.call_site_count',     ctx_ag.get('call_site_count'),     2)
+    check('ag ctx.all_callers_guarded', ctx_ag.get('all_callers_guarded'), True)
+
+    # non_static_helper: not determinable (not static)
+    ns = (by_fn.get('non_static_helper') or [{}])[0]
+    ctx_ns = ns.get('caller_context', {})
+    check('ns ctx.determinable', ctx_ns.get('determinable'), False)
+    check('ns ctx.reason',       ctx_ns.get('reason'),       'not-static')
 
     print(f'\n{total - bad} pass, {bad} fail')
     return 1 if bad else 0

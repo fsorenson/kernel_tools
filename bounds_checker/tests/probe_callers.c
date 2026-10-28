@@ -49,3 +49,27 @@ void non_static_helper(struct hdr *h, u32 extra)
 	u16 len = le16_to_cpu(h->len);
 	(void)kmalloc(len + extra, GFP_KERNEL);
 }
+
+/* ── Static function where ALL callers guard before calling ── */
+
+static void *all_guarded_helper(struct hdr *h)
+{
+	u16 len = le16_to_cpu(h->len);
+	return kmalloc(len, GFP_KERNEL);
+}
+
+void caller_c_guarded(struct hdr *h)
+{
+	u16 len = le16_to_cpu(h->len);
+	if (len > 512)
+		return;
+	all_guarded_helper(h);
+}
+
+void caller_d_guarded(struct hdr *h)
+{
+	u16 len = le16_to_cpu(h->len);
+	if (len > 1024)
+		return;
+	all_guarded_helper(h);
+}
