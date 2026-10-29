@@ -468,3 +468,52 @@ void *fp_provenance_local_struct(struct local_state *s)
 	u8 off = s->offset;
 	return kmalloc(off, GFP_KERNEL);
 }
+
+/* ── Category I: struct field read before sizeof header size check ── */
+
+/*
+ * Bug: first field access on smb2_read_rsp before any sizeof check.
+ * The buffer may be shorter than the struct; reading DataOffset is an OOB read.
+ * Value is returned (not used in a sink) so this is a pure Cat I finding.
+ */
+int bug_I_field_before_sizeof(struct smb2_read_rsp *rsp, u32 recv_len)
+{
+	u8 off = rsp->DataOffset;    /* OOB: no sizeof check before this read */
+	if (recv_len < sizeof(struct smb2_read_rsp))
+		return -1;
+	return off;
+}
+
+/*
+ * Guarded: sizeof(struct smb2_read_rsp) check appears before the first
+ * field read — the buffer is guaranteed large enough.
+ */
+int guarded_I_sizeof_before_read(struct smb2_read_rsp *rsp, u32 recv_len)
+{
+	if (recv_len < sizeof(struct smb2_read_rsp))
+		return -1;
+	u8 off = rsp->DataOffset;
+	return off;
+}
+
+/*
+ * Guarded via sizeof(*rsp) — equivalent to sizeof(struct smb2_read_rsp).
+ * The scanner must recognise both forms.
+ */
+int guarded_I_sizeof_star_ptr(struct smb2_read_rsp *rsp, u32 recv_len)
+{
+	if (recv_len < sizeof(*rsp))
+		return -1;
+	u8 off = rsp->DataOffset;
+	return off;
+}
+
+/*
+ * local_state is NOT in _SERVER_RESPONSE_STRUCTS.
+ * Cat I must NOT fire — not a server-response struct.
+ */
+int fp_I_local_struct(struct local_state *s, u32 len)
+{
+	u8 off = s->offset;
+	return off;
+}

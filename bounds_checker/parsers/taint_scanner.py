@@ -2093,6 +2093,119 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None,
 
 
 # ---------------------------------------------------------------------------
+# Category I: struct field read before sizeof header size check
+# ---------------------------------------------------------------------------
+
+def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source):
+    """
+    True if there is an if_statement before before_line whose condition contains
+    sizeof(struct_type) or sizeof(*ptr_var).
+
+    Accepts both `sizeof(struct T)` (type_descriptor child) and `sizeof(*ptr)`
+    (text match for '*ptr_var' inside the sizeof expression).
+    """
+    for node in _walk(fn_body):
+        if node.type != 'if_statement':
+            continue
+        if node.start_point[0] + 1 >= before_line:
+            continue
+        cond = node.child_by_field_name('condition')
+        if cond is None:
+            continue
+        for n in _walk(cond):
+            if n.type != 'sizeof_expression':
+                continue
+            # sizeof(struct T) — look for type_descriptor child
+            td = next((c for c in n.children if c.type == 'type_descriptor'), None)
+            if td is not None:
+                td_text = node_text(td, source).strip()
+                if (td_text == struct_type
+                        or td_text == f'struct {struct_type}'
+                        or td_text.replace('struct ', '') == struct_type):
+                    return True
+            # sizeof(*ptr_var) — text match is simpler and correct
+            sz_text = node_text(n, source)
+            if f'*{ptr_var}' in sz_text or f'* {ptr_var}' in sz_text:
+                return True
+    return False
+
+
+def scan_cat_i(fn_name, fn_body, source, filepath, var_type_map):
+    """
+    Category I: field read from a server-response struct pointer before a
+    sizeof(struct T) header size check.
+
+    For each variable declared as a known server-response struct pointer, find
+    the first field access (`ptr->field`). If no sizeof guard appears before
+    that access, emit a Cat I finding.
+
+    Returns a list of finding dicts (one per server-response struct pointer
+    that has at least one field access in the function body).
+    """
+    if not var_type_map:
+        return []
+
+    findings = []
+
+    for ptr_var, struct_type in var_type_map.items():
+        if struct_type not in _SERVER_RESPONSE_STRUCTS:
+            continue
+
+        # Find the first ->field access on ptr_var
+        first_line = None
+        first_node = None
+        for node in _walk(fn_body):
+            if node.type != 'field_expression':
+                continue
+            obj = node.child_by_field_name('argument')
+            if obj is None or obj.type != 'identifier':
+                continue
+            if node_text(obj, source) != ptr_var:
+                continue
+            # Only arrow accesses (ptr->field), not dot accesses
+            has_arrow = any(
+                c.type == '->' for c in node.children
+            )
+            if not has_arrow:
+                continue
+            line = node.start_point[0] + 1
+            if first_line is None or line < first_line:
+                first_line = line
+                first_node = node
+
+        if first_node is None:
+            continue
+
+        guarded = _has_sizeof_guard(fn_body, ptr_var, struct_type, first_line, source)
+
+        field_id = first_node.child_by_field_name('field')
+        field_name = node_text(field_id, source) if field_id else '?'
+        snippet = get_source_line(source, first_line)
+
+        findings.append({
+            'function':         fn_name,
+            'file':             str(filepath),
+            'category':         'I',
+            'severity':         'medium',
+            'taint_source_fn':  struct_type,
+            'tainted_var':      ptr_var,
+            'taint_line':       first_line,
+            'taint_snippet':    snippet,
+            'sink_fn':          f'{ptr_var}->{field_name}',
+            'sink_line':        first_line,
+            'sink_snippet':     snippet,
+            'possibly_guarded': guarded,
+            'guard_kind':       'sizeof_check' if guarded else '',
+            'reason': (
+                f"Field read {ptr_var}->{field_name} from server-response struct "
+                f"{struct_type} before sizeof({struct_type}) header size check"
+            ),
+        })
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -2125,12 +2238,16 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
     vtm = build_var_type_map(fn_def_node, fn_body, source)
     findings, _ = _scan_body(fn_name, fn_body, source, filepath,
                               var_type_map=vtm)
+    findings.extend(scan_cat_i(fn_name, fn_body, source, filepath, vtm))
     return findings
 
 
-def scan_files(source_paths, verbose=False):
+def scan_files(source_paths, verbose=False, cat_i_limit=None):
     """
     Scan a list of source files and return all taint findings.
+
+    cat_i_limit: if set, cap the total number of Cat I findings returned
+        across all files.  Use when running tree-wide to manage LLM quota.
 
     Returns list of finding dicts (see scan_function for schema).
     """
@@ -2139,6 +2256,7 @@ def scan_files(source_paths, verbose=False):
     )
 
     all_findings = []
+    cat_i_count = 0
     for path in source_paths:
         try:
             tree, source = parse_file(path)
@@ -2153,6 +2271,12 @@ def scan_files(source_paths, verbose=False):
                 var_type_map=vtm,
             )
             all_findings.extend(findings)
+            if cat_i_limit is None or cat_i_count < cat_i_limit:
+                cat_i = scan_cat_i(fn['name'], fn['body'], source, path, vtm)
+                if cat_i_limit is not None:
+                    cat_i = cat_i[:cat_i_limit - cat_i_count]
+                cat_i_count += len(cat_i)
+                all_findings.extend(cat_i)
 
     return all_findings
 

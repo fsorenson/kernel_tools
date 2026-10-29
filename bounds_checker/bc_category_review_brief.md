@@ -67,6 +67,7 @@ actually used (a bare `memchr(buf, 0, len);` with no result check is not a guard
 | H (narrowing) | declaration / assignment | Tainted wide value stored into a narrower integer type; the truncated value is what later bounds checks see |
 | H (sign-conv) | declaration / assignment | Tainted unsigned value stored into a signed local of the **same width**; values with the MSB set become negative, bypassing `if (local > MAX)` ceiling checks.  Not emitted for conventional error-code variable names (`rc`, `ret`, `err`, etc.). |
 | L | `x << n` / `x >> n` | Tainted value used as the shift amount without a prior check that it is less than the type width — shifting by ≥ width is undefined behaviour in C |
+| I | `ptr->field` on a server-response struct | Field read from a known server-response struct pointer before a `sizeof(struct T)` or `sizeof(*ptr)` header size check; the read itself is OOB if the buffer is shorter than the struct.  Uses `_SERVER_RESPONSE_STRUCTS` provenance table.  `possibly_guarded=True` when a sizeof if-guard appears before the first field access.  Multi-cast variant (Gap P) deferred — requires alias analysis Step 5. |
 
 ### Cross-function pass
 
@@ -198,24 +199,16 @@ reasoning error observed in practice:
 - **G3** — `kmalloc` (not `kzalloc`) of a struct with padding, then
   `copy_to_user`: uninitialized-byte infoleak. Needs per-field write coverage.
 
-- **Category I** — struct cast from server buffer with field reads before the
-  header size check.  Pattern: `(struct T *)src` followed by `le16_to_cpu(ptr->field)`
-  reads before a `size_of_data_area >= sizeof(struct T)` check.  The scanner
-  treats those `le16_to_cpu` calls as taint SOURCES, never asking whether the
-  read itself is in bounds.  Confirmed instance: `cifs_to_posix_acl()` (fixed
-  `9b2b3cda`).  Stage 2 prompt item 12 covers the reasoning gap; scanner
-  detection requires a new category keyed on cast-from-response-buffer.
-  Deferred: tree-wide scan would surface hundreds of instances needing Stage 2
-  analysis against the monthly LLM quota.
+- **Category I (multi-cast / Gap P)** — the same field-before-sizeof pattern
+  where validation is done through one cast pointer (`smb2_hdr *hdr = buf`) and
+  the field read is done through a different-type cast of the same buffer
+  (`smb2_read_rsp *rsp = buf; rsp->DataLength`).  A length check via `hdr` may
+  or may not establish that `buf` is long enough to hold `smb2_read_rsp`; the
+  scanner cannot connect the two pointer names to the same memory without alias
+  analysis.  Deferred to alias analysis Step 5.  Stage 2 prompt item 12 covers
+  the reasoning gap.
 
-  *Multi-cast variant (Gap P):* The same pattern appears when validation is done
-  through one cast pointer (`smb2_hdr *hdr = buf`) and the field read is done
-  through a different-type cast of the same buffer (`smb2_read_rsp *rsp = buf;
-  rsp->DataLength`).  A length check via `hdr->Command` may or may not establish
-  that `buf` is long enough to hold `smb2_read_rsp`; if not, reading `rsp->DataLength`
-  is an OOB read, but the scanner has no way to connect the two pointer names to
-  the same memory without alias analysis.  Stage 2 prompt item 12 applies here
-  too; the alias aspect is out of scope for single-function-body analysis.
+  *Single-cast form now implemented* (see Cat I in the category table above).
 
 - **Category J** — server-reported transfer count not validated against the
   requested length.  The taint IS seeded (e.g., `written = le16_to_cpu(smb->Count)`)

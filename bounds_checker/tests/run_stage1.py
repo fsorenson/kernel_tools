@@ -106,6 +106,16 @@ EXPECTED = {
     'guarded_B_provenance_u8':      {'cat': 'B', 'guarded': True},
     # local_state is NOT in the table — no taint, no finding.
     'fp_provenance_local_struct':   'no_finding',
+
+    # ── Category I: field read before sizeof header check (alias Step 3) ──
+    # First field access before sizeof guard — Cat I unguarded.
+    'bug_I_field_before_sizeof':    {'cat': 'I', 'guarded': False},
+    # sizeof guard before first field read — Cat I guarded.
+    'guarded_I_sizeof_before_read': {'cat': 'I', 'guarded': True},
+    # sizeof(*rsp) form — also guarded.
+    'guarded_I_sizeof_star_ptr':    {'cat': 'I', 'guarded': True},
+    # local_state NOT in _SERVER_RESPONSE_STRUCTS — no Cat I.
+    'fp_I_local_struct':            'no_finding',
 }
 
 

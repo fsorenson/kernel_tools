@@ -1267,10 +1267,20 @@ def _format_findings(findings):
                 f"is structurally bounded (e.g. capped by a sizeof or a max-count "
                 f"constant), the destination check may already be satisfied.\n"
             )
+        elif f.get('category') == 'I':
+            entry += (
+                f"    Field read: {f['sink_fn']}  line {f['sink_line']}\n"
+                f"    Snippet:        {f['sink_snippet']}\n"
+                f"    Note: the field read itself is out-of-bounds if the buffer "
+                f"is shorter than sizeof({f['taint_source_fn']}). Check whether "
+                f"received_len >= sizeof(struct {f['taint_source_fn']}) is verified "
+                f"before this line.\n"
+            )
         else:
             entry += (
                 f"    Sink: {f['sink_fn']}()  line {f['sink_line']}  "
-                f"(arg {f['sink_arg_index']}, role={f['sink_arg_role']})\n"
+                f"(arg {f.get('sink_arg_index', '?')}, "
+                f"role={f.get('sink_arg_role', '?')})\n"
                 f"    Sink snippet:   {f['sink_snippet']}\n"
             )
         repeats = [n for n in f.get('sink_lines', ()) if n != f['sink_line']]

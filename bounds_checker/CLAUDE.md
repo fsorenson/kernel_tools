@@ -39,7 +39,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 |---|---|
 | **Gap R (remaining-length loop)** — `prop_underflow` covers Pattern 2 (straight-line subtraction) but NOT Pattern 1 (subtraction inside a loop body, where the path encoder clobbers loop-written variables so BVSUB is not visible at the post-loop sink). Stage 2 prompt item 14 covers the reasoning gap. | Path encoder limitation — would need loop-invariant recovery |
 | **G3** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak | Needs per-field write coverage |
-| **Category I** — struct cast from server buffer with field reads before header size check; confirmed instance: `cifs_to_posix_acl` (fixed `9b2b3cda`); multi-cast variant (Gap P) needs alias analysis. Single-cast form now tractable with alias Step 2 complete. | LLM quota (tree-wide scan too expensive; implement with per-run limit or flag); alias analysis Step 3 for multi-cast |
+| **Category I (multi-cast / Gap P)** — validation through one cast pointer, read through a different-type alias of the same buffer; scanner cannot connect them without alias analysis. | Alias analysis Step 5; Stage 2 prompt item 12 covers the gap |
 | **Category J** — server-reported transfer count not validated against requested length | New sink type needed (value-out-of-bounds, no memory sink) |
 | **Category K** — zero-length TLV / infinite loop (DoS) | Scope decision needed first |
 | **Category M** — `%s` over-read via printk/cifs_dbg | Format string parser needed |
@@ -47,17 +47,17 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. **Category I scanner (alias analysis Step 3)** — single-cast form: detect `(struct T *)server_buf` followed by `le16_to_cpu(ptr->field)` or provenance field read before a `received_len >= sizeof(T)` check. Steps 1+2 are prerequisites (done); implement as new Cat I in taint_scanner with a per-run count limit to manage LLM quota.
+1. **Run Cat I on fs/smb/client** — alias analysis Steps 1–3 are done; first real-world scan for OOB struct field reads. Use `--categories I` (and `cat_i_limit` in `scan_files` if needed) to cap LLM quota.
 
 ## Alias analysis progress
 
-Six-step plan; steps 1–2 complete (not yet committed):
+Six-step plan; steps 1–3 complete (not yet committed):
 
 | Step | Status | Description |
 |---|---|---|
 | 1 | **Done** | `_SERVER_RESPONSE_STRUCTS` frozenset + `_ptr_is_server_response()` helper + `var_type_map` threaded through `scan_files()`/`scan_function()` |
 | 2 | **Done** | Provenance taint sourcing: `u8 off = rsp->DataOffset` taints `off` via struct type (no endian helper needed); `_field_expr_ptr()` helper |
-| 3 | **Next** | Category I scanner — single-cast: struct cast from server buf, field read before header size check |
+| 3 | **Done** | Category I scanner — single-cast: `_has_sizeof_guard()` + `scan_cat_i()` in taint_scanner; `cat_i_limit` parameter on `scan_files`; Stage 2 formatting branch added; 43/43 Stage 1 tests |
 | 4 | Deferred | Intra-procedural alias root tracking (`_alias_roots()`): `smb2_hdr *hdr = buf; smb2_read_rsp *rsp = buf` → same root |
 | 5 | Deferred | Category I multi-cast (Gap P): validation through one cast pointer, read through another alias |
 | 6 | Deferred | G3 field-write coverage: which struct fields are initialized before `copy_to_user` |
@@ -77,6 +77,7 @@ Six-step plan; steps 1–2 complete (not yet committed):
 
 ## Recently completed
 
+- **Alias analysis Step 3** — Category I scanner (single-cast form): `_has_sizeof_guard()` checks for `sizeof(struct T)` or `sizeof(*ptr)` in an if_statement before the first field read; `scan_cat_i()` emits Cat I findings per server-response struct pointer; `cat_i_limit` param on `scan_files` caps tree-wide scan for LLM quota; Stage 2 formatting branch added; 43/43 Stage 1 tests.
 - **Alias analysis Step 2** — provenance-based taint sourcing: `u8 off = rsp->DataOffset` now taints `off` when `rsp` is declared as a type in `_SERVER_RESPONSE_STRUCTS`; `_field_expr_ptr()` helper peels one cast; `fp_provenance_local_struct` test confirms non-server structs are not tainted. Tests: 39/39 Stage 1, 37/37 provenance.
 - **Alias analysis Step 1** — `_SERVER_RESPONSE_STRUCTS` (21 SMBv2/SMB3 _rsp types + oplock/lease/transform), `_ptr_is_server_response()` helper, `build_var_type_map()` wired into `scan_files()`/`scan_function()` per function; `run_provenance.py` test harness.
 - **Stage 1.5** (caller enumeration) — `stages/stage1_5_callers.py`: for static functions with findings, scans all source files once (via `build_call_site_index`), identifies the taint-originating parameter, checks each call site for guards via one-hop variable derivation + `_find_guards_between`. Attaches `caller_context` (determinable, all_callers_guarded, call_sites[{guarded, guard_kind, snippet}]) to each finding. Wired into cli.py between Stage 1.7 and Stage 2; rendered in all three report formats. Stage 2 prompt item 2d added: LLM dismisses findings where all callers guard.
