@@ -19,7 +19,7 @@ KNOWN_MODELS = [
 
 
 # Ordered list used for range expansion in --categories / --llm-categories.
-_VALID_CATS = ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H', 'L']
+_VALID_CATS = ['A', 'B', 'C', 'D', 'E', 'F', 'G1', 'G2', 'H', 'I', 'L']
 _CAT_INDEX  = {c: i for i, c in enumerate(_VALID_CATS)}
 
 

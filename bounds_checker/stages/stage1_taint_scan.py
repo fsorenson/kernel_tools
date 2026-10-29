@@ -227,6 +227,8 @@ def _print_summary(findings_intra, findings_cross, findings_g, by_category, c_pa
             'G1': 'Cat G1 — copy_from/to_user return value unchecked (partial copy = success)',
             'G2': 'Cat G2 — unvalidated size argument to copy_from/to_user',
             'H':  'Cat H — server value → narrow integer type (silent truncation)',
+            'I':  'Cat I — struct field read before sizeof(struct T) header size check',
+            'L':  'Cat L — server value → shift amount (undefined behaviour if ≥ width)',
         }.get(cat, f'Cat {cat}')
         entries   = by_category[cat]
         intra_n   = sum(1 for f in entries if f.get('propagation') == 'intra')
