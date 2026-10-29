@@ -232,8 +232,8 @@ def _build_context(run_dir, s1, s2):
                 'sink_fn':         s1f['sink_fn'],
                 'sink_line':       s1f['sink_line'],
                 'sink_snippet':    s1f['sink_snippet'],
-                'sink_arg_index':  s1f['sink_arg_index'],
-                'sink_arg_role':   s1f['sink_arg_role'],
+                'sink_arg_index':  s1f.get('sink_arg_index'),
+                'sink_arg_role':   s1f.get('sink_arg_role', ''),
                 'src_width':       s1f.get('src_width'),
                 'dest_width':      s1f.get('dest_width'),
                 'dest_type':       s1f.get('dest_type', ''),
@@ -523,6 +523,8 @@ def _md_finding(buf, r, has_llm):
     elif role == 'unvalidated_size':
         W(f"| Unvalidated size | `{r['sink_fn']}()` arg {r['sink_arg_index']} line {r['sink_line']} — "
           f"size `{r['tainted_var']}` |")
+    elif r.get('category') == 'I':
+        W(f"| Field read | `{r['sink_fn']}` line {r['sink_line']} |")
     elif xfn:
         W(f"| Sink (in callee) | `{r['sink_fn']}()` line {r['sink_line']} (arg {r['sink_arg_index']}, role={role}) |")
     else:
@@ -725,6 +727,8 @@ def _fn_copy_text(s, has_llm):
             )
         elif role == 'loop_bound':
             parts.append(f"  Loop bound: {r['sink_fn']} line {r['sink_line']}")
+        elif r.get('category') == 'I':
+            parts.append(f"  Field read: {r['sink_fn']} line {r['sink_line']}")
         else:
             parts.append(f"  Sink: {r['sink_fn']}() line {r['sink_line']}")
         parts.append(f"  Sink snippet:  {r['sink_snippet']}")
@@ -1007,6 +1011,9 @@ def _html_finding(lines, r, has_llm):
         W(f'<tr><th>Unvalidated size</th><td>'
           f'<code>{_e(r["sink_fn"])}()</code> arg {r["sink_arg_index"]} '
           f'line {r["sink_line"]} &mdash; size <code>{_e(r["tainted_var"])}</code></td></tr>')
+    elif r.get('category') == 'I':
+        W(f'<tr><th>Field read</th><td>'
+          f'<code>{_e(r["sink_fn"])}</code> line {r["sink_line"]}</td></tr>')
     elif xfn:
         W(f'<tr><th>Sink (in callee)</th><td>'
           f'<code>{_e(r["sink_fn"])}()</code> line {r["sink_line"]} '
