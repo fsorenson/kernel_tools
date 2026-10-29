@@ -138,7 +138,13 @@ def run(cfg, run_dir, verbose=False, write_report=True):
     # Build a human-readable label for what we're scanning.
     _scan_targets = list(source_dirs) + [str(p) for p in source_paths]
     _pfx_intra = f"  Scanning {len(c_paths)} file(s) in {', '.join(_scan_targets)} ..."
-    findings_intra = scan_files(_progress_wrap(c_paths, _pfx_intra, verbose), verbose=verbose)
+    # Skip Cat I sub-scan when 'I' is not in the requested categories (efficiency).
+    _run_cat_i = not cats or 'I' in cats
+    findings_intra = scan_files(
+        _progress_wrap(c_paths, _pfx_intra, verbose),
+        verbose=verbose,
+        _run_cat_i=_run_cat_i,
+    )
     for f in findings_intra:
         f['propagation'] = 'intra'
 
@@ -168,6 +174,16 @@ def run(cfg, run_dir, verbose=False, write_report=True):
         )
 
     all_findings = findings_intra + findings_cross + findings_g
+
+    # Filter to only the requested categories so the output and report are focused.
+    # When cats is empty (no --categories given, default config covers all) the
+    # config default list is already set to the desired set, so filter applies there
+    # too — unrecognised or new categories are excluded until added to the default.
+    if cats:
+        all_findings   = [f for f in all_findings   if f['category'] in cats]
+        findings_intra = [f for f in findings_intra if f['category'] in cats]
+        findings_cross = [f for f in findings_cross if f['category'] in cats]
+        findings_g     = [f for f in findings_g     if f['category'] in cats]
 
     # Categorize counts
     by_category = {}

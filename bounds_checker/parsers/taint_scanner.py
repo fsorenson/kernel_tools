@@ -2242,12 +2242,14 @@ def scan_function(fn_name, fn_def_node, fn_body, source, filepath):
     return findings
 
 
-def scan_files(source_paths, verbose=False, cat_i_limit=None):
+def scan_files(source_paths, verbose=False, cat_i_limit=None, _run_cat_i=True):
     """
     Scan a list of source files and return all taint findings.
 
     cat_i_limit: if set, cap the total number of Cat I findings returned
         across all files.  Use when running tree-wide to manage LLM quota.
+    _run_cat_i: set to False to skip the Cat I sub-scan entirely (when 'I'
+        is not in the requested categories).
 
     Returns list of finding dicts (see scan_function for schema).
     """
@@ -2271,7 +2273,7 @@ def scan_files(source_paths, verbose=False, cat_i_limit=None):
                 var_type_map=vtm,
             )
             all_findings.extend(findings)
-            if cat_i_limit is None or cat_i_count < cat_i_limit:
+            if _run_cat_i and (cat_i_limit is None or cat_i_count < cat_i_limit):
                 cat_i = scan_cat_i(fn['name'], fn['body'], source, path, vtm)
                 if cat_i_limit is not None:
                     cat_i = cat_i[:cat_i_limit - cat_i_count]
