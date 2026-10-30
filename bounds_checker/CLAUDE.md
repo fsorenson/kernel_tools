@@ -38,7 +38,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 | Item | Prerequisite / blocker |
 |---|---|
 | **Gap R (remaining-length loop)** — `prop_underflow` covers Pattern 2 (straight-line subtraction) but NOT Pattern 1 (subtraction inside a loop body, where the path encoder clobbers loop-written variables so BVSUB is not visible at the post-loop sink). Stage 2 prompt item 14 covers the reasoning gap. | Path encoder limitation — would need loop-invariant recovery |
-| **G3** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak | Needs per-field write coverage |
+| **G3 (per-field coverage)** — currently detects struct-level infoleak (kmalloc + copy_to_user without zeroing); true per-field coverage (which specific fields are written vs. uninitialized) not yet implemented | Needs field-definition parsing to know total field list |
 | **Category I (multi-cast / Gap P)** — validation through one cast pointer, read through a different-type alias of the same buffer; scanner cannot connect them without alias analysis. | Alias analysis Step 5; Stage 2 prompt item 12 covers the gap |
 | **Category J** — server-reported transfer count not validated against requested length | New sink type needed (value-out-of-bounds, no memory sink) |
 | **Category K** — zero-length TLV / infinite loop (DoS) | Scope decision needed first |
@@ -47,8 +47,12 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. **Alias analysis Step 6 (G3)** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak: needs per-field write coverage to determine which padding bytes are uninitialized.
-2. **Stage 2 LLM run on Cat I** — 62 Cat I findings in fs/smb/client (59 unguarded); use `--categories I --llm` to triage with the size table context in Stage 2 prompt.
+1. **Stage 2 LLM run on Cat I** — 62 Cat I findings in fs/smb/client (59 unguarded); use `--categories I --llm` to triage. The Stage 2 prompt should note that the receiver path validates minimum message sizes before dispatching (to assess whether individual functions can assume the buffer is already validated).
+2. **Wider G3 scan** — G3 finds 0 in fs/smb/client (modern CIFS uses kzalloc); try `--categories G3` on other subsystems with ioctl-heavy code (e.g., drivers/gpu/drm, net/).
+
+## Alias analysis — COMPLETE
+
+All 6 steps done (not yet committed as separate commits).
 
 ## Alias analysis progress
 
@@ -61,7 +65,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 | 3 | **Done** | Category I scanner — single-cast: `_has_sizeof_guard()` + `scan_cat_i()` in taint_scanner; `cat_i_limit` parameter on `scan_files`; Stage 2 formatting branch added; 43/43 Stage 1 tests |
 | 4 | **Done** | Alias root tracking: `_peel_casts()` + `_alias_roots()` build `{var: root_text}`; `_has_sizeof_guard` extended to credit same-root same-type aliases; 45/45 Stage 1 tests |
 | 5 | **Done** | Cross-type alias guards: `_alias_roots` now returns `{var: frozenset_of_roots}` + tracks assignment expressions; `_SMB2_STRUCT_MIN_BYTES` size table; `_has_sizeof_guard` credits larger-type alias guards; 48/48 Stage 1 tests |
-| 6 | Deferred | G3 field-write coverage: which struct fields are initialized before `copy_to_user` |
+| 6 | **Done** | G3 scanner: `scan_g3()` + `scan_g3_files()` detect `kmalloc`-allocated structs (unzeroed) passed to `copy_to_user`; kzalloc and `memset(p, 0, ...)` suppress the finding; field-write heuristic avoids raw-buffer FPs; 52/52 Stage 1 tests. Zero findings in fs/smb/client (modern code uses kzalloc). |
 
 **Key design decisions for alias analysis:**
 - Dual-use types (`smb2_hdr`, `smb2_pdu`, `smb_hdr`) excluded from `_SERVER_RESPONSE_STRUCTS` — type alone does not establish provenance; initialization-based provenance deferred to Step 4
@@ -78,6 +82,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 
 ## Recently completed
 
+- **Alias analysis Step 6 (G3)** — `scan_g3()` + `scan_g3_files()` in `taint_scanner.py`: detects `kmalloc`/`kvmalloc`/`vmalloc`-allocated struct pointers passed to `copy_to_user` without prior zeroing (`kzalloc` or `memset(p, 0, ...)`); field-write heuristic (`p->field = value` must exist) avoids flagging raw buffer copies; wired into `stage1_taint_scan.py` (same pattern as G1/G2), `config.py`, `cli.py`, `report.py` (3 render formats); 4 test cases (bug, fp_kzalloc, fp_memset, fp_no_field_writes), 52/52 Stage 1 tests. Zero findings in fs/smb/client and fs/ tree (modern kernel code uses kzalloc for structs copied to userspace).
 - **Alias analysis Step 5** — cross-type alias guards: `_alias_roots` refactored to return `{var: frozenset_of_roots}` and now also tracks `ptr = expr` assignment expressions (handles NULL-init-then-assign pattern); `_SMB2_STRUCT_MIN_BYTES` size table (22 SMBv2/SMB3 struct types, sizes verified from smb2pdu.h); `_has_sizeof_guard` extended to credit sizeof guards on larger-type aliases via set intersection + size comparison; 3 new test cases (cross-type larger guard, cross-type smaller guard, assignment alias); 48/48 Stage 1 tests. Real scan unchanged (no larger-type cross-type alias guards exist in fs/smb/client).
 - **Alias analysis Step 4** — alias root tracking: `_peel_casts()` strips cast/paren wrappers; `_alias_roots(fn_body, source)` builds `{var_name: root_text}` from init_declarator nodes; `_has_sizeof_guard` extended to credit `sizeof(*alias_var)` guards when `alias_var` shares the same root buffer and same struct type as `ptr_var`. Real CIFS scan unchanged (no same-root same-type alias patterns exist in the codebase). 45/45 Stage 1 tests.
 - **Alias analysis Step 3** — Category I scanner (single-cast form): `_has_sizeof_guard()` checks for `sizeof(struct T)` or `sizeof(*ptr)` in an if_statement before the first field read; `scan_cat_i()` emits Cat I findings per server-response struct pointer; `cat_i_limit` param on `scan_files` caps tree-wide scan for LLM quota; Stage 2 formatting branch added; 43/43 Stage 1 tests.

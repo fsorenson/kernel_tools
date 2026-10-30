@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 from bounds_checker.parsers.taint_scanner import (
-    scan_files, scan_copy_user_files, TAINT_SOURCES, DANGEROUS_SINKS,
+    scan_files, scan_copy_user_files, scan_g3_files,
+    TAINT_SOURCES, DANGEROUS_SINKS,
 )
 from bounds_checker.parsers.cross_function import build_param_sink_map, scan_cross_function_calls
 from bounds_checker.report import write_reports
@@ -173,17 +174,23 @@ def run(cfg, run_dir, verbose=False, write_report=True):
             _progress_wrap(c_paths, _pfx_g, verbose), active_g, verbose=verbose
         )
 
-    all_findings = findings_intra + findings_cross + findings_g
+    # G3: kmalloc'd struct with unzeroed padding → copy_to_user infoleak
+    findings_g3 = []
+    if not cats or 'G3' in cats:
+        _pfx_g3 = f"  Scanning for G3 (kmalloc + copy_to_user infoleak) ..."
+        findings_g3 = scan_g3_files(
+            _progress_wrap(c_paths, _pfx_g3, verbose), verbose=verbose
+        )
+
+    all_findings = findings_intra + findings_cross + findings_g + findings_g3
 
     # Filter to only the requested categories so the output and report are focused.
-    # When cats is empty (no --categories given, default config covers all) the
-    # config default list is already set to the desired set, so filter applies there
-    # too — unrecognised or new categories are excluded until added to the default.
     if cats:
         all_findings   = [f for f in all_findings   if f['category'] in cats]
         findings_intra = [f for f in findings_intra if f['category'] in cats]
         findings_cross = [f for f in findings_cross if f['category'] in cats]
         findings_g     = [f for f in findings_g     if f['category'] in cats]
+        findings_g3    = [f for f in findings_g3    if f['category'] in cats]
 
     # Categorize counts
     by_category = {}
@@ -191,7 +198,8 @@ def run(cfg, run_dir, verbose=False, write_report=True):
         cat = f['category']
         by_category.setdefault(cat, []).append(f)
 
-    _print_summary(findings_intra, findings_cross, findings_g, by_category, c_paths)
+    _print_summary(findings_intra, findings_cross, findings_g + findings_g3,
+                   by_category, c_paths)
 
     output = {
         'stage':                'taint_scan',
@@ -202,7 +210,7 @@ def run(cfg, run_dir, verbose=False, write_report=True):
         'findings_count':       len(all_findings),
         'findings_intra':       len(findings_intra),
         'findings_cross':       len(findings_cross),
-        'findings_g':           len(findings_g),
+        'findings_g':           len(findings_g) + len(findings_g3),
         'findings':             all_findings,
     }
 
@@ -242,6 +250,7 @@ def _print_summary(findings_intra, findings_cross, findings_g, by_category, c_pa
             'F':  'Cat F — server value → loop iteration count',
             'G1': 'Cat G1 — copy_from/to_user return value unchecked (partial copy = success)',
             'G2': 'Cat G2 — unvalidated size argument to copy_from/to_user',
+            'G3': 'Cat G3 — kmalloc struct (unzeroed padding) passed to copy_to_user (infoleak)',
             'H':  'Cat H — server value → narrow integer type (silent truncation)',
             'I':  'Cat I — struct field read before sizeof(struct T) header size check',
             'L':  'Cat L — server value → shift amount (undefined behaviour if ≥ width)',

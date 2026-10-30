@@ -2689,3 +2689,174 @@ def scan_copy_user_files(source_paths, cats, verbose=False):
                 _scan_fn_copy_user(fn['body'], fn['name'], source, path, cats)
             )
     return all_findings
+
+
+# ---------------------------------------------------------------------------
+# Category G3: kmalloc'd struct with unzeroed padding → copy_to_user infoleak
+# ---------------------------------------------------------------------------
+
+# Allocators that explicitly zero the allocated memory (padding included).
+_ZEROING_ALLOC_FNS = frozenset({
+    'kzalloc', 'kvzalloc', 'vzalloc', 'kzalloc_node', 'devm_kzalloc',
+})
+
+# Values that indicate a zero fill in memset's second argument.
+_ZERO_FILL_VALS = frozenset({'0', "'\\0'", '0U', '0UL', '(u8)0'})
+
+
+def scan_g3(fn_name, fn_body, source, filepath):
+    """
+    Category G3: struct allocated with kmalloc (unzeroed) then passed to
+    copy_to_user, potentially exposing padding bytes as an infoleak.
+
+    Detection criteria (all must hold):
+    1. ptr allocated by a non-zeroing allocator (kmalloc family, not kzalloc).
+    2. No memset(ptr, 0, ...) call between the allocation and the copy.
+    3. At least one ptr->field write (indicates struct-field usage pattern,
+       distinguishing struct copies from raw buffer copies).
+    4. copy_to_user(dst, ptr, ...) call after the allocation.
+
+    kzalloc / memset(ptr, 0, ...) are sufficient safeguards because they
+    zero padding bytes as well as named fields.
+    """
+    allocs = {}         # var -> {'zeroed': bool, 'line': int, 'fn': str, 'snippet': str}
+    memsets = {}        # var -> zeroing_line (first memset(var, 0, ...) seen)
+    field_writes = {}   # var -> first_write_line
+    copies = []         # (src_var, copy_line, copy_snippet, copy_fn)
+
+    for node in _walk(fn_body):
+        nline = node.start_point[0] + 1
+
+        # ── allocation in init_declarator: struct T *ptr = kmalloc(...) ──
+        if node.type == 'declaration':
+            for child in node.children:
+                if child.type != 'init_declarator' or len(child.children) < 3:
+                    continue
+                decl = child.children[0]
+                if decl.type != 'pointer_declarator':
+                    continue
+                ident = next(
+                    (node_text(n, source) for n in _walk(decl) if n.type == 'identifier'),
+                    None,
+                )
+                if ident is None:
+                    continue
+                rhs = _peel_casts(child.children[2])
+                if rhs and rhs.type == 'call_expression':
+                    fn_nm = _g_get_callee(rhs, source)
+                    if fn_nm in _ALLOC_FNS:
+                        allocs[ident] = {
+                            'zeroed': fn_nm in _ZEROING_ALLOC_FNS,
+                            'line':   nline,
+                            'fn':     fn_nm,
+                            'snippet': get_source_line(source, nline),
+                        }
+
+        elif node.type == 'assignment_expression':
+            lhs = node.child_by_field_name('left')
+            rhs_raw = node.child_by_field_name('right')
+            if lhs is None or rhs_raw is None:
+                continue
+
+            # ── allocation via assignment: ptr = kmalloc(...) ──
+            if lhs.type == 'identifier':
+                var = node_text(lhs, source)
+                rhs = _peel_casts(rhs_raw)
+                if rhs and rhs.type == 'call_expression':
+                    fn_nm = _g_get_callee(rhs, source)
+                    if fn_nm in _ALLOC_FNS:
+                        allocs[var] = {
+                            'zeroed': fn_nm in _ZEROING_ALLOC_FNS,
+                            'line':   nline,
+                            'fn':     fn_nm,
+                            'snippet': get_source_line(source, nline),
+                        }
+
+            # ── field write: ptr->field = value ──
+            if lhs.type == 'field_expression':
+                obj = lhs.child_by_field_name('argument')
+                if obj and obj.type == 'identifier':
+                    ptr_var = node_text(obj, source)
+                    if ptr_var not in field_writes:
+                        field_writes[ptr_var] = nline
+
+        elif node.type == 'call_expression':
+            fn_nm = _g_get_callee(node, source)
+            args = _arg_nodes(node)
+
+            # ── memset(ptr, 0, size) → marks ptr as zeroed ──
+            if fn_nm == 'memset' and len(args) >= 2:
+                ptr_arg = _peel_casts(args[0])
+                fill_text = node_text(args[1], source).strip()
+                if (ptr_arg and ptr_arg.type == 'identifier'
+                        and fill_text in _ZERO_FILL_VALS):
+                    var = node_text(ptr_arg, source)
+                    if var not in memsets:
+                        memsets[var] = nline
+
+            # ── copy_to_user(dst, src, size) → potential G3 sink ──
+            if fn_nm in ('copy_to_user', '__copy_to_user') and len(args) >= 2:
+                src_arg = _peel_casts(args[1])
+                if src_arg and src_arg.type == 'identifier':
+                    copies.append((node_text(src_arg, source), nline,
+                                   get_source_line(source, nline), fn_nm))
+
+    findings = []
+    for src_var, copy_line, copy_snippet, copy_fn in copies:
+        if src_var not in allocs:
+            continue
+        info = allocs[src_var]
+        if info['line'] >= copy_line:
+            continue  # allocation after copy — skip
+
+        if info['zeroed']:
+            continue  # kzalloc etc. zeroes padding — safe
+
+        if src_var in memsets and memsets[src_var] < copy_line:
+            continue  # explicit memset(ptr, 0, ...) before copy — safe
+
+        # Require at least one field write before the copy (struct usage pattern).
+        if src_var not in field_writes or field_writes[src_var] >= copy_line:
+            continue
+
+        findings.append({
+            'function':         fn_name,
+            'file':             str(filepath),
+            'category':         'G3',
+            'severity':         'medium',
+            'taint_source_fn':  info['fn'],
+            'tainted_var':      src_var,
+            'taint_line':       info['line'],
+            'taint_snippet':    info['snippet'],
+            'sink_fn':          copy_fn,
+            'sink_line':        copy_line,
+            'sink_snippet':     copy_snippet,
+            'sink_arg_index':   1,
+            'sink_arg_role':    'g3_src_ptr',
+            'possibly_guarded': False,
+            'guard_kind':       '',
+            'reason': (
+                f"{src_var} allocated with {info['fn']}() (unzeroed) "
+                f"and passed to {copy_fn}(); struct padding bytes "
+                f"between fields may expose stale kernel memory to userspace"
+            ),
+        })
+
+    return findings
+
+
+def scan_g3_files(source_paths, verbose=False):
+    """Scan source files for Category G3 (kmalloc + copy_to_user infoleak)."""
+    from kernel_analysis.parsers.c_parser import parse_file, find_functions
+
+    all_findings = []
+    for path in source_paths:
+        try:
+            tree, source = parse_file(path)
+        except Exception as e:
+            if verbose:
+                print(f"  [skip {path}: {e}]")
+            continue
+        for fn in find_functions(tree, source):
+            all_findings.extend(scan_g3(fn['name'], fn['body'], source, path))
+    return all_findings

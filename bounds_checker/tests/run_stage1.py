@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from bounds_checker.parsers.taint_scanner import scan_files, scan_copy_user_files
+from bounds_checker.parsers.taint_scanner import scan_files, scan_copy_user_files, scan_g3_files
 
 PROBE = Path(__file__).parent / 'probe_stage1.c'
 
@@ -74,6 +74,12 @@ EXPECTED = {
     # ── Category G2 ─────────────────────────────────────────────────────────
     'bug_G2_unvalidated_size':      {'cat': 'G2', 'guarded': False},
     'fp_G2_bounded':                'no_finding',
+
+    # ── Category G3 — kmalloc + copy_to_user infoleak ───────────────────────
+    'bug_G3_kmalloc_struct':        {'cat': 'G3', 'guarded': False},
+    'fp_G3_kzalloc':                'no_finding',   # kzalloc zeroes padding
+    'fp_G3_memset':                 'no_finding',   # memset(0) before copy
+    'fp_G3_no_field_writes':        'no_finding',   # no struct field usage
 
     # ── Category H ──────────────────────────────────────────────────────────
     'bug_H_u32_to_u16':             {'cat': 'H', 'guarded': False},
@@ -134,11 +140,13 @@ EXPECTED = {
 
 
 def run():
-    # Stage 1 taint scanner (A, B, C, D, E, F, H, L)
+    # Stage 1 taint scanner (A, B, C, D, E, F, H, I, L)
     findings = scan_files([str(PROBE)])
     # G1/G2 live in a separate scanner pass
     findings += scan_copy_user_files(
         [str(PROBE)], cats={'G1', 'G2'})
+    # G3: kmalloc + copy_to_user infoleak
+    findings += scan_g3_files([str(PROBE)])
 
     # Group by (function, category)
     by_fn_cat = defaultdict(list)

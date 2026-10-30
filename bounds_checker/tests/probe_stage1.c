@@ -322,6 +322,60 @@ long fp_G2_bounded(void *user_buf, u16 len)
 	return copy_to_user(user_buf, kbuf, len);
 }
 
+/* ── Category G3: kmalloc'd struct with unzeroed padding → copy_to_user ── */
+
+struct padded { u32 a; u8 b; /* 3 bytes compiler padding here */ u32 c; };
+
+/*
+ * Bug: kmalloc (not kzalloc) + field writes + copy_to_user.
+ * Compiler padding bytes between 'b' and 'c' remain uninitialized.
+ */
+int bug_G3_kmalloc_struct(void *user_buf)
+{
+	struct padded *p = kmalloc(sizeof(*p), GFP_KERNEL);
+	if (!p) return -1;
+	p->a = 1;
+	p->b = 2;
+	p->c = 3;
+	return copy_to_user(user_buf, p, sizeof(*p));
+}
+
+/*
+ * Safe: kzalloc zeroes the entire allocation including padding bytes.
+ */
+int fp_G3_kzalloc(void *user_buf)
+{
+	struct padded *p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p) return -1;
+	p->a = 1;
+	p->c = 3;
+	return copy_to_user(user_buf, p, sizeof(*p));
+}
+
+/*
+ * Safe: explicit memset(p, 0, ...) before copy_to_user zeroes padding.
+ */
+int fp_G3_memset(void *user_buf)
+{
+	struct padded *p = kmalloc(sizeof(*p), GFP_KERNEL);
+	if (!p) return -1;
+	memset(p, 0, sizeof(*p));
+	p->a = 1;
+	return copy_to_user(user_buf, p, sizeof(*p));
+}
+
+/*
+ * No field writes — raw buffer copy, not a struct field pattern.
+ * G3 must NOT fire (heuristic: field writes required).
+ */
+int fp_G3_no_field_writes(void *user_buf)
+{
+	u8 *buf = kmalloc(32, GFP_KERNEL);
+	if (!buf) return -1;
+	/* no buf->field writes — not a struct field usage */
+	return copy_to_user(user_buf, buf, 32);
+}
+
 /* ── Category H: wide server value truncated to narrower LOCAL variable ── */
 
 /* 32-bit server value stored into a declared 16-bit local variable */
