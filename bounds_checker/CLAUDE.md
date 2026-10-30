@@ -47,7 +47,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. **Run Cat I on fs/smb/client** — alias analysis Steps 1–3 are done; first real-world scan for OOB struct field reads. Use `--categories I` (and `cat_i_limit` in `scan_files` if needed) to cap LLM quota.
+1. **Alias analysis Step 5** — Cat I multi-cast (Gap P): validation through one cast pointer, read through a different-type alias of the same buffer. Requires struct-size comparison to determine if the guard covers the read type. Prerequisite: Steps 1–4 done.
 
 ## Alias analysis progress
 
@@ -58,7 +58,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 | 1 | **Done** | `_SERVER_RESPONSE_STRUCTS` frozenset + `_ptr_is_server_response()` helper + `var_type_map` threaded through `scan_files()`/`scan_function()` |
 | 2 | **Done** | Provenance taint sourcing: `u8 off = rsp->DataOffset` taints `off` via struct type (no endian helper needed); `_field_expr_ptr()` helper |
 | 3 | **Done** | Category I scanner — single-cast: `_has_sizeof_guard()` + `scan_cat_i()` in taint_scanner; `cat_i_limit` parameter on `scan_files`; Stage 2 formatting branch added; 43/43 Stage 1 tests |
-| 4 | Deferred | Intra-procedural alias root tracking (`_alias_roots()`): `smb2_hdr *hdr = buf; smb2_read_rsp *rsp = buf` → same root |
+| 4 | **Done** | Alias root tracking: `_peel_casts()` + `_alias_roots()` build `{var: root_text}`; `_has_sizeof_guard` extended to credit same-root same-type aliases; 45/45 Stage 1 tests |
 | 5 | Deferred | Category I multi-cast (Gap P): validation through one cast pointer, read through another alias |
 | 6 | Deferred | G3 field-write coverage: which struct fields are initialized before `copy_to_user` |
 
@@ -77,6 +77,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 
 ## Recently completed
 
+- **Alias analysis Step 4** — alias root tracking: `_peel_casts()` strips cast/paren wrappers; `_alias_roots(fn_body, source)` builds `{var_name: root_text}` from init_declarator nodes; `_has_sizeof_guard` extended to credit `sizeof(*alias_var)` guards when `alias_var` shares the same root buffer and same struct type as `ptr_var`. Real CIFS scan unchanged (no same-root same-type alias patterns exist in the codebase). 45/45 Stage 1 tests.
 - **Alias analysis Step 3** — Category I scanner (single-cast form): `_has_sizeof_guard()` checks for `sizeof(struct T)` or `sizeof(*ptr)` in an if_statement before the first field read; `scan_cat_i()` emits Cat I findings per server-response struct pointer; `cat_i_limit` param on `scan_files` caps tree-wide scan for LLM quota; Stage 2 formatting branch added; 43/43 Stage 1 tests.
 - **Alias analysis Step 2** — provenance-based taint sourcing: `u8 off = rsp->DataOffset` now taints `off` when `rsp` is declared as a type in `_SERVER_RESPONSE_STRUCTS`; `_field_expr_ptr()` helper peels one cast; `fp_provenance_local_struct` test confirms non-server structs are not tainted. Tests: 39/39 Stage 1, 37/37 provenance.
 - **Alias analysis Step 1** — `_SERVER_RESPONSE_STRUCTS` (21 SMBv2/SMB3 _rsp types + oplock/lease/transform), `_ptr_is_server_response()` helper, `build_var_type_map()` wired into `scan_files()`/`scan_function()` per function; `run_provenance.py` test harness.

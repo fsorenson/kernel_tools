@@ -116,6 +116,12 @@ EXPECTED = {
     'guarded_I_sizeof_star_ptr':    {'cat': 'I', 'guarded': True},
     # local_state NOT in _SERVER_RESPONSE_STRUCTS — no Cat I.
     'fp_I_local_struct':            'no_finding',
+
+    # ── Alias root tracking (alias Step 4) ──────────────────────────────
+    # sizeof(*alias) guards rsp via same root buffer — guarded.
+    'guarded_I_sizeof_via_alias':     {'cat': 'I', 'guarded': True},
+    # alias cast from different buffer — guard does not cross to rsp.
+    'bug_I_alias_different_root':     {'cat': 'I', 'guarded': False},
 }
 
 

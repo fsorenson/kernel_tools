@@ -517,3 +517,32 @@ int fp_I_local_struct(struct local_state *s, u32 len)
 	u8 off = s->offset;
 	return off;
 }
+
+/* ── Category I: alias root tracking (Step 4) ── */
+
+/*
+ * Two same-type pointers cast from the same buffer.
+ * sizeof guard references the alias variable, not rsp directly.
+ * Step 4 must credit the guard via alias root matching.
+ */
+int guarded_I_sizeof_via_alias(char *buf, u32 recv_len)
+{
+	struct smb2_read_rsp *alias = (struct smb2_read_rsp *)buf;
+	struct smb2_read_rsp *rsp   = (struct smb2_read_rsp *)buf;
+	if (recv_len < sizeof(*alias))   /* guard references alias, not rsp */
+		return -1;
+	return rsp->DataOffset;           /* guarded via same-root alias */
+}
+
+/*
+ * Two pointers cast from DIFFERENT buffers — alias guard does not apply.
+ * sizeof(*alias) guards buf2, not buf; rsp->DataOffset is still unguarded.
+ */
+int bug_I_alias_different_root(char *buf, char *buf2, u32 recv_len)
+{
+	struct smb2_read_rsp *alias = (struct smb2_read_rsp *)buf2;
+	struct smb2_read_rsp *rsp   = (struct smb2_read_rsp *)buf;
+	if (recv_len < sizeof(*alias))   /* guards buf2, not buf */
+		return -1;
+	return rsp->DataOffset;           /* unguarded — different root */
+}

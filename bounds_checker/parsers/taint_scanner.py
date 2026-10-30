@@ -361,6 +361,79 @@ def _field_expr_ptr(node, source):
 
 
 # ---------------------------------------------------------------------------
+# Alias root tracking (alias analysis Step 4)
+# ---------------------------------------------------------------------------
+
+def _peel_casts(node):
+    """
+    Strip cast_expression and parenthesized_expression wrappers from node,
+    returning the innermost non-wrapper node.  Used to find the root
+    expression that a pointer was cast from.
+    """
+    n = node
+    while n is not None:
+        if n.type == 'cast_expression':
+            inner = n.child_by_field_name('value')
+            if inner is None:
+                break
+            n = inner
+        elif n.type == 'parenthesized_expression':
+            inner = next(
+                (c for c in n.children if c.type not in ('(', ')')), None
+            )
+            if inner is None:
+                break
+            n = inner
+        else:
+            break
+    return n
+
+
+def _alias_roots(fn_body, source):
+    """
+    Return {var_name: root_text} for struct pointer local variables in fn_body
+    that are initialized from an expression.
+
+    'root_text' is the canonical text of the underlying buffer, after stripping
+    any cast wrappers.  Two variables with the same root_text are aliases:
+    they point into the same buffer.
+
+    Only covers local declarations with an initializer (not parameters or
+    assignments after declaration).  Conservative: complex LHS shapes
+    (double pointer, array declarator) are skipped.
+
+    Example:
+        struct smb2_read_rsp *rsp  = (struct smb2_read_rsp *)buf;
+        struct smb2_read_rsp *rsp2 = (struct smb2_read_rsp *)buf;
+    → {'rsp': 'buf', 'rsp2': 'buf'}
+    """
+    roots = {}
+    for node in _walk(fn_body):
+        if node.type != 'declaration':
+            continue
+        for child in node.children:
+            if child.type != 'init_declarator':
+                continue
+            if len(child.children) < 3:
+                continue
+            decl = child.children[0]
+            if decl.type != 'pointer_declarator':
+                continue
+            # Find the identifier inside the pointer declarator
+            ident = next(
+                (node_text(n, source) for n in _walk(decl) if n.type == 'identifier'),
+                None,
+            )
+            if ident is None:
+                continue
+            rhs = child.children[2]
+            root = _peel_casts(rhs)
+            if root is not None:
+                roots[ident] = node_text(root, source).strip()
+    return roots
+
+
+# ---------------------------------------------------------------------------
 # Expression taint analysis helpers
 # ---------------------------------------------------------------------------
 
@@ -2096,14 +2169,31 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None,
 # Category I: struct field read before sizeof header size check
 # ---------------------------------------------------------------------------
 
-def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source):
+def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
+                      alias_roots=None, var_type_map=None):
     """
     True if there is an if_statement before before_line whose condition contains
     sizeof(struct_type) or sizeof(*ptr_var).
 
     Accepts both `sizeof(struct T)` (type_descriptor child) and `sizeof(*ptr)`
     (text match for '*ptr_var' inside the sizeof expression).
+
+    When alias_roots and var_type_map are supplied (Step 4), also checks
+    sizeof(*alias_var) for any alias variable that shares the same root buffer
+    as ptr_var AND has the same declared struct type (same-type alias guard).
     """
+    # Collect the set of variable names whose sizeof counts as a guard.
+    # Always includes ptr_var itself; extended by same-type aliases when
+    # alias_roots is available.
+    guard_vars = {ptr_var}
+    if alias_roots and var_type_map:
+        my_root = alias_roots.get(ptr_var)
+        if my_root is not None:
+            for alias_var, alias_root in alias_roots.items():
+                if alias_var != ptr_var and alias_root == my_root:
+                    if var_type_map.get(alias_var) == struct_type:
+                        guard_vars.add(alias_var)
+
     for node in _walk(fn_body):
         if node.type != 'if_statement':
             continue
@@ -2123,10 +2213,11 @@ def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source):
                         or td_text == f'struct {struct_type}'
                         or td_text.replace('struct ', '') == struct_type):
                     return True
-            # sizeof(*ptr_var) — text match is simpler and correct
+            # sizeof(*var) — text match for any guard variable
             sz_text = node_text(n, source)
-            if f'*{ptr_var}' in sz_text or f'* {ptr_var}' in sz_text:
-                return True
+            for gvar in guard_vars:
+                if f'*{gvar}' in sz_text or f'* {gvar}' in sz_text:
+                    return True
     return False
 
 
@@ -2139,11 +2230,17 @@ def scan_cat_i(fn_name, fn_body, source, filepath, var_type_map):
     the first field access (`ptr->field`). If no sizeof guard appears before
     that access, emit a Cat I finding.
 
+    Builds alias_roots (Step 4) to credit sizeof(*alias) guards when alias
+    and ptr_var share the same root buffer and same struct type.
+
     Returns a list of finding dicts (one per server-response struct pointer
     that has at least one field access in the function body).
     """
     if not var_type_map:
         return []
+
+    # Build alias root map once per function (Step 4).
+    alias_roots = _alias_roots(fn_body, source)
 
     findings = []
 
@@ -2176,7 +2273,10 @@ def scan_cat_i(fn_name, fn_body, source, filepath, var_type_map):
         if first_node is None:
             continue
 
-        guarded = _has_sizeof_guard(fn_body, ptr_var, struct_type, first_line, source)
+        guarded = _has_sizeof_guard(
+            fn_body, ptr_var, struct_type, first_line, source,
+            alias_roots=alias_roots, var_type_map=var_type_map,
+        )
 
         field_id = first_node.child_by_field_name('field')
         field_name = node_text(field_id, source) if field_id else '?'
