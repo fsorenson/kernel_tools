@@ -361,14 +361,53 @@ def _field_expr_ptr(node, source):
 
 
 # ---------------------------------------------------------------------------
-# Alias root tracking (alias analysis Step 4)
+# Alias root tracking (alias analysis Steps 4–5)
 # ---------------------------------------------------------------------------
+
+# Minimum fixed-field sizes (bytes) for known SMBv2/SMB3 struct types.
+# All response structs embed smb2_hdr (64 bytes) as their first field, so
+# all values here exceed 64.  Used by Step 5 to determine whether a sizeof
+# guard on an alias struct is large enough to also protect reads through a
+# different-type alias of the same buffer.
+#
+# Sizes computed from fs/smb/common/smb2pdu.h by summing fixed-field widths
+# (flexible array members excluded — they contribute 0 at minimum).
+_SMB2_STRUCT_MIN_BYTES = {
+    # Dual-use types (not in _SERVER_RESPONSE_STRUCTS but included for
+    # completeness — their guard never protects a full response struct read)
+    'smb2_hdr':                   64,   # header only; all rsp structs > this
+    'smb2_pdu':                   72,   # hdr + StructureSize + ByteCount + Buffer[0]
+    # Response structs with only header + a few fixed fields
+    'smb2_logoff_rsp':            66,   # hdr + StructureSize(2)
+    'smb2_tree_disconnect_rsp':   66,
+    'smb2_flush_rsp':             66,
+    'smb2_lock_rsp':              66,
+    'smb2_echo_rsp':              66,
+    'smb2_set_info_rsp':          66,
+    # Response structs with additional fixed fields
+    'smb2_err_rsp':               72,   # hdr+StructureSize(2)+ErrorContextCount(1)+Reserved(1)+ByteCount(4)
+    'smb2_sess_setup_rsp':        72,   # hdr+StructureSize(2)+SessionFlags(2)+Offsets(4)
+    'smb2_tree_connect_rsp':      72,   # hdr+StructureSize(2)+ShareType(1)+Reserved(1)+Flags(4)+...
+    'smb2_query_directory_rsp':   72,   # hdr+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
+    'smb2_change_notify_rsp':     72,
+    'smb2_query_info_rsp':        72,   # hdr+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
+    'smb2_close_rsp':             76,   # hdr+StructureSize(2)+Flags(2)+Reserved(4)+...times
+    'smb2_read_rsp':              80,   # hdr+StructureSize(2)+DataOffset(1)+Reserved(1)+DataLength(4)+DataRemaining(4)+Flags(4)
+    'smb2_write_rsp':             80,   # hdr+StructureSize(2)+Reserved(2)+Count(4)+Remaining(4)+WriteChannelInfoOffset(2)+...
+    'smb2_ioctl_rsp':             112,  # hdr + many fixed fields including CtlCode, FileId, offsets, counts
+    'smb2_create_rsp':            152,  # hdr + OplockLevel(1)+Flags(1)+CreateAction(4)+8×8-byte timestamps+...+FileIds(16)+offsets
+}
+
+# Null-like initializer texts that indicate a variable has no meaningful root.
+_NULL_ROOTS = frozenset({'NULL', '0', '(void *)0', '(void*)0', '((void *)0)',
+                         'ERR_PTR(-EINVAL)', 'ERR_PTR(-EIO)'})
+
 
 def _peel_casts(node):
     """
     Strip cast_expression and parenthesized_expression wrappers from node,
     returning the innermost non-wrapper node.  Used to find the root
-    expression that a pointer was cast from.
+    expression a pointer was cast from.
     """
     n = node
     while n is not None:
@@ -391,46 +430,55 @@ def _peel_casts(node):
 
 def _alias_roots(fn_body, source):
     """
-    Return {var_name: root_text} for struct pointer local variables in fn_body
-    that are initialized from an expression.
+    Return {var_name: frozenset_of_root_texts} for struct pointer locals.
 
-    'root_text' is the canonical text of the underlying buffer, after stripping
-    any cast wrappers.  Two variables with the same root_text are aliases:
-    they point into the same buffer.
+    Tracks both init_declarator (Step 4) and assignment_expression (Step 5)
+    roots.  Null-like initializers ('NULL', '0', …) are filtered out because
+    they convey no buffer provenance.
 
-    Only covers local declarations with an initializer (not parameters or
-    assignments after declaration).  Conservative: complex LHS shapes
-    (double pointer, array declarator) are skipped.
+    Two variables are aliases iff their root sets share at least one element.
 
-    Example:
+    Examples:
         struct smb2_read_rsp *rsp  = (struct smb2_read_rsp *)buf;
         struct smb2_read_rsp *rsp2 = (struct smb2_read_rsp *)buf;
-    → {'rsp': 'buf', 'rsp2': 'buf'}
+        → {'rsp': frozenset({'buf'}), 'rsp2': frozenset({'buf'})}
+
+        struct smb2_read_rsp *rsp = NULL;          # init: filtered out
+        rsp = (struct smb2_read_rsp *)iov_base;    # assign: captured
+        → {'rsp': frozenset({'iov_base'})}
     """
-    roots = {}
+    roots: dict[str, set] = {}
+
+    def _add(var, rhs_node):
+        root = _peel_casts(rhs_node)
+        if root is None:
+            return
+        rt = node_text(root, source).strip()
+        if rt and rt not in _NULL_ROOTS:
+            roots.setdefault(var, set()).add(rt)
+
     for node in _walk(fn_body):
-        if node.type != 'declaration':
-            continue
-        for child in node.children:
-            if child.type != 'init_declarator':
-                continue
-            if len(child.children) < 3:
-                continue
-            decl = child.children[0]
-            if decl.type != 'pointer_declarator':
-                continue
-            # Find the identifier inside the pointer declarator
-            ident = next(
-                (node_text(n, source) for n in _walk(decl) if n.type == 'identifier'),
-                None,
-            )
-            if ident is None:
-                continue
-            rhs = child.children[2]
-            root = _peel_casts(rhs)
-            if root is not None:
-                roots[ident] = node_text(root, source).strip()
-    return roots
+        if node.type == 'declaration':
+            for child in node.children:
+                if child.type != 'init_declarator' or len(child.children) < 3:
+                    continue
+                decl = child.children[0]
+                if decl.type != 'pointer_declarator':
+                    continue
+                ident = next(
+                    (node_text(n, source) for n in _walk(decl) if n.type == 'identifier'),
+                    None,
+                )
+                if ident:
+                    _add(ident, child.children[2])
+
+        elif node.type == 'assignment_expression':
+            lhs = node.child_by_field_name('left')
+            rhs = node.child_by_field_name('right')
+            if lhs is not None and rhs is not None and lhs.type == 'identifier':
+                _add(node_text(lhs, source), rhs)
+
+    return {v: frozenset(rs) for v, rs in roots.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -2178,21 +2226,29 @@ def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
     Accepts both `sizeof(struct T)` (type_descriptor child) and `sizeof(*ptr)`
     (text match for '*ptr_var' inside the sizeof expression).
 
-    When alias_roots and var_type_map are supplied (Step 4), also checks
-    sizeof(*alias_var) for any alias variable that shares the same root buffer
-    as ptr_var AND has the same declared struct type (same-type alias guard).
+    When alias_roots and var_type_map are supplied (Steps 4–5), also checks
+    sizeof(*alias_var) for alias variables sharing the same root buffer as
+    ptr_var when the alias struct type is at least as large as struct_type
+    (same-type aliases always qualify; larger-type aliases qualify via
+    _SMB2_STRUCT_MIN_BYTES size table).
     """
-    # Collect the set of variable names whose sizeof counts as a guard.
-    # Always includes ptr_var itself; extended by same-type aliases when
-    # alias_roots is available.
+    # Collect variable names whose sizeof expression counts as a guard.
     guard_vars = {ptr_var}
     if alias_roots and var_type_map:
-        my_root = alias_roots.get(ptr_var)
-        if my_root is not None:
-            for alias_var, alias_root in alias_roots.items():
-                if alias_var != ptr_var and alias_root == my_root:
-                    if var_type_map.get(alias_var) == struct_type:
-                        guard_vars.add(alias_var)
+        my_roots = alias_roots.get(ptr_var, frozenset())
+        if my_roots:
+            ptr_min_sz = _SMB2_STRUCT_MIN_BYTES.get(struct_type, 0)
+            for alias_var, alias_root_set in alias_roots.items():
+                if alias_var == ptr_var or not (my_roots & alias_root_set):
+                    continue
+                alias_type = var_type_map.get(alias_var)
+                if alias_type is None:
+                    continue
+                alias_min_sz = _SMB2_STRUCT_MIN_BYTES.get(alias_type, 0)
+                # Credit when alias struct >= ptr struct in size, or same type.
+                if alias_type == struct_type or (
+                        ptr_min_sz > 0 and alias_min_sz >= ptr_min_sz):
+                    guard_vars.add(alias_var)
 
     for node in _walk(fn_body):
         if node.type != 'if_statement':
@@ -2230,8 +2286,13 @@ def scan_cat_i(fn_name, fn_body, source, filepath, var_type_map):
     the first field access (`ptr->field`). If no sizeof guard appears before
     that access, emit a Cat I finding.
 
-    Builds alias_roots (Step 4) to credit sizeof(*alias) guards when alias
-    and ptr_var share the same root buffer and same struct type.
+    Builds alias_roots (Steps 4–5) to credit sizeof(*alias) guards when:
+    - alias and ptr_var share the same root buffer (same underlying memory), and
+    - alias struct type is >= ptr_var struct type in size (Step 4: same type;
+      Step 5: larger type via _SMB2_STRUCT_MIN_BYTES table).
+
+    Also tracks assignment-expression alias roots (Step 5) so that the
+    NULL-init-then-assign pattern is handled.
 
     Returns a list of finding dicts (one per server-response struct pointer
     that has at least one field access in the function body).
@@ -2239,7 +2300,7 @@ def scan_cat_i(fn_name, fn_body, source, filepath, var_type_map):
     if not var_type_map:
         return []
 
-    # Build alias root map once per function (Step 4).
+    # Build alias root map once per function (Steps 4–5).
     alias_roots = _alias_roots(fn_body, source)
 
     findings = []

@@ -122,6 +122,14 @@ EXPECTED = {
     'guarded_I_sizeof_via_alias':     {'cat': 'I', 'guarded': True},
     # alias cast from different buffer — guard does not cross to rsp.
     'bug_I_alias_different_root':     {'cat': 'I', 'guarded': False},
+
+    # ── Cross-type alias guards (alias Step 5) ───────────────────────────
+    # sizeof(*read) [80 bytes] protects err->field [72 bytes] — guarded.
+    'guarded_I_cross_type_larger_guard': {'cat': 'I', 'guarded': True},
+    # sizeof(*err) [72 bytes] does NOT protect read->field [80 bytes].
+    'bug_I_cross_type_smaller_guard':    {'cat': 'I', 'guarded': False},
+    # NULL-init then assignment establishes alias root — guarded via assignment.
+    'guarded_I_alias_via_assignment':    {'cat': 'I', 'guarded': True},
 }
 
 

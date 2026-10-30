@@ -47,7 +47,8 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. **Alias analysis Step 5** — Cat I multi-cast (Gap P): validation through one cast pointer, read through a different-type alias of the same buffer. Requires struct-size comparison to determine if the guard covers the read type. Prerequisite: Steps 1–4 done.
+1. **Alias analysis Step 6 (G3)** — `kmalloc` (not `kzalloc`) of struct with padding → `copy_to_user` infoleak: needs per-field write coverage to determine which padding bytes are uninitialized.
+2. **Stage 2 LLM run on Cat I** — 62 Cat I findings in fs/smb/client (59 unguarded); use `--categories I --llm` to triage with the size table context in Stage 2 prompt.
 
 ## Alias analysis progress
 
@@ -59,7 +60,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 | 2 | **Done** | Provenance taint sourcing: `u8 off = rsp->DataOffset` taints `off` via struct type (no endian helper needed); `_field_expr_ptr()` helper |
 | 3 | **Done** | Category I scanner — single-cast: `_has_sizeof_guard()` + `scan_cat_i()` in taint_scanner; `cat_i_limit` parameter on `scan_files`; Stage 2 formatting branch added; 43/43 Stage 1 tests |
 | 4 | **Done** | Alias root tracking: `_peel_casts()` + `_alias_roots()` build `{var: root_text}`; `_has_sizeof_guard` extended to credit same-root same-type aliases; 45/45 Stage 1 tests |
-| 5 | Deferred | Category I multi-cast (Gap P): validation through one cast pointer, read through another alias |
+| 5 | **Done** | Cross-type alias guards: `_alias_roots` now returns `{var: frozenset_of_roots}` + tracks assignment expressions; `_SMB2_STRUCT_MIN_BYTES` size table; `_has_sizeof_guard` credits larger-type alias guards; 48/48 Stage 1 tests |
 | 6 | Deferred | G3 field-write coverage: which struct fields are initialized before `copy_to_user` |
 
 **Key design decisions for alias analysis:**
@@ -77,6 +78,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 
 ## Recently completed
 
+- **Alias analysis Step 5** — cross-type alias guards: `_alias_roots` refactored to return `{var: frozenset_of_roots}` and now also tracks `ptr = expr` assignment expressions (handles NULL-init-then-assign pattern); `_SMB2_STRUCT_MIN_BYTES` size table (22 SMBv2/SMB3 struct types, sizes verified from smb2pdu.h); `_has_sizeof_guard` extended to credit sizeof guards on larger-type aliases via set intersection + size comparison; 3 new test cases (cross-type larger guard, cross-type smaller guard, assignment alias); 48/48 Stage 1 tests. Real scan unchanged (no larger-type cross-type alias guards exist in fs/smb/client).
 - **Alias analysis Step 4** — alias root tracking: `_peel_casts()` strips cast/paren wrappers; `_alias_roots(fn_body, source)` builds `{var_name: root_text}` from init_declarator nodes; `_has_sizeof_guard` extended to credit `sizeof(*alias_var)` guards when `alias_var` shares the same root buffer and same struct type as `ptr_var`. Real CIFS scan unchanged (no same-root same-type alias patterns exist in the codebase). 45/45 Stage 1 tests.
 - **Alias analysis Step 3** — Category I scanner (single-cast form): `_has_sizeof_guard()` checks for `sizeof(struct T)` or `sizeof(*ptr)` in an if_statement before the first field read; `scan_cat_i()` emits Cat I findings per server-response struct pointer; `cat_i_limit` param on `scan_files` caps tree-wide scan for LLM quota; Stage 2 formatting branch added; 43/43 Stage 1 tests.
 - **Alias analysis Step 2** — provenance-based taint sourcing: `u8 off = rsp->DataOffset` now taints `off` when `rsp` is declared as a type in `_SERVER_RESPONSE_STRUCTS`; `_field_expr_ptr()` helper peels one cast; `fp_provenance_local_struct` test confirms non-server structs are not tainted. Tests: 39/39 Stage 1, 37/37 provenance.

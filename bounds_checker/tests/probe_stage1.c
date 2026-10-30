@@ -76,11 +76,17 @@ extern long copy_from_user(void *dst, const void *src, size_t n);
 #define clamp_val(val, lo, hi)  clamp(val, lo, hi)
 
 /*
- * Server-response struct stub for provenance tests.
- * smb2_read_rsp is in _SERVER_RESPONSE_STRUCTS; local_state is not.
+ * Server-response struct stubs for provenance and Cat I tests.
+ * smb2_read_rsp and smb2_err_rsp are in _SERVER_RESPONSE_STRUCTS.
+ * local_state is not.
+ *
+ * The real kernel structs are larger (both embed smb2_hdr at 64 bytes).
+ * Scanner uses _SMB2_STRUCT_MIN_BYTES for size comparison, not C sizeof.
+ * Per the size table: smb2_read_rsp(80) > smb2_err_rsp(72) > smb2_hdr(64).
  */
 struct smb2_read_rsp { u8 DataOffset; u32 DataLength; };
-struct local_state    { u8 offset;    u32 length; };
+struct smb2_err_rsp  { u16 StructureSize; u8 ErrorContextCount; u8 Reserved; u32 ByteCount; };
+struct local_state   { u8 offset;    u32 length; };
 
 /* ── Category A: tainted value → pointer arg of memory op ── */
 
@@ -545,4 +551,50 @@ int bug_I_alias_different_root(char *buf, char *buf2, u32 recv_len)
 	if (recv_len < sizeof(*alias))   /* guards buf2, not buf */
 		return -1;
 	return rsp->DataOffset;           /* unguarded — different root */
+}
+
+/* ── Category I: cross-type alias guards (alias Step 5) ── */
+
+/*
+ * sizeof guard via a LARGER struct (smb2_read_rsp, 80 bytes) protects a
+ * SMALLER struct read (smb2_err_rsp, 72 bytes) from the same buffer.
+ * _SMB2_STRUCT_MIN_BYTES: 80 >= 72 → credit the guard.
+ */
+int guarded_I_cross_type_larger_guard(char *buf, u32 recv_len)
+{
+	struct smb2_read_rsp *read = (struct smb2_read_rsp *)buf;
+	struct smb2_err_rsp  *err  = (struct smb2_err_rsp  *)buf;
+	if (recv_len < sizeof(*read))   /* guard for larger struct (80 bytes) */
+		return -1;
+	return err->ErrorContextCount;   /* guarded: 80 >= 72 */
+}
+
+/*
+ * Bug: sizeof guard via SMALLER struct (smb2_err_rsp, 72 bytes) does NOT
+ * protect a LARGER struct read (smb2_read_rsp, 80 bytes) from the same buf.
+ * _SMB2_STRUCT_MIN_BYTES: 72 < 80 → guard insufficient.
+ */
+int bug_I_cross_type_smaller_guard(char *buf, u32 recv_len)
+{
+	struct smb2_err_rsp  *err  = (struct smb2_err_rsp  *)buf;
+	struct smb2_read_rsp *read = (struct smb2_read_rsp *)buf;
+	if (recv_len < sizeof(*err))    /* guard for smaller struct (72 bytes) */
+		return -1;
+	return read->DataOffset;         /* unguarded: 72 < 80 */
+}
+
+/*
+ * Step 5 assignment-expression tracking: NULL-init then assign from same buf.
+ * The alias root is established via assignment, not init_declarator.
+ * sizeof(*read) guard (80 bytes) covers err->field (72 bytes) via alias.
+ */
+int guarded_I_alias_via_assignment(char *buf, u32 recv_len)
+{
+	struct smb2_read_rsp *read = NULL;
+	struct smb2_err_rsp  *err  = NULL;
+	read = (struct smb2_read_rsp *)buf;
+	err  = (struct smb2_err_rsp  *)buf;
+	if (recv_len < sizeof(*read))
+		return -1;
+	return err->ErrorContextCount;   /* guarded via assignment-tracked alias */
 }
