@@ -287,41 +287,58 @@ _ERROR_CODE_VARS = frozenset({
 # helper.  Used by Step 2 to source taint from u8/single-byte fields.
 #
 # Only response-only types are included here.  Dual-use types (smb2_hdr,
-# smb2_pdu, smb_hdr) are excluded: they appear in both locally-built
-# requests and received responses, so the type name alone does not
-# establish provenance.  Step 2 will handle initialization-based
-# provenance for those.
-_SERVER_RESPONSE_STRUCTS = frozenset({
-    # SMBv2/SMB3 command responses (fs/smb/common/)
-    'smb2_err_rsp',
-    'smb2_negotiate_rsp',
-    'smb2_sess_setup_rsp',
-    'smb2_logoff_rsp',
-    'smb2_tree_connect_rsp',
-    'smb2_tree_disconnect_rsp',
-    'smb2_create_rsp',
-    'smb2_close_rsp',
-    'smb2_flush_rsp',
-    'smb2_read_rsp',
-    'smb2_write_rsp',
-    'smb2_lock_rsp',
-    'smb2_echo_rsp',
-    'smb2_ioctl_rsp',
-    'smb2_query_directory_rsp',
-    'smb2_change_notify_rsp',
-    'smb2_query_info_rsp',
-    'smb2_set_info_rsp',
-    # Unsolicited server messages
-    'smb2_oplock_break',
-    'smb2_lease_break',
-    'smb2_lease_ack',
-    # Error/extension types — always from server
-    'smb2_symlink_err_rsp',
-    'smb2_error_context_rsp',
-    'smb2_transform_hdr',   # SMB3 encryption header; in client always received
-    # POSIX extension response info
-    'smb2_posix_info',
-})
+# Wire-receive struct tables are loaded from
+# bounds_checker/data/wire_structs/*.yaml at import time.
+# Each file lists protocol-specific struct types that are definitionally
+# received from the network and never constructed locally.
+#
+# _SERVER_RESPONSE_STRUCTS: frozenset of all loaded response struct names.
+# _WIRE_STRUCT_MIN_BYTES:   {name: min_bytes} for alias-guard size comparison.
+
+
+def _load_wire_struct_tables():
+    """
+    Load per-protocol wire-struct tables from data/wire_structs/*.yaml.
+
+    Each file may contain:
+      response_structs: {name: min_bytes}  — server-received types; added to
+          both _SERVER_RESPONSE_STRUCTS and _WIRE_STRUCT_MIN_BYTES.
+      dual_use_sizes: {name: min_bytes}    — types that appear in both sent
+          and received structs (NOT added to _SERVER_RESPONSE_STRUCTS) but
+          whose sizes are needed for alias-guard size comparison (Step 5).
+
+    Returns (response_structs frozenset, min_bytes dict).  Files are processed
+    in sorted name order; later files override min_bytes for shared names.
+    """
+    import yaml
+    from pathlib import Path
+
+    data_dir = Path(__file__).resolve().parent.parent / 'data' / 'wire_structs'
+    rsp_structs = {}    # name -> min_bytes (added to _SERVER_RESPONSE_STRUCTS)
+    extra_sizes = {}    # name -> min_bytes (size table only, not rsp set)
+
+    if not data_dir.is_dir():
+        return frozenset(), {}
+
+    def _to_int(val):
+        return int(val) if isinstance(val, (int, float)) else 0
+
+    for yaml_path in sorted(data_dir.glob('*.yaml')):
+        try:
+            with open(yaml_path) as fh:
+                data = yaml.safe_load(fh) or {}
+        except Exception:
+            continue
+        for name, val in (data.get('response_structs') or {}).items():
+            rsp_structs[name] = _to_int(val)
+        for name, val in (data.get('dual_use_sizes') or {}).items():
+            extra_sizes[name] = _to_int(val)
+
+    min_bytes = {**extra_sizes, **rsp_structs}   # rsp_structs wins on conflict
+    return frozenset(rsp_structs), min_bytes
+
+
+_SERVER_RESPONSE_STRUCTS, _WIRE_STRUCT_MIN_BYTES = _load_wire_struct_tables()
 
 
 def _ptr_is_server_response(var_name, var_type_map):
@@ -363,40 +380,16 @@ def _field_expr_ptr(node, source):
 # ---------------------------------------------------------------------------
 # Alias root tracking (alias analysis Steps 4–5)
 # ---------------------------------------------------------------------------
-
-# Minimum fixed-field sizes (bytes) for known SMBv2/SMB3 struct types.
-# All response structs embed smb2_hdr (64 bytes) as their first field, so
-# all values here exceed 64.  Used by Step 5 to determine whether a sizeof
-# guard on an alias struct is large enough to also protect reads through a
-# different-type alias of the same buffer.
 #
-# Sizes computed from fs/smb/common/smb2pdu.h by summing fixed-field widths
-# (flexible array members excluded — they contribute 0 at minimum).
-_SMB2_STRUCT_MIN_BYTES = {
-    # Dual-use types (not in _SERVER_RESPONSE_STRUCTS but included for
-    # completeness — their guard never protects a full response struct read)
-    'smb2_hdr':                   64,   # header only; all rsp structs > this
-    'smb2_pdu':                   72,   # hdr + StructureSize + ByteCount + Buffer[0]
-    # Response structs with only header + a few fixed fields
-    'smb2_logoff_rsp':            66,   # hdr + StructureSize(2)
-    'smb2_tree_disconnect_rsp':   66,
-    'smb2_flush_rsp':             66,
-    'smb2_lock_rsp':              66,
-    'smb2_echo_rsp':              66,
-    'smb2_set_info_rsp':          66,
-    # Response structs with additional fixed fields
-    'smb2_err_rsp':               72,   # hdr+StructureSize(2)+ErrorContextCount(1)+Reserved(1)+ByteCount(4)
-    'smb2_sess_setup_rsp':        72,   # hdr+StructureSize(2)+SessionFlags(2)+Offsets(4)
-    'smb2_tree_connect_rsp':      72,   # hdr+StructureSize(2)+ShareType(1)+Reserved(1)+Flags(4)+...
-    'smb2_query_directory_rsp':   72,   # hdr+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
-    'smb2_change_notify_rsp':     72,
-    'smb2_query_info_rsp':        72,   # hdr+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
-    'smb2_close_rsp':             76,   # hdr+StructureSize(2)+Flags(2)+Reserved(4)+...times
-    'smb2_read_rsp':              80,   # hdr+StructureSize(2)+DataOffset(1)+Reserved(1)+DataLength(4)+DataRemaining(4)+Flags(4)
-    'smb2_write_rsp':             80,   # hdr+StructureSize(2)+Reserved(2)+Count(4)+Remaining(4)+WriteChannelInfoOffset(2)+...
-    'smb2_ioctl_rsp':             112,  # hdr + many fixed fields including CtlCode, FileId, offsets, counts
-    'smb2_create_rsp':            152,  # hdr + OplockLevel(1)+Flags(1)+CreateAction(4)+8×8-byte timestamps+...+FileIds(16)+offsets
-}
+# _WIRE_STRUCT_MIN_BYTES: {name: min_bytes} loaded from wire_structs/*.yaml.
+# Used by Step 5 to determine whether a sizeof guard on one struct alias is
+# large enough to also protect reads through a smaller-type alias of the same
+# buffer.  0 means the size has not been verified (size comparison disabled).
+#
+# Note: dual-use types like smb2_hdr are NOT in _SERVER_RESPONSE_STRUCTS but
+# their sizes may still be relevant for alias comparison; add them directly
+# to smb2.yaml as response_structs entries with 0 if needed, or hard-code a
+# supplemental dict here.  For now the YAML provides the SMBv2 sizes.
 
 # Null-like initializer texts that indicate a variable has no meaningful root.
 _NULL_ROOTS = frozenset({'NULL', '0', '(void *)0', '(void*)0', '((void *)0)',
@@ -2246,14 +2239,14 @@ def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
     if alias_roots and var_type_map:
         my_roots = alias_roots.get(ptr_var, frozenset())
         if my_roots:
-            ptr_min_sz = _SMB2_STRUCT_MIN_BYTES.get(struct_type, 0)
+            ptr_min_sz = _WIRE_STRUCT_MIN_BYTES.get(struct_type, 0)
             for alias_var, alias_root_set in alias_roots.items():
                 if alias_var == ptr_var or not (my_roots & alias_root_set):
                     continue
                 alias_type = var_type_map.get(alias_var)
                 if alias_type is None:
                     continue
-                alias_min_sz = _SMB2_STRUCT_MIN_BYTES.get(alias_type, 0)
+                alias_min_sz = _WIRE_STRUCT_MIN_BYTES.get(alias_type, 0)
                 # Credit when alias struct >= ptr struct in size, or same type.
                 if alias_type == struct_type or (
                         ptr_min_sz > 0 and alias_min_sz >= ptr_min_sz):
@@ -2298,7 +2291,7 @@ def scan_cat_i(fn_name, fn_body, source, filepath, var_type_map):
     Builds alias_roots (Steps 4–5) to credit sizeof(*alias) guards when:
     - alias and ptr_var share the same root buffer (same underlying memory), and
     - alias struct type is >= ptr_var struct type in size (Step 4: same type;
-      Step 5: larger type via _SMB2_STRUCT_MIN_BYTES table).
+      Step 5: larger type via _WIRE_STRUCT_MIN_BYTES table).
 
     Also tracks assignment-expression alias roots (Step 5) so that the
     NULL-init-then-assign pattern is handled.

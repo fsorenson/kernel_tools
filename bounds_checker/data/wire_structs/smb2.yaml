@@ -1,0 +1,68 @@
+# SMBv2/SMB3 server response structs
+#
+# Struct types that are definitionally received from the network server and
+# never constructed locally.  The scanner fires Cat I when a ->field read
+# occurs before sizeof(struct T) is checked in the same function.
+#
+# min_bytes: fixed-field size in bytes, excluding flexible array members.
+#   Used by alias analysis (Step 5) to determine whether a sizeof guard on one
+#   struct alias is large enough to also protect reads through a smaller alias
+#   of the same buffer.  Sizes verified from fs/smb/common/smb2pdu.h by
+#   summing fixed-field widths.  Set to 0 if not yet verified.
+#
+# dual_use lists types excluded from the response table because they appear in
+# both locally-built requests and received responses — the type name alone does
+# not establish provenance.  Scanner ignores this list; it is documentation.
+
+protocol: SMBv2/SMB3
+subsystem: fs/smb
+
+response_structs:
+  # SMBv2/SMB3 command responses (fs/smb/common/smb2pdu.h)
+  # All embed smb2_hdr (64 bytes) as first field.
+  smb2_err_rsp:              72   # hdr(64)+StructureSize(2)+ErrorContextCount(1)+Reserved(1)+ByteCount(4)
+  smb2_negotiate_rsp:        65   # hdr(64)+StructureSize(2); variable negotiate contexts follow
+  smb2_sess_setup_rsp:       72   # hdr(64)+StructureSize(2)+SessionFlags(2)+SecurityBufferOffset(2)+SecurityBufferLength(2)
+  smb2_logoff_rsp:           66   # hdr(64)+StructureSize(2)
+  smb2_tree_connect_rsp:     72   # hdr(64)+StructureSize(2)+ShareType(1)+Reserved(1)+ShareFlags(4)+Capabilities(4)
+  smb2_tree_disconnect_rsp:  66   # hdr(64)+StructureSize(2)
+  smb2_create_rsp:           152  # hdr(64)+many fixed fields including timestamps and file IDs
+  smb2_close_rsp:            76   # hdr(64)+StructureSize(2)+Flags(2)+Reserved(4)+timestamps+Attributes(4)+sizes
+  smb2_flush_rsp:            66   # hdr(64)+StructureSize(2)
+  smb2_read_rsp:             80   # hdr(64)+StructureSize(2)+DataOffset(1)+Reserved(1)+DataLength(4)+DataRemaining(4)+Flags(4)
+  smb2_write_rsp:            80   # hdr(64)+StructureSize(2)+Reserved(2)+Count(4)+Remaining(4)+WriteChannelInfoOffset(2)+Pad(2)
+  smb2_lock_rsp:             66   # hdr(64)+StructureSize(2)
+  smb2_echo_rsp:             66   # hdr(64)+StructureSize(2)
+  smb2_ioctl_rsp:            112  # hdr(64)+many fixed fields including CtlCode, FileId, offsets, counts
+  smb2_query_directory_rsp:  72   # hdr(64)+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
+  smb2_change_notify_rsp:    72   # hdr(64)+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
+  smb2_query_info_rsp:       72   # hdr(64)+StructureSize(2)+OutputBufferOffset(2)+OutputBufferLength(4)
+  smb2_set_info_rsp:         66   # hdr(64)+StructureSize(2)
+  # Unsolicited server messages
+  smb2_oplock_break:         0    # size varies by oplock/lease variant; not yet measured
+  smb2_lease_break:          0    # ditto
+  smb2_lease_ack:            0    # ditto
+  # Error/extension types — always from server, never constructed by client
+  smb2_symlink_err_rsp:      0    # size varies; part of smb2_err_rsp error data
+  smb2_error_context_rsp:    0
+  smb2_transform_hdr:        0    # SMB3 encryption header; client always receives, never builds raw
+  # POSIX extension response info (ksmbd and client)
+  smb2_posix_info:           0
+
+# Dual-use sizes: not added to the response table (type alone does not
+# establish provenance), but min_bytes loaded into _WIRE_STRUCT_MIN_BYTES
+# for alias analysis Step 5 size comparison.  Knowing smb2_hdr (64 bytes)
+# is smaller than every response struct lets the scanner correctly conclude
+# that sizeof(*hdr) does NOT protect a smb2_read_rsp (80 bytes) field read.
+dual_use_sizes:
+  smb2_hdr:    64   # header only; all response structs are larger
+  smb2_pdu:    72   # hdr(64)+StructureSize(2)+ByteCount(4)+Buffer[0](2)
+  smb_hdr:     32   # SMBv1 header
+  smb_t2_rsp:   0   # SMBv1 TRANS2 — size not yet measured
+
+# Documentation only — not used by the scanner.
+dual_use:
+  - smb2_hdr
+  - smb2_pdu
+  - smb_hdr
+  - smb_t2_rsp
