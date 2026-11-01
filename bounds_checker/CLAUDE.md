@@ -47,8 +47,15 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Active next steps
 
-1. **Stage 2 LLM run on Cat I** — 62 Cat I findings in fs/smb/client (59 unguarded); use `--categories I --llm` to triage. The Stage 2 prompt should note that the receiver path validates minimum message sizes before dispatching (to assess whether individual functions can assume the buffer is already validated).
-2. **Wider G3 scan** — G3 finds 0 in fs/smb/client (modern CIFS uses kzalloc); try `--categories G3` on other subsystems with ioctl-heavy code (e.g., drivers/gpu/drm, net/).
+1. **Expand `_SERVER_RESPONSE_STRUCTS` to other protocols** — Cat I currently fires only in fs/smb/ because the type table is SMB-specific. Add per-protocol data files under `bounds_checker/data/` (planned: Ceph, Bluetooth HCI). Tree-wide scan (`--categories I /home/src/linux`) found 133 findings in 65746 files — all in fs/smb/. Other protocols (Ceph, Bluetooth) have confirmed historical OOB bugs from the same pattern.
+2. **Stage 2 LLM run on Cat I** — use `--categories I --llm` on fs/smb/client to triage the 62 findings (58 unguarded after while/for extension).
+3. **Wider G3 scan** — G3 finds 0 in fs/smb (modern CIFS uses kzalloc); try `--categories G3` on older ioctl-heavy code (e.g., drivers/gpu/drm, net/).
+
+## Known guard gaps (not yet implemented)
+
+- **`_find_guards_between` (Cat B/C/E tainted values)**: currently only recognises `if_statement` guards. `while_statement` and `for_statement` conditions also guard their loop bodies, but extending `_find_guards_between` requires adjusting the dominance check and consequence/terminal logic (non-trivial). `_has_sizeof_guard` (Cat I) already supports while/for.
+- **Named-constant guards**: `if (skb->len < MIN_HEADER_SIZE)` where `MIN_HEADER_SIZE == sizeof(struct T)` is not recognised; only `sizeof` expressions are checked.
+- **Macro-wrapped guards**: `ceph_decode_need(&p, end, sizeof(*hdr), bad)` — a macro that wraps the sizeof check — is not recognised by `_has_sizeof_guard`.
 
 ## Alias analysis — COMPLETE
 
@@ -82,6 +89,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 
 ## Recently completed
 
+- **while/for sizeof guard extension** — `_has_sizeof_guard` extended to recognise `while_statement` and `for_statement` conditions (not only `if_statement`); `_GUARD_STMT_TYPES` frozenset; do-while excluded (condition runs after first body iteration). 2 new test cases (guarded_I_while_sizeof, guarded_I_for_sizeof); 54/54 Stage 1 tests. One previously-unguarded Cat I finding in fs/smb/client now correctly credited as guarded (62 total, 4 guarded was 3).
 - **Alias analysis Step 6 (G3)** — `scan_g3()` + `scan_g3_files()` in `taint_scanner.py`: detects `kmalloc`/`kvmalloc`/`vmalloc`-allocated struct pointers passed to `copy_to_user` without prior zeroing (`kzalloc` or `memset(p, 0, ...)`); field-write heuristic (`p->field = value` must exist) avoids flagging raw buffer copies; wired into `stage1_taint_scan.py` (same pattern as G1/G2), `config.py`, `cli.py`, `report.py` (3 render formats); 4 test cases (bug, fp_kzalloc, fp_memset, fp_no_field_writes), 52/52 Stage 1 tests. Zero findings in fs/smb/client and fs/ tree (modern kernel code uses kzalloc for structs copied to userspace).
 - **Alias analysis Step 5** — cross-type alias guards: `_alias_roots` refactored to return `{var: frozenset_of_roots}` and now also tracks `ptr = expr` assignment expressions (handles NULL-init-then-assign pattern); `_SMB2_STRUCT_MIN_BYTES` size table (22 SMBv2/SMB3 struct types, sizes verified from smb2pdu.h); `_has_sizeof_guard` extended to credit sizeof guards on larger-type aliases via set intersection + size comparison; 3 new test cases (cross-type larger guard, cross-type smaller guard, assignment alias); 48/48 Stage 1 tests. Real scan unchanged (no larger-type cross-type alias guards exist in fs/smb/client).
 - **Alias analysis Step 4** — alias root tracking: `_peel_casts()` strips cast/paren wrappers; `_alias_roots(fn_body, source)` builds `{var_name: root_text}` from init_declarator nodes; `_has_sizeof_guard` extended to credit `sizeof(*alias_var)` guards when `alias_var` shares the same root buffer and same struct type as `ptr_var`. Real CIFS scan unchanged (no same-root same-type alias patterns exist in the codebase). 45/45 Stage 1 tests.

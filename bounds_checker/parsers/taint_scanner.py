@@ -2217,20 +2217,29 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None,
 # Category I: struct field read before sizeof header size check
 # ---------------------------------------------------------------------------
 
+# Statement types whose condition field is checked before the body executes.
+# do_statement is excluded: its condition runs AFTER the first body iteration,
+# so it does not guard reads that happen at the top of the body.
+_GUARD_STMT_TYPES = frozenset({'if_statement', 'while_statement', 'for_statement'})
+
+
 def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
                       alias_roots=None, var_type_map=None):
     """
-    True if there is an if_statement before before_line whose condition contains
-    sizeof(struct_type) or sizeof(*ptr_var).
+    True if there is an if/while/for statement before before_line whose
+    condition contains sizeof(struct_type) or sizeof(*ptr_var).
 
     Accepts both `sizeof(struct T)` (type_descriptor child) and `sizeof(*ptr)`
     (text match for '*ptr_var' inside the sizeof expression).
 
+    while and for conditions guard their loop bodies (condition executes before
+    each iteration, so a sizeof check in the condition protects field reads
+    inside the body).  do-while is excluded because its condition runs after
+    the first iteration.
+
     When alias_roots and var_type_map are supplied (Steps 4–5), also checks
     sizeof(*alias_var) for alias variables sharing the same root buffer as
-    ptr_var when the alias struct type is at least as large as struct_type
-    (same-type aliases always qualify; larger-type aliases qualify via
-    _SMB2_STRUCT_MIN_BYTES size table).
+    ptr_var when the alias struct type is at least as large as struct_type.
     """
     # Collect variable names whose sizeof expression counts as a guard.
     guard_vars = {ptr_var}
@@ -2251,7 +2260,7 @@ def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
                     guard_vars.add(alias_var)
 
     for node in _walk(fn_body):
-        if node.type != 'if_statement':
+        if node.type not in _GUARD_STMT_TYPES:
             continue
         if node.start_point[0] + 1 >= before_line:
             continue

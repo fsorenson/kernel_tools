@@ -578,6 +578,35 @@ int fp_I_local_struct(struct local_state *s, u32 len)
 	return off;
 }
 
+/* ── Category I: while/for loop sizeof guards ── */
+
+/*
+ * TLV-style parsing loop: while condition contains sizeof(*rsp), which runs
+ * before the first field read in the body.  Must be credited as guarded.
+ */
+int guarded_I_while_sizeof(struct smb2_read_rsp *rsp, u32 recv_len)
+{
+	while (recv_len >= sizeof(*rsp)) {
+		u8 off = rsp->DataOffset;   /* guarded: while condition runs first */
+		recv_len -= sizeof(*rsp);
+		break;
+	}
+	return 0;
+}
+
+/*
+ * for loop with sizeof(struct T) in the condition — both the type-name and
+ * the star-ptr forms must be recognised.
+ */
+int guarded_I_for_sizeof(struct smb2_read_rsp *rsp, u32 recv_len)
+{
+	for (; recv_len >= sizeof(struct smb2_read_rsp); recv_len--) {
+		u8 off = rsp->DataOffset;   /* guarded by for condition */
+		break;
+	}
+	return 0;
+}
+
 /* ── Category I: alias root tracking (Step 4) ── */
 
 /*
