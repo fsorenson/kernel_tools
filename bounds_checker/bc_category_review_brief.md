@@ -164,8 +164,8 @@ Per-finding schema fields: `taint_is_server_supplied`, `bounds_check_present`,
 LLM verified the SMT witness is reachable), `real_bug`, `impact`, `symptom`,
 `suggested_fix`, `cve_pattern`, `notes`.
 
-The analysis task prompt carries 14 numbered items covering the main classes of
-reasoning error observed in practice:
+The analysis task prompt carries 15 numbered items (plus sub-items) covering the
+main classes of reasoning error observed in practice:
 
 1. Taint is genuinely server-supplied (vs. a locally-built request)
 2. Bounds check present and sufficient (and callee postcondition analysis)
@@ -176,18 +176,25 @@ reasoning error observed in practice:
     not just `count <= MAX` (the SMT layer cannot see buffer sizes)
 2d. Caller-level guard evidence — when Stage 1.5 reports "ALL N sites guarded", the
     static function is always called with the tainted parameter already validated; the
-    LLM should dismiss such findings as false_positive and note which parameter is
-    always validated.  When "X of N sites guarded", the finding is real on the
-    unguarded call paths.
+    LLM should dismiss such findings as false_positive.  When "X of N sites guarded",
+    the finding is real on the unguarded call paths.
+2e. Cat I dispatch-layer check — for Category I findings specifically: determine
+    whether the function is a top-level raw-buffer receiver (real bug) or a sub-handler
+    called after a dispatch loop that already validated the size (false positive).
+    Key signals: does the function receive a typed pointer parameter vs. a raw buffer?
+    Does the call site in the provided context perform a sizeof check before calling?
 3–11. Real bug, impact, symptom, suggested fix, CVE pattern, validation notes
 10. Caps vs. inflations — `if (x > limit) x = limit` reduces x, never inflates it
 11. `copy_to_user` with user-controlled size cap is self-limiting
 12. Struct cast from server buffer — field reads before the header size check
     (the scanner treats `le16_to_cpu(ptr->field)` as a taint source, not asking
     whether the READ ITSELF is in bounds if the buffer is too short for the struct)
-13. `kmalloc(0)` returns ZERO_SIZE_PTR (non-null, non-dereferenceable); a `if (!p)`
+13. Category I — dispatch-layer vs. direct-receiver pattern (see 2e above); the
+    scanner detects `ptr->field` reads before `sizeof(*ptr)` guards in the same
+    function body; false positive when the dispatcher already validated the size
+14. `kmalloc(0)` returns ZERO_SIZE_PTR (non-null, non-dereferenceable); a `if (!p)`
     null check does not exclude this case
-14. Unsigned subtraction underflow — `remaining -= server_len` wraps to a huge
+15. Unsigned subtraction underflow — `remaining -= server_len` wraps to a huge
     positive value when `server_len > remaining`; the SMT layer cannot flag the
     wrapped unsigned value as dangerous, so Stage 2 must check that
     `remaining >= server_len` was validated before the subtraction

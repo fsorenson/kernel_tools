@@ -879,6 +879,40 @@ Common false positive patterns in kernel taint analysis:
    at line N guards the dereference" may still be a real bug if the
    read occurs before line N.
 
+13. Category I — struct field read before sizeof header check (scanner-detected
+   OOB read pattern): when the scanner reports category I, it has found that
+   `ptr->field` is read BEFORE any `if (recv_len < sizeof(*ptr))` guard
+   appears in the SAME function body.  Two cases determine the verdict:
+
+   **Dispatch-layer validation (common false-positive pattern)**: many kernel
+   protocol handlers are structured as: top-level receiver → dispatch table
+   → individual command handler.  The top-level receiver validates
+   `iov->iov_len >= MIN_MSG_SIZE` and the dispatch table routes to sub-
+   handlers that receive already-validated, typed pointers.  If THIS function
+   is a sub-handler that receives the pointer from a caller that already
+   verified the size, the Cat I finding is a false positive.  Signs: (a) the
+   function name matches a command (e.g. `smb2_handle_negotiate`, `process_ioctl`),
+   (b) the function signature takes a typed pointer parameter rather than a
+   raw buffer+length pair, (c) the corresponding dispatch call site in the
+   provided context performs a size check before invoking this function.  Set
+   `real_bug: false`, assessment `false_positive`, explain the dispatch path.
+
+   **Direct raw-buffer receiver (true positive)**: the function itself
+   receives a raw byte buffer (void *, u8 *, char *, or an iov/skb) and
+   casts it to the struct type internally.  There is no caller-visible guard
+   between the cast and the field read.  Signs: (a) the cast `ptr = (struct T
+   *)buf` appears inside this function, (b) the function signature accepts
+   a raw buffer parameter, (c) no `if (len < sizeof(*ptr))` or equivalent
+   appears before the field read — even when such a check appears later in
+   the same function.  The field read itself is the OOB access; what happens
+   with the VALUE read is irrelevant to this question.  Set `real_bug: true`.
+
+   **Offset matters**: `ptr->field` at byte offset N is OOB if the received
+   buffer is shorter than N + sizeof(field).  A buffer exactly equal to
+   sizeof(*ptr) is fine; a buffer equal to sizeof(struct smb2_hdr) but
+   shorter than sizeof(struct smb2_read_rsp) makes any field beyond the hdr
+   portion an OOB read even if the field value itself is zero.
+
 14. Unsigned subtraction underflow — two patterns, same root cause: for
    unsigned arithmetic, a subtraction that goes below zero wraps to a
    huge positive value (e.g., `0xFFFF_FF00`).  The SMT layer returns
@@ -1019,6 +1053,22 @@ For each finding above, determine:
    still occurs.  Common example: `struct T {{ u32 count; u32 data[]; }}` — \
    a check that `count < 256` does not prevent an OOB read of `data[count-1]` \
    if the server sent a 12-byte packet claiming count=255.
+
+2e. **Cat I dispatch-layer check** (apply to every Category I finding): \
+   the scanner confirmed that no `sizeof` guard appears before the first \
+   `ptr->field` read inside THIS function body.  Before calling this a real \
+   bug, determine which of the two patterns applies (see item 13 above).  \
+   Specifically: (a) inspect the function signature — does it accept a raw \
+   buffer + length, or a typed pointer?  (b) look at any caller context or \
+   call-site snippets provided — does the caller verify \
+   `len >= sizeof(struct T)` or equivalent before calling?  (c) check \
+   whether the function appears to be a top-level protocol receiver or a \
+   sub-handler invoked after dispatch.  A function that receives a typed \
+   `struct smb2_read_rsp *rsp` parameter from a dispatch table almost \
+   certainly had the size validated by the dispatcher — treat as \
+   false_positive unless you can confirm the dispatch does NOT check.  A \
+   function that builds its own typed pointer from a `void *buf` parameter \
+   is the primary suspect — treat as real_bug.
 
 2d. **Caller-level guard evidence** (only when finding shows \
    "Caller context: ALL ... sites guarded"): the scanner has \
