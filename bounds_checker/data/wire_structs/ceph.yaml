@@ -1,30 +1,25 @@
 # Ceph messenger/protocol receive structs
 #
-# TEMPLATE — types are commented out because Ceph size guards use a macro
-# idiom that the scanner cannot yet recognise:
+# Ceph messenger/protocol receive structs.
 #
-#   ceph_decode_need(&p, end, sizeof(*hdr2), bad);
-#   hdr2 = p;
-#   seq = le64_to_cpu(hdr2->seq);   ← Cat I fires (macro guard invisible)
+# Guard idiom: Ceph uses ceph_decode_need(&p, end, sizeof(*hdr), bad) as a
+# standalone expression statement (not an if_statement condition).
+# _has_sizeof_guard recognises this via _SIZEOF_GUARD_CALLS.
 #
-# Enabling these types produces false positives for every properly-guarded
-# Ceph receive path.  Uncomment after implementing macro-guard recognition
-# in _has_sizeof_guard (see "Known guard gaps" in CLAUDE.md).
-#
-# Historical confirmed instance: net/ceph/messenger_v2.c, fixed upstream
-# commit 69fb5d91bba4 (2026-03-08) by adding ceph_decode_need() before
-# the ceph_msg_header2 field reads.
+# Historical confirmed Cat I instance: net/ceph/messenger_v2.c,
+# process_message_header() — fixed upstream commit 69fb5d91bba4 (2026-03-08)
+# by adding ceph_decode_need() before the ceph_msg_header2 field reads.
+# After the fix, the scanner correctly credits process_message_header()
+# as [guarded?] and the remaining 10 findings are likely caller-validated
+# sub-handlers (Stage 2 LLM assessment needed).
 
 protocol: Ceph
 subsystem: net/ceph
 
-response_structs: {}
-
-# Uncomment when macro guards are supported:
-# response_structs:
-#   ceph_msg_header2:   0   # v2 messenger frame header; always received
-#   ceph_msg_header:    0   # v1 header (fill_header reads it from received data)
-#   ceph_mds_reply_head: 0  # MDS reply; needs size audit
+response_structs:
+  ceph_msg_header2:    0   # v2 messenger frame header; always received from peer
+  ceph_msg_header:     0   # v1 header; received in classic messenger path
+  ceph_mds_reply_head: 0   # MDS reply header; needs size audit
 
 dual_use_sizes: {}
 

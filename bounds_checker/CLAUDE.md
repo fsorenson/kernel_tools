@@ -54,8 +54,7 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 ## Known guard gaps (not yet implemented)
 
 - **`_find_guards_between` (Cat B/C/E tainted values)**: currently only recognises `if_statement` guards. `while_statement` and `for_statement` conditions also guard their loop bodies, but extending `_find_guards_between` requires adjusting the dominance check and consequence/terminal logic (non-trivial). `_has_sizeof_guard` (Cat I) already supports while/for.
-- **Named-constant guards**: `if (skb->len < MIN_HEADER_SIZE)` where `MIN_HEADER_SIZE == sizeof(struct T)` is not recognised; only `sizeof` expressions are checked.
-- **Macro-wrapped guards**: `ceph_decode_need(&p, end, sizeof(*hdr), bad)` — a macro that wraps the sizeof check — is not recognised by `_has_sizeof_guard`.
+- **Named-constant guards (Bluetooth, older drivers)**: `if (skb->len < VENDOR_CAPA_BASE_SIZE)` where the constant equals `sizeof(struct T)` is not recognised; only `sizeof` expressions are checked.
 
 ## Alias analysis — COMPLETE
 
@@ -89,6 +88,7 @@ Six-step plan; steps 1–3 complete (not yet committed):
 
 ## Recently completed
 
+- **Macro guard recognition** — `_SIZEOF_GUARD_CALLS` frozenset + second walk pass in `_has_sizeof_guard` for `call_expression` nodes (standalone guard macros like `ceph_decode_need` that are not inside an if/while/for condition). Sizeof helper extracted to inner `_sizeof_matches()`. Ceph types enabled in `ceph.yaml`; `process_message_header()` in `messenger_v2.c` now correctly shows as `[guarded?]` (the historical confirmed bug — fixed upstream by adding `ceph_decode_need`). 11 Ceph Cat I findings (1 guarded, 10 needing Stage 2 triage). 55/55 Stage 1 tests.
 - **Stage 2 Cat I prompt** — added item 13 (dispatch-layer vs. direct-receiver pattern) and assessment step 2e (Cat I dispatch-layer check). Item 13 explains both the false-positive pattern (sub-handler with dispatcher-validated pointer) and the true-positive pattern (function casts raw buffer itself). Step 2e gives the LLM concrete signals: typed pointer parameter → likely FP; raw buffer + internal cast → likely real bug.
 - **Wire-struct data files** — `_SERVER_RESPONSE_STRUCTS` and `_WIRE_STRUCT_MIN_BYTES` (was `_SMB2_STRUCT_MIN_BYTES`) now loaded from `bounds_checker/data/wire_structs/*.yaml`. `_load_wire_struct_tables()` reads `response_structs` (name→min_bytes) and `dual_use_sizes` (excluded from response table, included in size table for alias analysis). SMBv2/SMB3 content migrated to `smb2.yaml`; `ceph.yaml` is a stub (commented out — Ceph uses `ceph_decode_need` macro guards the scanner can't yet see). Adding a new protocol = add a YAML file, no code changes needed.
 - **while/for sizeof guard extension** — `_has_sizeof_guard` extended to recognise `while_statement` and `for_statement` conditions (not only `if_statement`); `_GUARD_STMT_TYPES` frozenset; do-while excluded (condition runs after first body iteration). 2 new test cases (guarded_I_while_sizeof, guarded_I_for_sizeof); 54/54 Stage 1 tests. One previously-unguarded Cat I finding in fs/smb/client now correctly credited as guarded (62 total, 4 guarded was 3).

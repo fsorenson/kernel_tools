@@ -607,6 +607,29 @@ int guarded_I_for_sizeof(struct smb2_read_rsp *rsp, u32 recv_len)
 	return 0;
 }
 
+/* ── Category I: standalone guard macro (ceph_decode_need style) ── */
+
+/*
+ * Stub for ceph_decode_need — at source level this is a call_expression
+ * statement, NOT an if_statement; the scanner must recognise sizeof(*p)
+ * inside the arguments as a guard.
+ */
+#define ceph_decode_need(p, end, n, bad) \
+	do { if ((u8 *)(*(p)) + (n) > (u8 *)(end)) goto bad; } while (0)
+
+/*
+ * Guarded via ceph_decode_need standalone macro call.
+ * sizeof(*rsp) is in the 3rd argument — not in an if/while/for condition.
+ */
+int guarded_I_macro_guard(struct smb2_read_rsp *rsp, u8 *end)
+{
+	u8 *p = (u8 *)rsp;
+	ceph_decode_need(&p, end, sizeof(*rsp), bad);
+	return rsp->DataOffset;   /* guarded by macro */
+bad:
+	return -1;
+}
+
 /* ── Category I: alias root tracking (Step 4) ── */
 
 /*

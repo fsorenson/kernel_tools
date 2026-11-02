@@ -2215,6 +2215,19 @@ def _scan_body(fn_name, fn_body, source, filepath, initial_taint=None,
 # so it does not guard reads that happen at the top of the body.
 _GUARD_STMT_TYPES = frozenset({'if_statement', 'while_statement', 'for_statement'})
 
+# Macro/function calls used as standalone expression statements (not inside an
+# if/while/for condition) that implement a sizeof-based length guard.
+#
+# Example — Ceph messenger:
+#   ceph_decode_need(&p, end, sizeof(*hdr2), bad);
+# expands to `if (!ceph_has_room(p, end, n)) goto bad;`.  At source level
+# this is a call_expression statement, invisible to the branch-condition
+# walker above.  Callee names listed here are checked for sizeof arguments
+# as an additional guard-detection pass.
+_SIZEOF_GUARD_CALLS = frozenset({
+    'ceph_decode_need',   # Ceph: ceph_decode_need(&p, end, sizeof(*hdr), bad)
+})
+
 
 def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
                       alias_roots=None, var_type_map=None):
@@ -2252,30 +2265,40 @@ def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
                         ptr_min_sz > 0 and alias_min_sz >= ptr_min_sz):
                     guard_vars.add(alias_var)
 
+    def _sizeof_matches(sizeof_node):
+        """True if sizeof_node matches struct_type by name or any guard_var by text."""
+        td = next((c for c in sizeof_node.children if c.type == 'type_descriptor'), None)
+        if td is not None:
+            td_text = node_text(td, source).strip()
+            if (td_text == struct_type
+                    or td_text == f'struct {struct_type}'
+                    or td_text.replace('struct ', '') == struct_type):
+                return True
+        sz_text = node_text(sizeof_node, source)
+        return any(f'*{gvar}' in sz_text or f'* {gvar}' in sz_text
+                   for gvar in guard_vars)
+
     for node in _walk(fn_body):
-        if node.type not in _GUARD_STMT_TYPES:
-            continue
         if node.start_point[0] + 1 >= before_line:
             continue
-        cond = node.child_by_field_name('condition')
-        if cond is None:
-            continue
-        for n in _walk(cond):
-            if n.type != 'sizeof_expression':
-                continue
-            # sizeof(struct T) — look for type_descriptor child
-            td = next((c for c in n.children if c.type == 'type_descriptor'), None)
-            if td is not None:
-                td_text = node_text(td, source).strip()
-                if (td_text == struct_type
-                        or td_text == f'struct {struct_type}'
-                        or td_text.replace('struct ', '') == struct_type):
-                    return True
-            # sizeof(*var) — text match for any guard variable
-            sz_text = node_text(n, source)
-            for gvar in guard_vars:
-                if f'*{gvar}' in sz_text or f'* {gvar}' in sz_text:
-                    return True
+
+        # Path 1: if/while/for condition containing a sizeof expression.
+        if node.type in _GUARD_STMT_TYPES:
+            cond = node.child_by_field_name('condition')
+            if cond is not None:
+                for n in _walk(cond):
+                    if n.type == 'sizeof_expression' and _sizeof_matches(n):
+                        return True
+
+        # Path 2: standalone guard macro call with sizeof in its arguments
+        # (e.g. ceph_decode_need(&p, end, sizeof(*hdr), bad)).
+        elif node.type == 'call_expression':
+            if _g_get_callee(node, source) in _SIZEOF_GUARD_CALLS:
+                for arg in _arg_nodes(node):
+                    for n in _walk(arg):
+                        if n.type == 'sizeof_expression' and _sizeof_matches(n):
+                            return True
+
     return False
 
 

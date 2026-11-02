@@ -118,6 +118,8 @@ EXPECTED = {
     'guarded_I_while_sizeof':        {'cat': 'I', 'guarded': True},
     # for condition with sizeof(struct T) guards the loop body.
     'guarded_I_for_sizeof':          {'cat': 'I', 'guarded': True},
+    # standalone guard macro (ceph_decode_need style) with sizeof in args.
+    'guarded_I_macro_guard':         {'cat': 'I', 'guarded': True},
 
     # ── Category I: field read before sizeof header check (alias Step 3) ──
     # First field access before sizeof guard — Cat I unguarded.
