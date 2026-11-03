@@ -19,7 +19,7 @@ from kernel_analysis.parsers.c_parser import (
     parse_file, find_functions, find_calls_to, node_text, get_source_line,
     _walk,
 )
-from bounds_checker.parsers.taint_scanner import _find_guards_between
+from bounds_checker.parsers.taint_scanner import _find_guards_between, _has_sizeof_guard
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +404,185 @@ def build_call_site_index(fn_names, paths, context_lines=5):
 
 
 # ---------------------------------------------------------------------------
+# Cat I: caller-side sizeof guard check
+# ---------------------------------------------------------------------------
+
+def annotate_cat_i_sizeof_guard(call_sites, param_idx, struct_type):
+    """
+    For each call site of a Cat I static function, check whether the caller
+    has a sizeof(struct_type) or sizeof(*arg_var) guard before the call.
+
+    Unlike annotate_with_guards (which checks VALUE bounds on the tainted
+    argument), this checks for a SIZE check: `if (len < sizeof(*rsp))` or
+    `if (len < sizeof(struct smb2_read_rsp))` anywhere before the call line.
+
+    `param_idx` is the 0-based index of the struct pointer parameter.
+    `struct_type` is the struct name (e.g. 'smb2_read_rsp').
+    """
+    if param_idx is None:
+        for cs in call_sites:
+            cs['guarded']    = None
+            cs['guard_kind'] = 'param-unknown'
+        return call_sites
+
+    by_file = {}
+    for cs in call_sites:
+        by_file.setdefault(cs['file'], []).append(cs)
+
+    for filepath, sites in by_file.items():
+        try:
+            tree, source = parse_file(filepath)
+        except Exception:
+            for cs in sites:
+                cs['guarded']    = None
+                cs['guard_kind'] = 'parse-error'
+            continue
+
+        fn_bodies = {f['name']: f['body'] for f in find_functions(tree, source)}
+
+        for cs in sites:
+            caller   = cs.get('caller_fn', '')
+            call_ln  = cs.get('line', 0)
+            args     = cs.get('args', [])
+            fn_body  = fn_bodies.get(caller)
+
+            if not caller or fn_body is None:
+                cs['guarded']    = None
+                cs['guard_kind'] = 'no-body'
+                continue
+
+            # Resolve the argument variable name at param_idx (for text match).
+            # Fall back to struct-type-name-only match when the arg is complex.
+            arg_var = None
+            if param_idx < len(args):
+                arg_text = args[param_idx].strip()
+                if (arg_text.isidentifier()
+                        and arg_text not in _C_KEYWORDS):
+                    arg_var = arg_text
+
+            guarded = _has_sizeof_guard(
+                fn_body, arg_var, struct_type, call_ln, source
+            )
+            cs['guarded']    = guarded
+            cs['guard_kind'] = 'sizeof_check' if guarded else ''
+
+    return call_sites
+
+
+def annotate_cat_i_findings(findings, paths):
+    """
+    Attach caller_context to Cat I findings in static functions where
+    ptr_var (tainted_var) is a function parameter, not a locally-cast variable.
+
+    At each call site of the static function, checks whether the caller has a
+    sizeof(struct T) guard before the call — if all callers do, the finding
+    is a dispatch-layer false positive.  This complements Stage 2 prompt
+    item 2e (Cat I dispatch-layer check) by resolving the question statically.
+
+    Annotates in place; only Cat I findings with determinable = True receive
+    a caller_context.  Non-static functions and locally-cast variables get
+    determinable = False with a reason string.
+    """
+    cat_i = [f for f in findings
+             if f.get('category') == 'I' and f.get('propagation') == 'intra']
+    if not cat_i:
+        return
+
+    # ── Step 1: Parse callee files to check static-ness and param membership ──
+    file_cache = {}
+
+    def _fdata(fp):
+        if fp not in file_cache:
+            try:
+                tree, source = parse_file(fp)
+                file_cache[fp] = {
+                    'source': source,
+                    'fns': {fn['name']: fn for fn in find_functions(tree, source)},
+                }
+            except Exception:
+                file_cache[fp] = None
+        return file_cache[fp]
+
+    static_fns  = set()
+    param_idxs  = {}   # (fn_name, ptr_var) -> int or None
+
+    for f in cat_i:
+        fn_name  = f.get('function')
+        filepath = f.get('file')
+        ptr_var  = f.get('tainted_var')
+        if not (fn_name and filepath and ptr_var):
+            continue
+        fdata = _fdata(filepath)
+        if not fdata:
+            continue
+        fn_info = fdata['fns'].get(fn_name)
+        if fn_info is None:
+            continue
+        source = fdata['source']
+        if not is_static_fn(fn_info['node'], source):
+            continue
+        static_fns.add(fn_name)
+        params = fn_param_names(fn_info['node'], source)
+        key = (fn_name, ptr_var)
+        param_idxs[key] = params.index(ptr_var) if ptr_var in params else None
+
+    if not static_fns:
+        return
+
+    # ── Step 2: Build call-site index for all static Cat I functions at once ──
+    cs_index = build_call_site_index(static_fns, paths)
+
+    # ── Step 3: Annotate each Cat I finding ──
+    for f in cat_i:
+        fn_name    = f.get('function')
+        filepath   = f.get('file')
+        ptr_var    = f.get('tainted_var')
+        struct_type = f.get('taint_source_fn')
+
+        if fn_name not in static_fns:
+            f['caller_context'] = {'determinable': False, 'reason': 'not-static'}
+            continue
+
+        key       = (fn_name, ptr_var)
+        param_idx = param_idxs.get(key)
+
+        if param_idx is None:
+            # ptr_var is a locally-cast variable, not a parameter; the
+            # function IS the direct receiver, so caller checks don't apply.
+            f['caller_context'] = {
+                'determinable': False,
+                'reason': 'not-parameter',
+            }
+            continue
+
+        raw_sites = cs_index.get(fn_name, [])
+        if not raw_sites:
+            f['caller_context'] = {
+                'determinable': False,
+                'reason':       'no-call-sites',
+                'param_idx':    param_idx,
+            }
+            continue
+
+        cs = [dict(s) for s in raw_sites]
+        annotate_cat_i_sizeof_guard(cs, param_idx, struct_type)
+
+        all_guarded = bool(cs) and all(s.get('guarded') is True for s in cs)
+
+        f['caller_context'] = {
+            'determinable':        True,
+            'param_name':          ptr_var,
+            'param_idx':           param_idx,
+            'call_site_count':     len(cs),
+            'all_callers_guarded': all_guarded,
+            'call_sites': [
+                {k: v for k, v in s.items() if k not in _OMIT_FROM_SITE}
+                for s in cs
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline: annotate a findings list
 # ---------------------------------------------------------------------------
 
@@ -562,6 +741,7 @@ def run(cfg, run_dir, stage1_output, verbose=False):
           f"across {n_paths} source file(s) ...")
 
     annotate_findings(findings, paths)
+    annotate_cat_i_findings(findings, paths)
 
     n_det      = sum(1 for f in findings
                      if f.get('caller_context', {}).get('determinable'))
@@ -569,17 +749,32 @@ def run(cfg, run_dir, stage1_output, verbose=False):
                      if f.get('caller_context', {}).get('all_callers_guarded'))
     n_not_static = sum(1 for f in findings
                        if f.get('caller_context', {}).get('reason') == 'not-static')
+    n_cat_i_det = sum(
+        1 for f in findings
+        if f.get('category') == 'I'
+        and f.get('caller_context', {}).get('determinable')
+    )
+    n_cat_i_guarded = sum(
+        1 for f in findings
+        if f.get('category') == 'I'
+        and f.get('caller_context', {}).get('all_callers_guarded')
+    )
 
     print(f"Stage 1.5: {n_det} annotated "
           f"({n_guarded} fully guarded, {n_not_static} non-static)")
+    if n_cat_i_det or n_cat_i_guarded:
+        print(f"Stage 1.5 Cat I: {n_cat_i_det} caller-checked"
+              f" ({n_cat_i_guarded} all-callers-guarded)")
 
     output = {
-        'stage':               'caller_enumeration',
-        'files_scanned':       n_paths,
-        'findings_annotated':  n_det,
-        'all_callers_guarded': n_guarded,
-        'not_static':          n_not_static,
-        'total_findings':      len(findings),
+        'stage':                       'caller_enumeration',
+        'files_scanned':               n_paths,
+        'findings_annotated':          n_det,
+        'all_callers_guarded':         n_guarded,
+        'not_static':                  n_not_static,
+        'cat_i_caller_checked':        n_cat_i_det,
+        'cat_i_all_callers_guarded':   n_cat_i_guarded,
+        'total_findings':              len(findings),
     }
     out_path = Path(run_dir) / 'stage1_5_callers.json'
     out_path.write_text(json.dumps(output, indent=2))

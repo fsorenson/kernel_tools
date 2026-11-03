@@ -2248,8 +2248,11 @@ def _has_sizeof_guard(fn_body, ptr_var, struct_type, before_line, source,
     ptr_var when the alias struct type is at least as large as struct_type.
     """
     # Collect variable names whose sizeof expression counts as a guard.
-    guard_vars = {ptr_var}
-    if alias_roots and var_type_map:
+    # ptr_var=None means "struct_type name match only, no text match" — used
+    # when calling from the caller-enumeration path where the arg variable
+    # name is unknown or not a simple identifier.
+    guard_vars = {ptr_var} if ptr_var else set()
+    if alias_roots and var_type_map and ptr_var:
         my_roots = alias_roots.get(ptr_var, frozenset())
         if my_roots:
             ptr_min_sz = _WIRE_STRUCT_MIN_BYTES.get(struct_type, 0)
