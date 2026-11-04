@@ -185,11 +185,17 @@ def _build_context(run_dir, s1, s2):
     for a in s2.get('analyses', []):
         s2_by_fn[(a['function'], a['file'])] = a
 
-    # Build per-function sections, sorted by (filepath, fn_name) so the same
-    # source file's functions appear together and grouped by directory.
+    # Build per-function sections, sorted by (dir, filepath, fn_name).
+    # Sorting by directory first ensures each directory's group is contiguous
+    # in the report — without this, files directly in a parent directory (e.g.
+    # fs/aio.c, fs/binfmt_elf.c) are alphabetically interspersed with
+    # subdirectories, causing the same dir header to appear multiple times.
     sections = []
     for (fn_name, filepath), s1_findings in sorted(s1_groups.items(),
-                                                    key=lambda kv: (kv[0][1], kv[0][0])):
+                                                    key=lambda kv: (
+                                                        str(Path(kv[0][1]).parent),
+                                                        kv[0][1],
+                                                        kv[0][0])):
         short_file = Path(filepath).name
         rp = _rel_path(filepath, kernel_root)
         dp = str(Path(rp).parent) if rp and Path(rp).parent != Path('.') else rp
