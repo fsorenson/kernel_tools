@@ -704,3 +704,43 @@ int guarded_I_alias_via_assignment(char *buf, u32 recv_len)
 		return -1;
 	return err->ErrorContextCount;   /* guarded via assignment-tracked alias */
 }
+
+/* ── while/for loop conditions as taint-value guards (Cat B/C/E/F) ── */
+
+/*
+ * while condition bounds count before the kmalloc inside the body.
+ * Every iteration enters the body only if count < 64.
+ */
+void *guarded_B_while_bounded(struct pkt *p)
+{
+	u16 count = le16_to_cpu(p->count);
+	while (count < 64) {
+		return kmalloc(count * sizeof(struct entry), GFP_KERNEL);
+	}
+	return NULL;
+}
+
+/*
+ * for condition bounds off before the kmalloc inside the body.
+ * The body executes only while off < 4096.
+ */
+void *guarded_B_for_bounded(struct pkt *p)
+{
+	u32 off = le32_to_cpu(p->size32);
+	for (; off < 4096; off++) {
+		return kmalloc(off * sizeof(struct entry), GFP_KERNEL);
+	}
+	return NULL;
+}
+
+/*
+ * while condition does NOT guard a sink outside the loop body.
+ * The kmalloc runs after the loop exits with count >= 64 possible.
+ */
+void *bug_B_while_notbody(struct pkt *p)
+{
+	u16 count = le16_to_cpu(p->count);
+	while (count < 64)
+		count++;
+	return kmalloc(count * sizeof(struct entry), GFP_KERNEL);
+}

@@ -121,6 +121,15 @@ EXPECTED = {
     # standalone guard macro (ceph_decode_need style) with sizeof in args.
     'guarded_I_macro_guard':         {'cat': 'I', 'guarded': True},
 
+    # ── while/for loop conditions as taint-value guards (Cat B/C/E/F) ───────
+    # while (count < 64) { kmalloc(count * size) } — body is guarded.
+    'guarded_B_while_bounded':       {'cat': 'B', 'guarded': True},
+    # for (; off < 4096; off++) { kmalloc(off * size) } — body is guarded.
+    'guarded_B_for_bounded':         {'cat': 'B', 'guarded': True},
+    # while (count < 64) { count++; } kmalloc(count * size) — sink is outside
+    # the loop body; the while condition does NOT guard it.
+    'bug_B_while_notbody':           {'cat': 'B', 'guarded': False},
+
     # ── Category I: field read before sizeof header check (alias Step 3) ──
     # First field access before sizeof guard — Cat I unguarded.
     'bug_I_field_before_sizeof':    {'cat': 'I', 'guarded': False},

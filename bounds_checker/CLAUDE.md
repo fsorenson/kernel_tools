@@ -44,13 +44,13 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 
 ## Known guard gaps (not yet implemented)
 
-- **`_find_guards_between` (Cat B/C/E taint values)**: only `if_statement` guards; `while`/`for` extension needs dominance/terminal-logic rework. `_has_sizeof_guard` (Cat I) already supports while/for.
+- **`_find_guards_between` (Cat B/C/E taint values)**: now supports `while_statement` and `for_statement` as guards when the sink is inside the loop body; `do_statement` excluded (condition runs after body).
 - **Named-constant guards**: `if (skb->len < VENDOR_CAPA_BASE_SIZE)` — constant value not checked against struct size; blocks Bluetooth HCI activation.
 - **Macro-wrapped guards in taint path**: `_has_sizeof_guard` recognises `ceph_decode_need`; taint categories (`_find_guards_between`) do not.
 
 ## Active next steps
 
-1. **`_find_guards_between` while/for extension** — reduces Cat B/C/E/F false positives for loop-body sinks; non-trivial (dominance + terminal-exit checks).
+1. ~~**`_find_guards_between` while/for extension**~~ — **done**; 58/58 tests.
 2. **Named-constant guard recognition** — prerequisite for Bluetooth HCI YAML activation; options: (a) constant propagation from `preproc_def` nodes, (b) heuristic `if (len_var < CONSTANT)` credited conservatively.
 3. **Bluetooth HCI YAML** — audit which HCI event structs are receive-only (never sent); then add `bluetooth_hci.yaml`. Blocked on #2 or careful per-type audit.
 4. **Wider G3 scan** — G3 finds 0 in fs/smb; try `--categories G3` on drivers/gpu/drm or net/.
@@ -60,11 +60,12 @@ Full category taxonomy, SMT properties, and Stage 2 prompt items: `bc_category_r
 - Do NOT commit or push unless explicitly asked
 - Git commits: `Co-Authored-By: Claude Sonnet 4.6 (1M context) <noreply@anthropic.com>`
 - Update `bc_category_review_brief.md` whenever categories, SMT properties, or Stage 2 prompt items change
-- Test suite: `python3 tests/run_all.py` — excludes Stage 2 (API cost); 55/55 Stage 1 tests currently
+- Test suite: `python3 tests/run_all.py` — excludes Stage 2 (API cost); 58/58 Stage 1 tests currently
 - Config: `bc_config.yaml` in project root; output: `bc_runs/`
 
 ## Recently completed
 
+- **`_find_guards_between` while/for** — `while_statement`/`for_statement` conditions now guard sinks inside the loop body (Cat B/C/E/F); do-while excluded; 3 new test cases; 58/58.
 - **Cat I caller enumeration (Stage 1.5)** — `annotate_cat_i_findings()`: static functions with parameter-based Cat I findings get caller_context with sizeof-guard check at each call site; `not-parameter` labels direct receivers; 1 finding auto-dismissed in fs/smb/client (`cifs_fill_dirent_posix`).
 - **Macro guard recognition** — `_SIZEOF_GUARD_CALLS` + second walk in `_has_sizeof_guard` for standalone macro calls (`ceph_decode_need`); Ceph types enabled in `ceph.yaml`; 55/55 tests.
 - **Stage 2 Cat I prompt items 13 + 2e** — dispatch-layer vs. direct-receiver reasoning; typed-pointer parameter → FP; raw-buffer internal cast → real bug.

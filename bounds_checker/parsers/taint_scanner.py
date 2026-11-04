@@ -1220,7 +1220,7 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
     writes = None
 
     for node in _walk(fn_body):
-        if node.type != 'if_statement':
+        if node.type not in ('if_statement', 'while_statement', 'for_statement'):
             continue
         stmt_line = node.start_point[0] + 1
         if stmt_line <= line_lo or stmt_line >= line_hi:
@@ -1233,20 +1233,34 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
         if not cmps:
             continue
 
-        consequence = node.child_by_field_name('consequence')
-        alternative = node.child_by_field_name('alternative')
+        if node.type == 'if_statement':
+            consequence = node.child_by_field_name('consequence')
+            alternative = node.child_by_field_name('alternative')
 
-        if labels is None:
-            labels = _label_lines(fn_body, source)
-        early = ((consequence is not None
-                  and _has_terminal(consequence, source, labels, line_hi))
-                 or (alternative is not None
-                     and _has_terminal(alternative, source, labels, line_hi)))
-        encloses = any(b is not None
-                       and b.start_point[0] + 1 <= line_hi <= b.end_point[0] + 1
-                       for b in (consequence, alternative))
-        if not (early or encloses):
-            continue
+            if labels is None:
+                labels = _label_lines(fn_body, source)
+            early = ((consequence is not None
+                      and _has_terminal(consequence, source, labels, line_hi))
+                     or (alternative is not None
+                         and _has_terminal(alternative, source, labels, line_hi)))
+            encloses = any(b is not None
+                           and b.start_point[0] + 1 <= line_hi <= b.end_point[0] + 1
+                           for b in (consequence, alternative))
+            if not (early or encloses):
+                continue
+        else:
+            # while_statement / for_statement: condition guards the loop body only.
+            # `while (count < MAX) { use(count); }` — inside the body, `count <
+            # MAX` holds on every iteration.  The sink must be inside the body;
+            # the condition does NOT guard code that runs after the loop.
+            # do_statement is excluded: its condition runs AFTER the first body
+            # execution, so it cannot guard the body.
+            body = node.child_by_field_name('body')
+            if body is None:
+                continue
+            if not (body.start_point[0] + 1 <= line_hi <= body.end_point[0] + 1):
+                continue
+            early = False
 
         if not _dominates(node, fn_body, line_hi):
             saw_nondominating = True
@@ -1256,6 +1270,8 @@ def _find_guards_between(fn_body, var_names, line_lo, line_hi, source,
         # write a later one still covers.
         if writes is None:
             writes = _fresh_writes(fn_body, var_names, source)
+        if labels is None:
+            labels = _label_lines(fn_body, source)
         if any(stmt_line < wline < line_hi
                and _write_reaches(w, fn_body, line_hi, var_names, source, labels)
                for wline, w in writes):
