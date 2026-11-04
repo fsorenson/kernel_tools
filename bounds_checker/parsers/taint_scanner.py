@@ -43,6 +43,10 @@ TAINT_SOURCES = frozenset({
     # Endian conversion from __le/__be struct fields
     'le16_to_cpu', 'le32_to_cpu', 'le64_to_cpu',
     'be16_to_cpu', 'be32_to_cpu', 'be64_to_cpu',
+    # Pointer-dereference variants — take a __be32 * / __le32 * and return the
+    # native integer.  Dominant pattern in NFS/sunrpc XDR decoders (nfs4xdr.c etc.)
+    'le16_to_cpup', 'le32_to_cpup', 'le64_to_cpup',
+    'be16_to_cpup', 'be32_to_cpup', 'be64_to_cpup',
     # In-place endian store/load helpers that return the value
     'le16_to_cpus', 'le32_to_cpus', 'le64_to_cpus',
     # ntohs / ntohl (network byte order, used in some subsystems)
@@ -60,6 +64,9 @@ TAINT_SOURCE_WIDTHS = {
     'le16_to_cpu': 16, 'be16_to_cpu': 16, 'le16_to_cpus': 16,
     'le32_to_cpu': 32, 'be32_to_cpu': 32, 'le32_to_cpus': 32,
     'le64_to_cpu': 64, 'be64_to_cpu': 64, 'le64_to_cpus': 64,
+    'le16_to_cpup': 16, 'be16_to_cpup': 16,
+    'le32_to_cpup': 32, 'be32_to_cpup': 32,
+    'le64_to_cpup': 64, 'be64_to_cpup': 64,
     'ntohs': 16, 'ntohl': 32, 'ntohe': 32,
 }
 
