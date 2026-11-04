@@ -39,6 +39,9 @@ def parse_categories(s):
     for tok in tokens:
         if not tok:
             continue
+        if tok.lower() == 'all':
+            result.extend(_VALID_CATS)
+            continue
         if tok in _CAT_INDEX:
             result.append(tok)
         elif '-' in tok:
@@ -155,8 +158,9 @@ def build_arg_parser():
     _cat_metavar = 'CAT[,CAT|-CAT]'
     _cat_help_suffix = (
         f'  Categories: {", ".join(_VALID_CATS)}.  '
+        f'Use "all" to select every category.  '
         f'Accepts comma-separated values, hyphen ranges, or a mix: '
-        f'"A-D", "A,B,G1", "A-C,G1-H".'
+        f'"all", "A-D", "A,B,G1", "A-C,G1-H".'
     )
     p = argparse.ArgumentParser(
         description='Kernel bounds / data validation checker',
