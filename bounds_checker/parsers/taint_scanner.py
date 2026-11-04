@@ -43,6 +43,10 @@ TAINT_SOURCES = frozenset({
     # Endian conversion from __le/__be struct fields
     'le16_to_cpu', 'le32_to_cpu', 'le64_to_cpu',
     'be16_to_cpu', 'be32_to_cpu', 'be64_to_cpu',
+    # Double-underscore internal variants — same semantics, used directly in
+    # some subsystems (Bluetooth hci_codec.c etc.)
+    '__le16_to_cpu', '__le32_to_cpu', '__le64_to_cpu',
+    '__be16_to_cpu', '__be32_to_cpu', '__be64_to_cpu',
     # Pointer-dereference variants — take a __be32 * / __le32 * and return the
     # native integer.  Dominant pattern in NFS/sunrpc XDR decoders (nfs4xdr.c etc.)
     'le16_to_cpup', 'le32_to_cpup', 'le64_to_cpup',
@@ -51,6 +55,13 @@ TAINT_SOURCES = frozenset({
     'le16_to_cpus', 'le32_to_cpus', 'le64_to_cpus',
     # ntohs / ntohl (network byte order, used in some subsystems)
     'ntohs', 'ntohl', 'ntohe',
+    # JFFS2 bi-endian flash helpers — same call-return shape as le32_to_cpu
+    'je16_to_cpu', 'je32_to_cpu',
+    # BeFS (Be Filesystem) bi-endian disk helpers
+    'fs16_to_cpu', 'fs32_to_cpu', 'fs64_to_cpu',
+    # Ceph protocol wire-data decoders (direct return form; *_safe form uses
+    # output pointer and is not covered here)
+    'ceph_decode_8', 'ceph_decode_16', 'ceph_decode_32', 'ceph_decode_64',
 })
 
 # Maps each taint source to its natural return-value bit width.
@@ -64,10 +75,17 @@ TAINT_SOURCE_WIDTHS = {
     'le16_to_cpu': 16, 'be16_to_cpu': 16, 'le16_to_cpus': 16,
     'le32_to_cpu': 32, 'be32_to_cpu': 32, 'le32_to_cpus': 32,
     'le64_to_cpu': 64, 'be64_to_cpu': 64, 'le64_to_cpus': 64,
+    '__le16_to_cpu': 16, '__be16_to_cpu': 16,
+    '__le32_to_cpu': 32, '__be32_to_cpu': 32,
+    '__le64_to_cpu': 64, '__be64_to_cpu': 64,
     'le16_to_cpup': 16, 'be16_to_cpup': 16,
     'le32_to_cpup': 32, 'be32_to_cpup': 32,
     'le64_to_cpup': 64, 'be64_to_cpup': 64,
     'ntohs': 16, 'ntohl': 32, 'ntohe': 32,
+    'je16_to_cpu': 16, 'je32_to_cpu': 32,
+    'fs16_to_cpu': 16, 'fs32_to_cpu': 32, 'fs64_to_cpu': 64,
+    'ceph_decode_8': 8, 'ceph_decode_16': 16,
+    'ceph_decode_32': 32, 'ceph_decode_64': 64,
 }
 
 # ---------------------------------------------------------------------------
